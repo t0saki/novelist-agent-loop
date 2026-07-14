@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api";
+import { api, getToken } from "../api";
 import { BookCard } from "../types";
 import { Loading, TopBar } from "../components";
 
@@ -48,7 +48,7 @@ export default function Library() {
               <Link key={b.slug} to={`/book/${b.slug}`} className="book-card">
                 <div className="cover">
                   {b.has_cover ? (
-                    <img src={`/api/reader/books/${b.slug}/cover`} alt={b.title} />
+                    <img src={`/api/reader/books/${b.slug}/cover?token=${getToken()}`} alt={b.title} />
                   ) : (
                     <div className="cover-title">{b.title}</div>
                   )}

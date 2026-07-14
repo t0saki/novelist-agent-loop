@@ -49,9 +49,11 @@ def concept_prompt(premise: dict[str, Any], length_hint: str, avg_recent_words: 
 def bible_prompt(novel_title: str, synopsis: str) -> str:
     return (
         f"书名：{novel_title}\n简介：{synopsis}\n\n"
-        "请构建这部小说的设定集（story bible）。输出 JSON："
-        '{"world":"世界观与核心规则","characters":[{"name":"","role":"主角/配角/反派",'
-        '"description":"外貌性格","motivation":"核心动机","relationships":"关系","state":"初始状态"}],'
+        "请构建这部小说的设定集（story bible）。characters 必须**列全本书所有重要登场人物**"
+        "（主角、关键配角、反派等，一般 5-12 人，命名具体到姓名）——这是全书唯一的权威人物表，"
+        "后续大纲与正文只能使用这里定义的角色与姓名。输出 JSON："
+        '{"world":"世界观与核心规则","characters":[{"name":"具体姓名","role":"主角/配角/反派",'
+        '"description":"外貌性格","motivation":"核心动机","relationships":"与其他角色的关系","state":"故事开始时的处境"}],'
         '"canon":["不可违背的硬事实"],"voice":{"pov":"叙事视角","style":"文风特征"},'
         '"foreshadowing":[{"item":"伏笔","plant_hint":"何时埋","payoff_hint":"何时收"}]}'
     )
@@ -61,14 +63,24 @@ def blueprint_prompt(
     novel_title: str,
     synopsis: str,
     outline_ctx: str,
+    characters_block: str,
     start: int,
     count: int,
     total: int,
 ) -> str:
+    opening_rule = ""
+    if start == 1:
+        opening_rule = (
+            "第 1 章是全书开篇：要循序渐进，单个场景只聚焦少数在场角色，"
+            "**严禁**出现「逐一介绍所有人物」「集中登场」这类会写成流水账的场景要求；"
+            "主要人物应在随后的章节里随情节自然登场。\n"
+        )
     return (
         f"书名：{novel_title}\n简介：{synopsis}\n全书/卷纲：{outline_ctx}\n"
+        f"【权威人物表】只能使用以下已定义角色，不得另起新名；确需新增次要角色时须保持风格一致：\n{characters_block}\n"
         f"全书共 {total} 章。请为第 {start} 到第 {start + count - 1} 章生成详细细纲。\n"
-        "每章拆成 3-6 个场景，每个场景写明：概要、必须发生的事件、出场角色、目标字数（600-1200）。"
+        f"{opening_rule}"
+        "每章拆成 3-6 个场景，每个场景写明：概要、必须发生的事件、出场角色（从权威人物表里选，单场景不宜过多）、目标字数（600-1200）。"
         f"只有第 {total} 章是最后一章（is_final=true）可以收尾，其余章必须在 hook 里留下钩子。输出 JSON："
         '{"chapters":[{"index":整数,"title":"第N章 标题","goal":"本章主线目标",'
         '"characters":["出场角色"],"foreshadow_plant":"本章埋设的伏笔","foreshadow_payoff":"本章回收的伏笔",'
@@ -86,6 +98,7 @@ def scene_prompt(
     prev_tail: str,
     is_final_chapter: bool,
     is_final_scene: bool,
+    is_opening: bool,
     attempt: int,
     shortfall: int | None,
 ) -> str:
@@ -94,6 +107,14 @@ def scene_prompt(
         if (is_final_chapter and is_final_scene)
         else "这不是结尾，场景末尾要自然过渡或留有张力，绝不能出现完结语。"
     )
+    opening_rule = ""
+    if is_opening:
+        opening_rule = (
+            "\n【这是全书的第一段文字 · 冷开场】读者对这个故事一无所知。请从一个**具体的时刻与画面**切入"
+            "（某个人物正在做的某件事、某个地点的此刻），用动作、对白、感官细节把读者带进场景。"
+            "严禁用「通知来得突然」「他本是应邀前来」这种回溯式概述来交代背景，也不要把尚未在正文出现过的前情、"
+            "身份、关系当作读者已知来陈述——这些要靠情节逐渐揭示。人物按需要一两位自然登场即可，不要在开场罗列或集中介绍多人。"
+        )
     expand = ""
     if attempt > 0 and shortfall:
         expand = (
@@ -108,7 +129,7 @@ def scene_prompt(
         f"出场角色：{', '.join(scene.get('characters', []))}\n"
         f"目标字数：约 {scene.get('target_words', 900)} 字（这是下限，宁多勿少）。\n"
         f"衔接上文结尾：…{prev_tail[-200:] if prev_tail else '（本章开头）'}\n"
-        f"{ending_rule}{expand}\n\n"
+        f"{ending_rule}{opening_rule}{expand}\n\n"
         "现在直接写这个场景的正文，只输出正文，不要标题、不要场景编号、不要任何说明。"
     )
 

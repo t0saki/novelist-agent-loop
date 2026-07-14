@@ -1,13 +1,14 @@
 """阅读端 API：书库、目录、章节、阅读进度、EPUB、封面。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import db_session, require_reader
+from app.api.deps import _token_from_header, db_session, require_reader
+from app.core.security import verify_token
 from app.db.models import Chapter, ChapterStatus, Novel, NovelStatus, ReadingProgress
 from app.services.epub import build_epub, cover_path_bytes
 
@@ -106,8 +107,15 @@ def chapter_content(
 
 @router.get("/books/{slug}/cover")
 def book_cover(
-    slug: str, session: Session = Depends(db_session), _: dict = Depends(require_reader)
+    slug: str,
+    token: str | None = Query(default=None),
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(db_session),
 ) -> Response:
+    # <img> 标签发的普通请求带不上 Authorization 头，故也接受 ?token= 查询参数
+    payload = verify_token(token) if token else _token_from_header(authorization)
+    if not payload or payload.get("role") not in ("reader", "admin"):
+        raise HTTPException(401, "未登录或会话已过期")
     n = _get_visible_novel(session, slug)
     data = cover_path_bytes(n.cover_path)
     if not data:

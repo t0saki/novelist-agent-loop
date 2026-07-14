@@ -27,7 +27,7 @@ def _cost(cfg: ProfileConfig, usage: Usage) -> float:
 class ChatClient:
     """真实 OpenAI 兼容后端。给定 profile fallback 链，逐个尝试直到成功。"""
 
-    def __init__(self, retries_per_profile: int = 2) -> None:
+    def __init__(self, retries_per_profile: int = 5) -> None:
         self.retries = retries_per_profile
 
     async def complete(
@@ -55,7 +55,10 @@ class ChatClient:
                         )
                     except (httpx.HTTPError, ProviderError, KeyError) as e:
                         last_err = e
-                        wait = 1.5 * (attempt + 1)
+                        # 限流（429）/网关错误（5xx）退避更久，避免继续冲击代理
+                        msg = str(e)
+                        throttled = "429" in msg or "502" in msg or "503" in msg or "504" in msg
+                        wait = min(30.0, (6.0 if throttled else 1.5) * (attempt + 1))
                         logger.warning(
                             "chat profile=%s attempt=%d failed: %s (retry in %.1fs)",
                             cfg.name, attempt, e, wait,
@@ -77,6 +80,8 @@ class ChatClient:
             "model": cfg.model,
             "messages": messages,
             "temperature": cfg.temperature if temperature is None else temperature,
+            # 显式非流式：部分 OpenAI 兼容代理默认返回 SSE 流，会破坏 resp.json()
+            "stream": False,
         }
         mt = max_tokens if max_tokens is not None else cfg.max_tokens
         if mt:

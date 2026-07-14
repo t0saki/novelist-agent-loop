@@ -64,6 +64,7 @@ async def _generate_scene(
     rolling_summary: str,
     is_final_chapter: bool,
     is_final_scene: bool,
+    is_opening: bool,
     chapter_id: int,
     floor_ratio: float,
 ) -> tuple[str, bool]:
@@ -80,7 +81,7 @@ async def _generate_scene(
         shortfall = max(0, target - best_words) if attempt > 0 else None
         user = prompts.scene_prompt(
             novel.title, voice, ctx_block, chapter_bp.get("title", ""),
-            scene, prev_tail, is_final_chapter, is_final_scene, attempt, shortfall,
+            scene, prev_tail, is_final_chapter, is_final_scene, is_opening, attempt, shortfall,
         )
         out = await llm.text(
             "scene", "writing",
@@ -155,9 +156,10 @@ async def stage_writing(
         prev_tail = ""
         for si, scene in enumerate(scenes):
             is_final_scene = si >= len(scenes) - 1
+            is_opening = index == 1 and si == 0
             text, ok = await _generate_scene(
                 llm, novel, chapter_bp, scene, prev_tail, rolling,
-                is_final_chapter, is_final_scene, chapter.id, floor_ratio,
+                is_final_chapter, is_final_scene, is_opening, chapter.id, floor_ratio,
             )
             scene_texts.append({"summary": scene.get("summary", ""), "text": text, "ok": ok})
             prev_tail = text

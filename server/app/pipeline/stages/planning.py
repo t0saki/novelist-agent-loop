@@ -140,11 +140,17 @@ async def _make_blueprints(session: Session, llm: PipelineLLM, novel: Novel, sta
     count = min(count, total - start + 1)
     if count <= 0:
         return
+    chars = (novel.bible or {}).get("characters", [])
+    characters_block = "\n".join(
+        f"- {c.get('name','')}（{c.get('role','')}）：{c.get('description','')}"
+        for c in chars
+    ) or "（设定集未提供角色，请据简介自拟并保持全书一致）"
     data = await llm.structured(
         "chapter_blueprints", "outline",
         system=prompts.SYSTEM_JSON,
         user=prompts.blueprint_prompt(
-            novel.title, novel.synopsis, outline_context(novel), start, count, total
+            novel.title, novel.synopsis, outline_context(novel),
+            characters_block, start, count, total,
         ),
         ctx={"start": start, "count": count, "total": total, "seed": f"n{novel.id}"},
     )

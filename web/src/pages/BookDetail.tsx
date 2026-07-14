@@ -27,7 +27,7 @@ export default function BookDetail() {
           <div style={{ width: 160, flexShrink: 0 }}>
             <div className="cover">
               {book.has_cover ? (
-                <img src={`/api/reader/books/${slug}/cover`} alt={book.title} />
+                <img src={`/api/reader/books/${slug}/cover?token=${getToken()}`} alt={book.title} />
               ) : (
                 <div className="cover-title">{book.title}</div>
               )}
