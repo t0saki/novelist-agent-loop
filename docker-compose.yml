@@ -23,7 +23,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "${NOVELIST_PORT:-8000}:8000"
     volumes:
       - ./data:/data
     environment:
