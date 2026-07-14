@@ -23,6 +23,7 @@ data/covers/
 data/illustrations/
 data/epub/
 data/*.log
+pgdata/
 
 # Env
 .env

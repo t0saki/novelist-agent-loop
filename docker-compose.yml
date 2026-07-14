@@ -1,13 +1,34 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: novelist-postgres
+    environment:
+      POSTGRES_USER: novelist
+      POSTGRES_PASSWORD: "${NOVELIST_PG_PASSWORD:-novelist}"
+      POSTGRES_DB: novelist
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U novelist -d novelist"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   novelist:
     build: .
-    image: novelist-agent-loop:latest
+    image: ghcr.io/t0saki/novelist-agent-loop:latest
     container_name: novelist
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8000:8000"
     volumes:
       - ./data:/data
     environment:
+      # 数据库：默认走 compose 内的 Postgres（MVCC，天然支持并发写者）
+      NOVELIST_DATABASE_URL: "postgresql+psycopg://novelist:${NOVELIST_PG_PASSWORD:-novelist}@postgres:5432/novelist"
       # 首次启动的管理员密码（之后可在网页端修改；留空则随机生成并打印到日志）
       NOVELIST_ADMIN_PASSWORD: "${NOVELIST_ADMIN_PASSWORD:-}"
       # 会话签名密钥（留空则持久化到 /data/.session_secret）
@@ -17,3 +38,6 @@ services:
       # 调度器开关
       NOVELIST_SCHEDULER_ENABLED: "${NOVELIST_SCHEDULER_ENABLED:-true}"
     restart: unless-stopped
+
+# 说明：想用 SQLite（本地/单机零依赖）可把 novelist 的 NOVELIST_DATABASE_URL 留空
+# 并去掉 postgres 服务与 depends_on。生产建议保留 Postgres。
