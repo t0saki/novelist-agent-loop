@@ -101,6 +101,10 @@ class Scheduler:
                 if exc:
                     logger.error("job=%s 任务异常：%s", jid, exc)
 
+        # 看门狗：DB 里标记 running 但没有活任务的 job（任务异常/进程被杀导致孤儿），
+        # 重新入队让其从检查点续跑；超过重试上限则判失败。防止「永远卡在某阶段」。
+        self._reap_stale_running()
+
         with session_scope() as session:
             if _get(session, "scheduler_paused", False):
                 return
@@ -131,6 +135,33 @@ class Scheduler:
             broker.publish("book_created", {"job_id": job_id})
             self._launch(job_id)
             capacity -= 1
+
+    def _reap_stale_running(self) -> None:
+        """把 DB 中 status=running 但没有对应活任务的 job 复位。
+
+        这类 job 的 asyncio 任务已死（异常/取消），或进程曾被杀，DB 状态没落终态，
+        而调度器只挑 queued/paused，会导致其永远卡住。每 tick 检查并回收。
+        """
+        with session_scope() as session:
+            max_attempts = int(_get(session, "max_job_attempts", 3) or 3)
+            stale = session.execute(
+                select(Job).where(Job.status == JobStatus.running.value)
+            ).scalars().all()
+            for job in stale:
+                if job.id in self.running:
+                    continue  # 确有活任务，正常运行中
+                job.attempts += 1
+                if job.attempts >= max_attempts:
+                    job.status = JobStatus.failed.value
+                    job.error = (job.error or "") + " | 任务孤儿：running 无活任务，重试耗尽"
+                    novel = session.get(Novel, job.novel_id) if job.novel_id else None
+                    if novel is not None:
+                        novel.status = NovelStatus.failed.value
+                    logger.warning("孤儿任务 job=%s 重试耗尽，判失败", job.id)
+                else:
+                    job.status = JobStatus.queued.value
+                    logger.warning("回收孤儿任务 job=%s（running→queued, stage=%s, attempts=%s）",
+                                   job.id, job.stage, job.attempts)
 
     def _launch(self, job_id: int) -> None:
         if job_id in self.running:

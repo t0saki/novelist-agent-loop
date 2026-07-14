@@ -87,6 +87,39 @@ async def test_per_book_budget_pauses():
         assert novel.status == NovelStatus.completed.value
 
 
+def test_stale_running_job_recovered():
+    """running 但无活任务的孤儿 job（第二本卡死的根因）应被看门狗回收为 queued。"""
+    _wipe()
+    _set("max_job_attempts", 3)
+    with session_scope() as s:
+        from app.services.novels import create_novel_with_job
+        novel, job = create_novel_with_job(s, None)
+        job.status = JobStatus.running.value
+        job.stage = "bible"
+        job_id = job.id
+    sched = Scheduler()  # self.running 为空 => 没有活任务
+    sched._reap_stale_running()
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        assert job.status == JobStatus.queued.value
+        assert job.attempts == 1
+
+
+def test_stale_running_fails_after_max_attempts():
+    _wipe()
+    _set("max_job_attempts", 2)
+    with session_scope() as s:
+        from app.services.novels import create_novel_with_job
+        novel, job = create_novel_with_job(s, None)
+        job.status = JobStatus.running.value
+        job.attempts = 1
+        job_id = job.id
+    sched = Scheduler()
+    sched._reap_stale_running()
+    with session_scope() as s:
+        assert s.get(Job, job_id).status == JobStatus.failed.value
+
+
 async def test_orphan_recovery():
     _wipe()
     _set("rate_limit", {"books_per_day": 0, "books_per_5h": 0})  # 0=不限

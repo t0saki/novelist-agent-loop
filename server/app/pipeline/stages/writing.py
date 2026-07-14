@@ -152,6 +152,9 @@ async def stage_writing(
         chapter.status = ChapterStatus.writing.value
 
         rolling = _rolling_summary(session, novel.id, index)
+        # 提交章壳，释放上面 SELECT 触发的 autoflush 写锁，避免跨 LLM 调用长时间持锁
+        session.commit()
+
         scene_texts: list[dict] = []
         prev_tail = ""
         for si, scene in enumerate(scenes):
@@ -168,6 +171,10 @@ async def stage_writing(
                     "chapter": index, "scene": si, "type": "short",
                     "detail": f"场景字数未达标（目标{scene.get('target_words')}）",
                 })
+            # 每个场景后落库并提交：写锁只在 commit 瞬间持有，不跨下一个场景的 LLM 调用
+            chapter.scenes = list(scene_texts)
+            chapter.content = "\n\n".join(s["text"] for s in scene_texts)
+            session.commit()
 
         content = "\n\n".join(s["text"] for s in scene_texts)
         chapter.content = content

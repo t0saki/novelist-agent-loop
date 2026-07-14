@@ -124,27 +124,43 @@ class PipelineEngine:
 
             except Exception as e:  # noqa: BLE001
                 logger.exception("job=%s stage=%s 失败", job.id, job.stage)
-                session.rollback()
-                # rollback 后需重新取对象
-                job = session.get(Job, job_id)
-                novel = session.get(Novel, job.novel_id) if job and job.novel_id else None
-                if job is None:
-                    return "missing"
-                job.attempts += 1
-                job.error = str(e)[:1000]
-                if job.attempts >= max_attempts:
-                    job.status = JobStatus.failed.value
-                    if novel is not None:
-                        novel.status = NovelStatus.failed.value
-                        novel.error = str(e)[:1000]
-                else:
-                    job.status = JobStatus.queued.value  # 稍后重试
-                session.commit()
+                try:
+                    session.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                # 关键：用**全新会话**记账失败，避免当前会话被 flush 异常（如
+                # database is locked）污染后连状态都写不回，导致 job 永远卡在 running。
+                # 若这次写回也失败，调度器看门狗仍会把 running 孤儿回收。
+                status = self._record_failure(job_id, str(e)[:1000], max_attempts)
+                return status
+
+    def _record_failure(self, job_id: int, err: str, max_attempts: int) -> str:
+        for attempt in range(3):
+            try:
+                with session_scope() as s:
+                    job = s.get(Job, job_id)
+                    if job is None:
+                        return "missing"
+                    novel = s.get(Novel, job.novel_id) if job.novel_id else None
+                    job.attempts += 1
+                    job.error = err
+                    if job.attempts >= max_attempts:
+                        job.status = JobStatus.failed.value
+                        if novel is not None:
+                            novel.status = NovelStatus.failed.value
+                            novel.error = err
+                    else:
+                        job.status = JobStatus.queued.value  # 稍后重试
+                    final = job.status == JobStatus.failed.value
+                    attempts = job.attempts
+                    jid = job.id
                 broker.publish("job_error", {
-                    "job_id": job.id, "attempts": job.attempts, "error": job.error,
-                    "final": job.status == JobStatus.failed.value,
+                    "job_id": jid, "attempts": attempts, "error": err, "final": final,
                 })
-                return job.status
+                return JobStatus.failed.value if final else JobStatus.queued.value
+            except Exception:  # noqa: BLE001
+                logger.warning("记账失败重试 %d/3（job=%s）", attempt + 1, job_id)
+        return JobStatus.running.value  # 记账彻底失败，交由看门狗回收
 
     async def _dispatch(self, stage, session, llm, novel, job) -> str | None:
         if stage == STAGE_IDEATION:

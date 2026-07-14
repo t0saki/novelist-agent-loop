@@ -25,7 +25,8 @@ def _configure_sqlite(dbapi_conn, _record) -> None:
     cur.execute("PRAGMA journal_mode=WAL")
     cur.execute("PRAGMA synchronous=NORMAL")
     cur.execute("PRAGMA foreign_keys=ON")
-    cur.execute("PRAGMA busy_timeout=10000")
+    # 写者等待锁的时间：SQLite 单写者，流水线并发/读写争用时给足退避窗口
+    cur.execute("PRAGMA busy_timeout=30000")
     cur.close()
 
 
