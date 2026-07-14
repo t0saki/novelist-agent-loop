@@ -35,12 +35,16 @@ def get_engine() -> Engine:
     if _engine is None:
         settings = get_settings()
         settings.ensure_dirs()
-        _engine = create_engine(
-            f"sqlite:///{settings.db_path}",
-            connect_args={"check_same_thread": False},
-            future=True,
-        )
-        event.listen(_engine, "connect", _configure_sqlite)
+        url = settings.database_url or f"sqlite:///{settings.db_path}"
+        is_sqlite = url.startswith("sqlite")
+        if is_sqlite:
+            _engine = create_engine(
+                url, connect_args={"check_same_thread": False}, future=True
+            )
+            event.listen(_engine, "connect", _configure_sqlite)
+        else:
+            # Postgres 等：MVCC，天然支持并发写者，无 SQLite 的 database is locked。
+            _engine = create_engine(url, pool_pre_ping=True, pool_size=10, future=True)
         _SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
     return _engine
 

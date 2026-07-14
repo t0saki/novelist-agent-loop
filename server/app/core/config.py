@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     # 数据目录：SQLite、封面、插图、EPUB 都放这里（Docker volume 挂载点）
     data_dir: Path = Field(default=Path("../data"))
 
+    # 数据库连接串。留空则用 data_dir 下的 SQLite；生产建议 Postgres：
+    # postgresql+psycopg://user:pass@host:5432/dbname
+    database_url: str = Field(default="")
+
     # 首次启动时用于初始化管理员密码；之后以 DB 中 hash 为准。
     # 留空则首启生成随机密码并打印到日志。
     admin_password: str = Field(default="")

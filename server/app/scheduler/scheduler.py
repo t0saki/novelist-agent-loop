@@ -128,9 +128,13 @@ class Scheduler:
                 if not can_start_new_book(session):
                     break
                 theme = _pick_theme(session)
+                if theme is None:
+                    # 没有启用的题材就不要凭空造一本无题材的书（避免跑偏出无关内容）
+                    logger.info("无启用题材，跳过自动立项")
+                    break
                 novel, job = create_novel_with_job(session, theme)
                 job_id = job.id
-                title_hint = theme.name if theme else "自由发挥"
+                title_hint = theme.name
             logger.info("自动立项新书 job=%s 题材=%s", job_id, title_hint)
             broker.publish("book_created", {"job_id": job_id})
             self._launch(job_id)

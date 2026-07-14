@@ -15,12 +15,15 @@ from app.core.events import broker
 from app.core.security import hash_password, verify_token
 from app.db.models import (
     Chapter,
+    Image,
     Job,
     JobStatus,
     LlmProfile,
     Novel,
+    NovelEmbedding,
     NovelStatus,
     ReaderPassword,
+    ReadingProgress,
     Setting,
     Theme,
     UsageLedger,
@@ -334,8 +337,11 @@ def delete_novel(slug: str, session: Session = Depends(db_session), _: dict = De
     n = session.execute(select(Novel).where(Novel.slug == slug)).scalar_one_or_none()
     if not n:
         raise HTTPException(404, "书籍不存在")
-    session.execute(delete(Job).where(Job.novel_id == n.id))
-    session.delete(n)  # cascade 章节
+    nid = n.id
+    # 先删所有引用该书的子表，再删书本身（否则外键约束失败）
+    for model in (UsageLedger, NovelEmbedding, Image, ReadingProgress, Chapter, Job):
+        session.execute(delete(model).where(model.novel_id == nid))
+    session.execute(delete(Novel).where(Novel.id == nid))
     return {"ok": True}
 
 
