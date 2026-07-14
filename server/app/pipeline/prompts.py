@@ -165,5 +165,8 @@ def cover_prompt_prompt(title: str, synopsis: str, tone: str) -> str:
     return (
         f"书名：{title}\n基调：{tone}\n简介：{synopsis}\n\n"
         "请为这部小说设计一张封面。用一段英文描述画面（风格、构图、光线、主体、氛围），"
-        "适合作为文生图模型的 prompt，只输出这段英文 prompt。"
+        "适合作为文生图模型的 prompt。"
+        "**画面必须是全年龄安全内容（SFW）**：即使小说本身是成人向，封面也要含蓄，"
+        "以氛围、意象、象征来表现，不得包含裸露、性行为、性暗示或任何露骨内容。"
+        "只输出这段英文 prompt。"
     )

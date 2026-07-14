@@ -45,6 +45,10 @@ async def _gen_image(session: Session, prompt: str, size: str) -> bytes | None:
         return None
 
 
+# 图像生成的硬性 SFW 后缀：即便小说是成人向，封面/插图始终保持全年龄安全
+_SFW_SUFFIX = ", SFW, safe for work, tasteful, fully clothed, no nudity, no sexual content, no explicit content, atmospheric illustration"
+
+
 async def run_cover_job(session: Session, llm: PipelineLLM, novel: Novel) -> None:
     settings = get_settings()
     settings.ensure_dirs()
@@ -56,7 +60,7 @@ async def run_cover_job(session: Session, llm: PipelineLLM, novel: Novel) -> Non
         user=prompts.cover_prompt_prompt(novel.title, novel.synopsis, novel.tone),
         ctx={"seed": f"n{novel.id}"},
     )
-    data = await _gen_image(session, cover_prompt, "1024x1536")
+    data = await _gen_image(session, cover_prompt + _SFW_SUFFIX, "1024x1536")
     if data:
         path = settings.covers_dir / f"{novel.slug}.png"
         path.write_bytes(data)
@@ -75,7 +79,7 @@ async def run_cover_job(session: Session, llm: PipelineLLM, novel: Novel) -> Non
             if c.index % every != 0:
                 continue
             illo_prompt = f"Illustration for chapter '{c.title}': {c.summary}. Cinematic, atmospheric."
-            img = await _gen_image(session, illo_prompt, "1024x1024")
+            img = await _gen_image(session, illo_prompt + _SFW_SUFFIX, "1024x1024")
             if img:
                 p = settings.illustrations_dir / f"{novel.slug}-{c.index}.png"
                 p.write_bytes(img)
