@@ -1,0 +1,12 @@
+**/__pycache__/
+**/*.pyc
+server/.venv/
+server/.pytest_cache/
+server/.ruff_cache/
+web/node_modules/
+web/dist/
+data/
+.git/
+.gitignore
+*.md
+!README.md

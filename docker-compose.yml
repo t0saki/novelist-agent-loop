@@ -1,0 +1,19 @@
+services:
+  novelist:
+    build: .
+    image: novelist-agent-loop:latest
+    container_name: novelist
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      # 首次启动的管理员密码（之后可在网页端修改；留空则随机生成并打印到日志）
+      NOVELIST_ADMIN_PASSWORD: "${NOVELIST_ADMIN_PASSWORD:-}"
+      # 会话签名密钥（留空则持久化到 /data/.session_secret）
+      NOVELIST_SESSION_SECRET: "${NOVELIST_SESSION_SECRET:-}"
+      # Mock 模式：true 则不调真实模型，用假 LLM 零成本演练
+      NOVELIST_MOCK_LLM: "${NOVELIST_MOCK_LLM:-false}"
+      # 调度器开关
+      NOVELIST_SCHEDULER_ENABLED: "${NOVELIST_SCHEDULER_ENABLED:-true}"
+    restart: unless-stopped

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+uv.lock
+
+# Node
+node_modules/
+web/dist/
+.vite/
+
+# Data (runtime artifacts)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/covers/
+data/illustrations/
+data/epub/
+data/*.log
+
+# Env
+.env
+.env.local
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
