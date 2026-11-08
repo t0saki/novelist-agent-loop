@@ -55,6 +55,7 @@ async function startServer(): Promise<void> {
       NOVELIST_DATA_DIR: dataDir,
       ...(process.env.NOVELIST_E2E_DATABASE_URL ? { NOVELIST_DATABASE_URL: process.env.NOVELIST_E2E_DATABASE_URL } : {}),
       NOVELIST_FAKE_HARNESS: '1',
+      NOVELIST_ISOLATION: 'container',
       NOVELIST_ADMIN_PASSWORD: ADMIN_PASSWORD,
       NOVELIST_HOST: '127.0.0.1',
       NOVELIST_LISTEN_PORT: String(port),

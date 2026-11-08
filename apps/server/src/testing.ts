@@ -29,6 +29,7 @@ export interface TestApp {
 export async function createTestApp(opts?: { http?: boolean; preset?: string; web?: string }): Promise<TestApp> {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'nv-g-'));
   const config = loadConfig({
+    NOVELIST_ISOLATION: 'container',
     NOVELIST_DATA_DIR: dataDir,
     NOVELIST_DATABASE_URL: 'pglite:memory',
     NOVELIST_ADMIN_PASSWORD: TEST_ADMIN_PASSWORD,

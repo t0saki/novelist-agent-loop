@@ -152,7 +152,7 @@ export async function createOrchTestEnv(opts: { pipeline?: FakePipelineOptions; 
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'nv-f-'));
   const paths = dataPaths(dataDir);
   for (const d of [paths.books, paths.accounts, paths.runs, paths.runsActive, paths.instructionsGlobal]) await fs.mkdir(d, { recursive: true });
-  const config = loadConfig({ NOVELIST_DATA_DIR: dataDir, NOVELIST_ALLOW_FAKE_HARNESS: '1', NOVELIST_DATABASE_URL: 'pglite:memory' } as NodeJS.ProcessEnv);
+  const config = loadConfig({ NOVELIST_DATA_DIR: dataDir, NOVELIST_ISOLATION: 'container', NOVELIST_ALLOW_FAKE_HARNESS: '1', NOVELIST_DATABASE_URL: 'pglite:memory' } as NodeJS.ProcessEnv);
   const dbh = await createTestDb();
   const db = dbh.db;
   await seedRouting(db);
