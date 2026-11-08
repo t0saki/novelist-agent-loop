@@ -1,0 +1,27 @@
+{
+  "name": "novelist",
+  "version": "2.0.0-alpha.0",
+  "private": true,
+  "type": "module",
+  "description": "Novelist 2.0 — 自托管超长篇网文工厂兼阅读室（驱动 vendor harness 写作）",
+  "license": "MIT",
+  "packageManager": "pnpm@10.34.9",
+  "engines": {
+    "node": ">=24.9"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel --filter @novelist/server --filter @novelist/web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "biome lint .",
+    "format": "biome format --write ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.6",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}

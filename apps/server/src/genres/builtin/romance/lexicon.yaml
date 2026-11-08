@@ -1,0 +1,12 @@
+schema: nv.lexicon/1
+ban:
+  - 邪魅一笑
+  - 小鹿乱撞
+  - 心漏跳了一拍
+watch:
+  - 脸红
+  - 心跳
+  - 温柔
+  - 宠溺
+allow: []
+patterns: []

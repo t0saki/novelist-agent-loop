@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a1b9df-2451-7580-853a-e9c949c4c65a"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll write `你好` to `out.txt` in the current directory."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc \"printf '%s' '你好' > out.txt\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc \"printf '%s' '你好' > out.txt\"","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"OK"}}
+{"type":"turn.completed","usage":{"input_tokens":21859,"cached_input_tokens":19200,"cache_write_input_tokens":0,"output_tokens":63,"reasoning_output_tokens":0}}

@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"nv-run-2","timestamp":"2026-11-08T14:00:00.000Z","cwd":"/x"}
+{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"529 overloaded"}
+{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"529 overloaded"}}
+{"type":"agent_settled","aborted":false}

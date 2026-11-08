@@ -1,0 +1,11 @@
+# 都市题材包
+schema: nv.pack/1
+id: urban
+name: 都市
+description: 现代都市背景的逆袭、职场、商战与生活
+extends: [generic]
+builtin: true
+event_families:
+  transfer: [转账, 收购, 签约, 过户, 入股]
+  reveal: [真实身份, 背景, 幕后, 老板]
+  relation: [分手, 复合, 订婚, 离婚]

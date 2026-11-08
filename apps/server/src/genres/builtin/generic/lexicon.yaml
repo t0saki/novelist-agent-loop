@@ -1,0 +1,41 @@
+# 去模板腔词表（lexicon gate 默认 soft）：只标记套话和机械表达，不限制题材和内容。
+# ban：一旦出现就记违规；watch：高频才提示；allow：放行（书层 allow 压过一切 ban）。
+schema: nv.lexicon/1
+ban:
+  - 一股莫名的
+  - 嘴角勾起一抹
+  - 嘴角微微上扬
+  - 眼中闪过一丝
+  - 眼底闪过一抹
+  - 空气仿佛凝固了
+  - 空气仿佛凝滞
+  - 时间仿佛静止了
+  - 一抹难以察觉的
+  - 心中涌起一股
+  - 心中五味杂陈
+  - 仿佛一切都没有发生
+  - 不知过了多久
+  - 这一刻，他终于明白
+  - 这一刻，她终于明白
+watch:
+  - 仿佛
+  - 似乎
+  - 不禁
+  - 微微
+  - 淡淡
+  - 缓缓
+  - 一丝
+  - 一抹
+  - 深吸一口气
+  - 沉默了片刻
+  - 点了点头
+  - 不由得
+  - 与此同时
+  - 毫无疑问
+allow: []
+patterns:
+  - { id: not_but, regex: "不是[^，。！？\\n]{1,20}，而是", weight: 1, where: any }
+  - { id: open_weather, regex: "^.{0,40}(天色阴沉|夜色如墨|阳光透过|清晨的第一缕阳光)", weight: 2, where: open }
+  - { id: open_wake, regex: "^.{0,40}(缓缓睁开|猛地睁开|从睡梦中醒来)", weight: 2, where: open }
+  - { id: close_reflect, regex: "(他知道|她知道|他明白|她明白|新的征程|命运的齿轮).{0,30}$", weight: 2, where: close }
+  - { id: close_ellipsis_fate, regex: "(一切才刚刚开始|风暴即将来临|真正的考验)[。…！]*$", weight: 2, where: close }

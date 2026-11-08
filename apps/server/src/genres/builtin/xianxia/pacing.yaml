@@ -1,0 +1,5 @@
+schema: nv.pacing/1
+chapter_length: { min: 2600, target: 3000, max: 3800, count_mode: han }
+beats_per_chapter: [4, 7]
+arc_length: [12, 30]
+card_buffer: { min: 6, target: 12 }

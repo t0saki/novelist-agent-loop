@@ -1,0 +1,45 @@
+{
+  "name": "@novelist/server",
+  "version": "2.0.0-alpha.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "novelist": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx --conditions=source watch src/cli.ts serve",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "cli": "tsx --conditions=source src/cli.ts"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.15",
+    "@fastify/cookie": "^11.1.5",
+    "@fastify/multipart": "^10.1.8",
+    "@fastify/rate-limit": "^11.2.2",
+    "@fastify/static": "^10.1.10",
+    "@node-rs/argon2": "^2.2.2",
+    "@node-rs/jieba": "^2.0.4",
+    "@novelist/shared": "workspace:*",
+    "croner": "^11.0.0",
+    "diff": "^9.0.0",
+    "drizzle-orm": "^0.45.4",
+    "execa": "^10.2.1",
+    "fastify": "^5.12.8",
+    "jszip": "^3.10.2",
+    "nanoid": "^6.0.2",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "pinyin-pro": "^3.29.5",
+    "prom-client": "^15.1.3",
+    "smol-toml": "^1.9.1",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11"
+  }
+}

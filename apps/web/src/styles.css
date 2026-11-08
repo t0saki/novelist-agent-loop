@@ -1,0 +1,98 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-panel2: var(--panel2);
+  --color-ink: var(--ink);
+  --color-sub: var(--sub);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --color-chart: var(--chart);
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-serif: "Songti SC", "Noto Serif CJK SC", "Source Han Serif SC", SimSun, serif;
+}
+
+:root {
+  color-scheme: light;
+  --bg: #f6f4ef;
+  --panel: #fffefb;
+  --panel2: #efece4;
+  --ink: #23201b;
+  --sub: #6b655a;
+  --faint: #9b9486;
+  --line: #e2ddd1;
+  --accent: #a83f2c;
+  --on-accent: #fff9f5;
+  --ok: #2f7d4f;
+  --warn: #9a6a00;
+  --danger: #c0392b;
+  --info: #2a6fb5;
+  --chart: #2a78d6;
+}
+
+.dark {
+  color-scheme: dark;
+  --bg: #15140f;
+  --panel: #1e1c17;
+  --panel2: #2a2720;
+  --ink: #ece7dc;
+  --sub: #aca596;
+  --faint: #7b7568;
+  --line: #36322a;
+  --accent: #e0755c;
+  --on-accent: #1d0f0a;
+  --ok: #5cbb83;
+  --warn: #dba63a;
+  --danger: #ec7063;
+  --info: #6aa9e6;
+  --chart: #3987e5;
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-text-size-adjust: 100%;
+  overflow-wrap: break-word;
+}
+button, a, input, select, textarea { touch-action: manipulation; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.tbl { width: 100%; font-size: 0.875rem; border-collapse: collapse; }
+.tbl th { text-align: left; font-weight: 500; color: var(--sub); padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.tbl td { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tbl td { min-width: 3.5rem; }
+.tbl tbody tr:last-child td { border-bottom: 0; }
+.tbl tbody tr:hover { background: color-mix(in srgb, var(--panel2) 55%, transparent); }
+
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+/* 阅读器：配色由 data-reader-theme 决定，与站点明暗主题相互独立 */
+.reader { background: var(--r-bg); color: var(--r-ink); min-height: 100dvh; transition: background 0.2s; }
+.reader[data-reader-theme="paper"] { --r-bg: #fbfaf6; --r-ink: #26231d; --r-sub: #7b7466; --r-bar: rgba(251, 250, 246, 0.94); --r-line: #e6e1d5; }
+.reader[data-reader-theme="sepia"] { --r-bg: #f3e7cd; --r-ink: #4a3a22; --r-sub: #84704f; --r-bar: rgba(243, 231, 205, 0.94); --r-line: #dfcfa9; }
+.reader[data-reader-theme="green"] { --r-bg: #d9e8d5; --r-ink: #24352a; --r-sub: #587058; --r-bar: rgba(217, 232, 213, 0.94); --r-line: #bdd2b8; }
+.reader[data-reader-theme="dark"] { --r-bg: #1a1916; --r-ink: #bdb6a7; --r-sub: #7c766a; --r-bar: rgba(26, 25, 22, 0.94); --r-line: #322f28; }
+.reader[data-reader-theme="black"] { --r-bg: #000; --r-ink: #93908a; --r-sub: #5f5c56; --r-bar: rgba(0, 0, 0, 0.92); --r-line: #24231f; }
+.reader-bar { position: fixed; left: 0; right: 0; z-index: 30; background: var(--r-bar); backdrop-filter: blur(8px); color: var(--r-ink); transition: transform 0.22s ease, opacity 0.22s ease; }
+.reader-bar.top { top: 0; border-bottom: 1px solid var(--r-line); padding-top: env(safe-area-inset-top); }
+.reader-bar.bottom { bottom: 0; border-top: 1px solid var(--r-line); padding-bottom: env(safe-area-inset-bottom); }
+.reader-bar.top.off { transform: translateY(-100%); opacity: 0; pointer-events: none; }
+.reader-bar.bottom.off { transform: translateY(100%); opacity: 0; pointer-events: none; }
+.reader-body { font-family: var(--reader-font-family, var(--font-serif)); font-size: var(--reader-font-size, 19px); line-height: var(--reader-line-height, 1.9); max-width: var(--reader-width, 42rem); margin: 0 auto; padding: 5rem 1.25rem 7rem; }
+.reader-body h1 { font-size: 1.35em; font-weight: 700; margin-bottom: 1.6em; line-height: 1.4; }
+.reader-body p { text-indent: 2em; margin: 0 0 0.85em; }
+.reader-progress { position: fixed; top: 0; left: 0; height: 2px; background: var(--r-sub); z-index: 31; opacity: 0.6; pointer-events: none; }
+.cm-editor { font-size: 14px; }
+.cm-editor.cm-focused { outline: none; }

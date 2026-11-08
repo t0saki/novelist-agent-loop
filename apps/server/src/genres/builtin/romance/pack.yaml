@@ -1,0 +1,13 @@
+# 言情题材包
+schema: nv.pack/1
+id: romance
+name: 言情
+description: 以情感关系为主线，强调拉扯、误会、成长和双向奔赴
+extends: [generic]
+builtin: true
+event_families:
+  confession: [表白, 告白, 我喜欢你, 心意]
+  relation: [在一起, 分手, 和好, 订婚, 成婚, 吃醋]
+  reveal: [身世, 真相, 隐瞒, 当年]
+catalogs:
+  tropes: [先婚后爱, 破镜重圆, 青梅竹马, 欢喜冤家, 双向暗恋]

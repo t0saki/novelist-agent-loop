@@ -1,29 +1,23 @@
-# Python
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+coverage/
+
+# v1 (legacy) leftovers
 __pycache__/
 *.py[cod]
 .venv/
-venv/
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
+legacy/v1/server/uv.lock
 
-# uv
-uv.lock
-
-# Node
-node_modules/
-web/dist/
-.vite/
-
-# Data (runtime artifacts)
-data/*.db
-data/*.db-wal
-data/*.db-shm
-data/covers/
-data/illustrations/
-data/epub/
-data/*.log
-pgdata/
+# Runtime data (dev)
+/data/
+/data2/
+/pgdata/
+/pgdata17/
+/secrets/
+*.log
 
 # Env
 .env

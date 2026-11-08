@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","cwd":"/x","session_id":"s-rl","tools":[],"mcp_servers":[],"model":"claude-opus-5-5","claude_code_version":"2.1.319"}
+{"type":"system","subtype":"api_retry","attempt":1,"max_retries":3,"retry_delay_ms":5000,"error_status":429,"error":"rate_limit"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1794337200,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":1.0,"resetsAt":1794337200,"status":"rejected"}}}}
+{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["usage limit reached"],"stop_reason":null,"session_id":"s-rl","num_turns":0}

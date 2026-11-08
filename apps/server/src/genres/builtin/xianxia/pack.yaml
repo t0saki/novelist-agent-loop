@@ -1,0 +1,14 @@
+# 仙侠题材包
+schema: nv.pack/1
+id: xianxia
+name: 仙侠
+description: 修仙升级、宗门与秘境、天道与因果
+extends: [generic]
+builtin: true
+event_families:
+  death: [陨落, 兵解, 魂飞魄散, 坐化]
+  breakthrough: [突破, 晋入, 踏入, 破境, 结丹, 化婴, 渡劫]
+  transfer: [祭炼, 认主, 夺舍, 传承]
+  reveal: [转世, 前世, 真身, 道号]
+catalogs:
+  power_stages: [练气, 筑基, 金丹, 元婴, 化神, 炼虚, 合体, 大乘, 渡劫]

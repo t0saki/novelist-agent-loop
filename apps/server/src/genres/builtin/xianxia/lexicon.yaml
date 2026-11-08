@@ -1,0 +1,12 @@
+schema: nv.lexicon/1
+ban:
+  - 恐怖如斯
+  - 此子断不可留
+  - 倒吸一口凉气
+watch:
+  - 一道身影
+  - 冷哼一声
+  - 蝼蚁
+allow: []
+patterns:
+  - { id: open_rebirth, regex: "^.{0,60}(重生回到|穿越到了这个修仙世界)", weight: 1, where: open }

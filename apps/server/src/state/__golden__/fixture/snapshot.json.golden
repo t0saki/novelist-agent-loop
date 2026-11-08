@@ -1,0 +1,125 @@
+{
+  "arcs_resolved": [],
+  "entities": {
+    "char.lin-feng": {
+      "alive": true,
+      "attrs": {
+        "loc": "loc.qingyun"
+      },
+      "conds": [
+        "injury.arm.left.fracture"
+      ],
+      "first_seen": "c00001",
+      "id": "char.lin-feng",
+      "kind": "character",
+      "last_seen": "c00003",
+      "name": "林枫",
+      "power": {
+        "cultivation": "练气九层"
+      },
+      "stage": "s1"
+    },
+    "char.su-wan": {
+      "alive": true,
+      "attrs": {
+        "loc": "loc.qingyun"
+      },
+      "conds": [],
+      "first_seen": "c00001",
+      "id": "char.su-wan",
+      "kind": "character",
+      "last_seen": "c00003",
+      "name": "苏婉",
+      "power": {
+        "cultivation": "练气七层"
+      }
+    },
+    "loc.qingyun": {
+      "alive": true,
+      "attrs": {},
+      "conds": [],
+      "first_seen": "c00001",
+      "id": "loc.qingyun",
+      "kind": "location",
+      "last_seen": "c00003",
+      "name": "青云宗",
+      "power": {}
+    }
+  },
+  "events": [
+    {
+      "ch": "c00001",
+      "id": "ev.c00001.e1",
+      "what": "初雪重逢",
+      "who": [
+        "char.lin-feng",
+        "char.su-wan"
+      ]
+    },
+    {
+      "ch": "c00002",
+      "id": "ev.c00002.e1",
+      "what": "后山遇袭",
+      "who": [
+        "char.lin-feng"
+      ]
+    },
+    {
+      "ch": "c00003",
+      "id": "ev.c00003.e1",
+      "what": "渡口偷听",
+      "who": [
+        "char.lin-feng",
+        "char.su-wan"
+      ]
+    }
+  ],
+  "facts": {
+    "fact.copper-token": {
+      "overridden": false,
+      "since": "c00001",
+      "text": "林枫持有父亲留下的铜牌"
+    }
+  },
+  "hash": "c496819795a442fd84c27438f72a2c587f178665f0e10efbed99cd18812645f2",
+  "items": {},
+  "knowledge": {
+    "char.lin-feng": [
+      "fact.su-wan-spy"
+    ]
+  },
+  "ledger_hash": "fd9608939e0e49890a43cf52d601651c5679743c4b39a121fac1796eea00ad83",
+  "obligations": {
+    "F0001": {
+      "advances": [],
+      "due": [
+        "c00005",
+        "c00012"
+      ],
+      "id": "F0001",
+      "kind": "mystery",
+      "open_ev": "林枫把那枚铜牌收进袖中",
+      "opened": "c00001",
+      "status": "open",
+      "text": "铜牌的来历",
+      "weight": "major"
+    }
+  },
+  "reader_knows": [],
+  "relations": [
+    {
+      "a": "char.lin-feng",
+      "b": "char.su-wan",
+      "since": "c00001",
+      "type": "师兄妹"
+    }
+  ],
+  "schema": "nv.snapshot/1",
+  "through": "c00003",
+  "time": {
+    "calendar": "天元历",
+    "day": 302,
+    "year": 3
+  },
+  "total_cjk": 2400
+}

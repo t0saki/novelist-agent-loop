@@ -1,0 +1,11 @@
+# 科幻题材包
+schema: nv.pack/1
+id: scifi
+name: 科幻
+description: 以设定和推演为卖点的硬核或软科幻
+extends: [generic]
+builtin: true
+event_families:
+  transfer: [接管, 劫持, 移交, 上传]
+  reveal: [真相, 信号, 协议, 实验]
+  breakthrough: [跃迁, 突破, 解锁, 升级]

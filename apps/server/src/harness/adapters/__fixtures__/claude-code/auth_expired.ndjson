@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","cwd":"/data/runs/2026-11/RUN/book","session_id":"11111111-2222-4333-8444-555555555555","tools":["Read","Write"],"mcp_servers":[],"model":"claude-opus-5-5","permissionMode":"acceptEdits","apiKeySource":"none","claude_code_version":"2.1.319"}
+{"type":"result","subtype":"success","is_error":true,"result":"Login expired · Please run /login","stop_reason":null,"session_id":"11111111-2222-4333-8444-555555555555","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0},"num_turns":1,"api_error_status":401}

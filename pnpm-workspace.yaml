@@ -1,0 +1,14 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+
+onlyBuiltDependencies:
+  - "@biomejs/biome"
+  - "@electric-sql/pglite"
+  - "@node-rs/argon2"
+  - "@node-rs/jieba"
+  - esbuild
+
+autoInstallPeers: true
+strictPeerDependencies: false
+linkWorkspacePackages: true

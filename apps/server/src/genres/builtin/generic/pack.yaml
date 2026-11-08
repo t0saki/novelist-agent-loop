@@ -1,0 +1,13 @@
+# 通用网文题材包：其他内置题材包都 extends 它。可在“题材包”页面任意修改。
+schema: nv.pack/1
+id: generic
+name: 通用网文
+description: 通用的长篇网文工艺：黄金三章、爽点节奏、钩子、伏笔回收、人物弧光、去模板腔
+extends: []
+builtin: true
+event_families:
+  death: [死, 身亡, 断气, 丧命, 牺牲, 毙命]
+  transfer: [交给, 递给, 夺走, 抢走, 送给, 收下, 偷走]
+  reveal: [原来是, 竟然是, 正是, 真相, 身份]
+  relation: [结盟, 反目, 决裂, 拜师, 成亲, 背叛]
+  injury: [重伤, 受伤, 中毒, 昏迷, 骨折]

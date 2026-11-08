@@ -1,0 +1,9 @@
+schema: nv.lexicon/1
+ban:
+  - 科技与狠活
+watch:
+  - 量子
+  - 维度
+  - 算法
+allow: []
+patterns: []
