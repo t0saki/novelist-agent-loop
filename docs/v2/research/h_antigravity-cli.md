@@ -29,7 +29,7 @@ Research date: 2026-11-08. The latest CLI version visible in the official CHANGE
 | Item | Fact |
 |---|---|
 | Name / vendor | "Antigravity CLI", Google. It shares its core engine and settings with the Antigravity 2.0 desktop app ([repo](https://github.com/google-antigravity/antigravity-cli)) |
-| Install | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` (macOS/Linux)<br>`irm https://antigravity.google/cli/install.ps1 \| iex` (Windows)<br>Installer flags: `--skip-aliases`, `--skip-path` ([install](https://antigravity.google/docs/install?tab=cli)) |
+| Install | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` (macOS/Linux)<br>`irm https://antigravity.google/cli/install.ps1 \| iex` (Windows)<br>The docs list `--skip-aliases` and `--skip-path`, but the live `install.sh` rejects them. It only accepts `-d/--dir` and `-h/--help` (checked 2026-11-09) |
 | Binary | `agy`, a single Go binary [3rd-party]. Check with `agy --version`. Subcommands include `models`, `agents`, `acp`, `plugin {install,list --json,enable,disable,uninstall,validate --strict,import}` and `mcp {add,remove,list,enable,disable}` |
 | License | Proprietary, under the [Antigravity terms](https://antigravity.google/terms). The GitHub repo is public but only holds the issue tracker, CHANGELOG.md and examples; no LICENSE is shown and there is no source |
 | Release cadence | Very fast: about 21–23 releases per month [3rd-party: havoptic, releasealert]. Pin the version and re-check behaviour on upgrades |

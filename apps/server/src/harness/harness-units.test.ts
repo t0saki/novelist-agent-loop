@@ -555,6 +555,8 @@ describe('probe / install', () => {
     const agy = planInstall(paths, 'agy', '');
     expect(agy.binRel).toBe('home/.local/bin/agy');
     expect(agy.commands[1]!.join(' ')).toContain('antigravity.google/cli/install.sh');
+    // 官方 installer 对未知参数直接 exit 1
+    expect(agy.commands[1]![2]).toMatch(/\| HOME='?\/data\/harness\/agy\/[^ ]+\/home'? bash -s$/);
     expect(() => planInstall(paths, 'fake', '')).toThrow();
   });
 

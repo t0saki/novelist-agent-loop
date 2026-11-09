@@ -79,7 +79,8 @@ export function planInstall(paths: DataPaths, harness: HarnessId, version: strin
       ],
     };
   }
-  // agy：官方 installer 装到隔离 HOME（不改 PATH、不建别名），二进制在 <prefix>/home/.local/bin/agy
+  // agy：官方 installer 只认 -d/--dir，这里不传参，靠隔离 HOME 把二进制放到 <prefix>/home/.local/bin/agy，
+  // 它对 shell rc 的改动也只落在这个隔离 HOME 里
   return {
     harness,
     version: ver,
@@ -89,7 +90,7 @@ export function planInstall(paths: DataPaths, harness: HarnessId, version: strin
     source: `installer:${meta.installer}`,
     commands: [
       ['mkdir', '-p', path.join(prefix, 'home')],
-      ['bash', '-c', `set -euo pipefail; curl -fsSL ${shQuote(meta.installer ?? '')} | HOME=${shQuote(path.join(prefix, 'home'))} bash -s -- --skip-aliases --skip-path`],
+      ['bash', '-c', `set -euo pipefail; curl -fsSL ${shQuote(meta.installer ?? '')} | HOME=${shQuote(path.join(prefix, 'home'))} bash -s`],
     ],
   };
 }
