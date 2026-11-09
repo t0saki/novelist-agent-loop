@@ -144,6 +144,8 @@ async function applyTaskEffect(db: Db, taskId: string, effect: 'done' | 'ready' 
         finishedAt: null,
         params: withOrch(task.params, {
           generation: (orch.generation ?? 1) + 1,
+          avoidProfiles: [],
+          contractFailures: {},
           ...(note ? { ownerNotes: [...(orch.ownerNotes ?? []), { source: `inbox:${item.id}`, text: note }] } : {}),
           recover: undefined,
         }),

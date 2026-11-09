@@ -7,8 +7,8 @@
 import type { RoleId } from '../enums.js';
 import type { ProfileInput, RoleRouteInput, RoutingPresetInput } from './routing.js';
 
-/** Gemini 4 Argon 的 slug 尚未在本地核实（免费档不可见）；UI 以 `agy models` 为准，可改 */
-export const AGY_ARGON_DEFAULT_SLUG = 'gemini-4-argon';
+/** Ultra 账号的 `agy models` 里只有 gemini-4-argon-{low,medium,high}（2026-11-09 核实）；UI 可改 */
+export const AGY_ARGON_DEFAULT_SLUG = 'gemini-4-argon-high';
 
 export const BUILTIN_PROFILES: ProfileInput[] = [
   { id: 'agy-argon', label: 'agy · Gemini 4 Argon', harness: 'agy', model: AGY_ARGON_DEFAULT_SLUG, effort: 'high' },

@@ -24,7 +24,7 @@ async function filesOf(dir: string, prefix = ''): Promise<string[]> {
 }
 
 async function toSummary(deps: AppDeps, pack: Awaited<ReturnType<typeof listGenres>>[number], bookCount: number): Promise<GenreSummary> {
-  return { id: pack.id, name: pack.name, description: pack.description, extends: pack.extends, builtin: pack.builtin, books: bookCount, files: await filesOf(path.join(deps.paths.genres, pack.id)) };
+  return { id: pack.id, name: pack.name, description: pack.description, extends: pack.extends, builtin: pack.builtin, books: bookCount, auto: pack.auto ? { enabled: pack.auto.enabled, weight: pack.auto.weight, keywords: pack.auto.keywords.length, lengthHint: pack.auto.length_hint } : null, files: await filesOf(path.join(deps.paths.genres, pack.id)) };
 }
 
 export async function register(app: FastifyInstance, deps: AppDeps): Promise<void> {

@@ -4,7 +4,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { parse as yamlParse } from 'yaml';
 import type { ArtifactDecl, Card, EffectiveGate, GatesFile, GateResult, InboxKind, LengthSpec, Lexicon, TaskKind } from '@novelist/shared';
-import { zGatesFile, zLexicon } from '@novelist/shared';
+import { SCHEMAS, type SchemaName, toJsonSchema, zGatesFile, zLexicon } from '@novelist/shared';
 import type { BookState } from '../state/index.js';
 import { canonicalJson, loadBookState } from '../state/index.js';
 import { BUILTIN_GATES, mergeLexiconLayers, resolveEffectiveGates, runContractGates } from '../validators/index.js';
@@ -186,6 +186,20 @@ export function frontmatterFor(book: BookHandle | null, task: TaskRow, run: RunC
 }
 
 /** 工作单“输出要求”段：显式的绝对路径 + 回执要求（§5.5） */
+const SCHEMA_BLOCK_MAX_CHARS = 16_000;
+
+/** 结构化产物的 JSON Schema：只写 schema 名时模型只能猜字段（真实 run 里连续失败过） */
+export function schemaBlock(artifacts: ArtifactDecl[]): string[] {
+  const names = [...new Set(artifacts.map((a) => a.schema).filter((s): s is string => !!s && s in SCHEMAS))];
+  const blocks = names.flatMap((name) => {
+    const { $schema: _dialect, ...schema } = toJsonSchema(SCHEMAS[name as SchemaName]);
+    const json = JSON.stringify(schema);
+    return json.length > SCHEMA_BLOCK_MAX_CHARS ? [] : [`\`${name}\`：`, '', '```json', json, '```', ''];
+  });
+  if (blocks.length === 0) return [];
+  return ['', '## 产物结构（必须一致）', '', '字段名、类型和层级必须与下面的 JSON Schema 完全一致，不要加同义字段或改成别的嵌套。YAML 产物按同样的结构书写，.md 产物写在 frontmatter 里。', '', ...blocks];
+}
+
 export function outputBlock(artifacts: ArtifactDecl[], outDir: string): string {
   const lines = artifacts.map((a) => {
     const qty = a.min !== undefined || a.max !== undefined ? `，文件数 ${a.min ?? 1}–${a.max ?? '不限'}` : '';
@@ -201,6 +215,7 @@ export function outputBlock(artifacts: ArtifactDecl[], outDir: string): string {
     `- \`${path.join(outDir, 'receipt.json')}\`（schema: nv.receipt/1）— 回执，必须最后写，status 为 done / blocked / failed`,
     '',
     '产物以文件为准，标准输出只作日志。回执的 nonces 只从系统提示抄录。无法完成时写 status: blocked 并在 questions_for_planner 说明原因，不要交付凑数内容。',
+    ...schemaBlock(artifacts),
   ].join('\n');
 }
 
@@ -217,7 +232,7 @@ export function collectOwnerNotes(card: Card | null, task: TaskRow): { source: s
 }
 
 export function retryHint(task: TaskRow): string {
-  if (task.attempts <= 1 || !task.lastError) return '';
+  if (!task.lastError) return '';
   return `\n## 上一次尝试未通过\n\n${task.lastError}\n\n请修正后重新交付全部产物。\n`;
 }
 

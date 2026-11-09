@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { eq, sql } from 'drizzle-orm';
-import { AGY_ARGON_DEFAULT_SLUG, type DoctorReport, type HarnessId } from '@novelist/shared';
+import type { DoctorReport, HarnessId } from '@novelist/shared';
 import type { AppDeps } from '../app.js';
 import { ping } from '../db/client.js';
 import { profiles } from '../db/schema.js';
@@ -69,8 +69,6 @@ export async function runDoctor(deps: AppDeps, opts?: { refresh?: boolean; reque
       const inst = installs.find((i) => i.id === a.id);
       return { id: a.id as HarnessId, ok: !!inst, detail: inst ? `${inst.version}（${inst.binPath}）` : '未安装' };
     });
-  const argon = (await deps.db.select().from(profiles).where(eq(profiles.harness, 'agy'))).filter((p) => (p.body as { model?: string }).model === AGY_ARGON_DEFAULT_SLUG);
-  if (argon.length > 0) hints.push(`Gemini 4 Argon 的模型 slug（${AGY_ARGON_DEFAULT_SLUG}）是未经核实的占位值，需对照账号真实的模型列表（Harness 与账号 → Antigravity CLI → 模型）核对，并在“路由与 Profile → Profile”里修改 ${argon.map((p) => p.id).join('、')}。`);
   if (harnesses.every((h) => !h.ok)) hints.push('没有检测到任何 harness：在“Harness 与账号”页安装，或设置 NOVELIST_HARNESS_DIR');
 
   // 残余风险（DESIGN §10.6 的独立 uid / 分角色 DB 未实现）：明确告知，不做无法兑现的承诺

@@ -296,18 +296,23 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
   // 不可信输入（v1 导入正文）不走带 shell 的 harness（DESIGN §10.6）。必须走 avoidProfiles：excludeProfiles 只在 not_in_judges 约束下生效
   const noShell = task.kind === 'import.bootstrap' ? await shellProfiles(env) : [];
   const avoidProfiles = [...(orch.avoidProfiles ?? []), ...noShell];
-  const route = await resolveRoute(env.db, {
-    role,
-    book,
-    tier,
-    writerVendor,
-    plannerVendor,
-    ...(excludeProfiles.length ? { excludeProfiles } : {}),
-    ...(avoidProfiles.length ? { avoidProfiles } : {}),
-    ...(orch.avoidVendors?.length ? { avoidVendors: orch.avoidVendors } : {}),
-    now,
-    allowFakeHarness: env.config.allowFakeHarness,
-  });
+  const resolveAvoiding = (avoid: string[]) =>
+    resolveRoute(env.db, {
+      role,
+      book,
+      tier,
+      writerVendor,
+      plannerVendor,
+      ...(excludeProfiles.length ? { excludeProfiles } : {}),
+      ...(avoid.length ? { avoidProfiles: avoid } : {}),
+      ...(orch.avoidVendors?.length ? { avoidVendors: orch.avoidVendors } : {}),
+      now,
+      allowFakeHarness: env.config.allowFakeHarness,
+    });
+  let route = await resolveAvoiding(avoidProfiles);
+  // 产物不合格时换 profile 只是优化：没有别的 profile 可换就继续用原来的，次数上限由 handler 兜底。noShell 是安全约束，始终保留
+  const keepAvoiding = (orch.avoidProfiles ?? []).filter((p) => !orch.contractFailures?.[p]);
+  if (!route.profile && !route.waitUntil && keepAvoiding.length < (orch.avoidProfiles?.length ?? 0)) route = await resolveAvoiding([...keepAvoiding, ...noShell]);
   if (!route.profile || !route.profileObj) return routeFailure(env, task, route, book);
   if (role === 'writer' && book) await rememberWriter(env, book, route);
 

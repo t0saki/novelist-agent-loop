@@ -1,7 +1,7 @@
 /** 书的生命周期服务（开书、删除、reindex）与书级视图（summary/overview/publish）。Owner: lane G（调用 B 的 initBookRepo、C 的 genreExists、E 的 initialTasks、F 的 startBook）。 */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
-import { and, count, desc, eq, inArray, notInArray } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, ne, notInArray } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { parseDocument } from 'yaml';
 import type { BookOverview, BookSummary, CreateBook, Frontiers, GitCommitRow, PublishOverview } from '@novelist/shared';
@@ -17,6 +17,7 @@ import { bufferState, commitOwnerEdit, loadSystemSettings, nextSlots } from '../
 import { loadBookState, milestoneStatus } from '../state/index.js';
 import type { PublishConfig } from '@novelist/shared';
 
+export const AUTO_CREATED_EVENT = 'book.auto_created';
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 /** 活动任务状态：未终结（含等待） */
@@ -73,7 +74,8 @@ export async function deleteBook(deps: AppDeps, slug: string): Promise<void> {
     await tx.delete(inbox).where(eq(inbox.bookId, book.id));
     await tx.delete(publishSchedule).where(eq(publishSchedule.bookId, book.id));
     await tx.delete(readingProgress).where(eq(readingProgress.bookId, book.id));
-    await tx.delete(bookEvents).where(eq(bookEvents.bookId, book.id));
+    // 开书记录留着：删书不退回当天的自动开书额度，题材轮转序号也不回退
+    await tx.delete(bookEvents).where(and(eq(bookEvents.bookId, book.id), ne(bookEvents.kind, AUTO_CREATED_EVENT)));
     await tx.delete(books).where(eq(books.id, book.id)); // chapters 级联
   });
   await fs.rm(bookDir(deps, slug), { recursive: true, force: true });

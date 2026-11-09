@@ -92,6 +92,19 @@ export const zGenrePack = z.object({
   event_families: z.record(z.string(), z.array(z.string())).default({}),
   catalogs: z.record(z.string(), z.array(z.string())).default({}),
   rubric: z.record(z.string(), z.number()).default({}),
+  /** 自动开书配置（v1 的 theme 字段转换而来，也可手写）；缺省表示这个包不参与自动开书 */
+  auto: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** 加权轮转的权重，越大开书越多 */
+      weight: z.number().min(0).default(1),
+      keywords: z.array(z.string()).default([]),
+      length_hint: z.string().default(''),
+      min_chapters: z.number().int().positive().nullable().default(null),
+      /** 要求自动开书的种子声明所有角色都是成年人 */
+      adult_only: z.boolean().default(false),
+    })
+    .optional(),
   /** v1 主题导入时原样保留的元数据（含内容分级等，Novelist 不解释） */
   meta: z.record(z.string(), z.unknown()).default({}),
 });

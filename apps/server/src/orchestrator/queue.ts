@@ -154,6 +154,9 @@ export async function completeTask(db: Db, taskId: string, result: TaskResult, o
   if (!task) throw new Error(`completeTask: no such task ${taskId}`);
   const orch: OrchTaskState = { ...orchOf(task) };
   if (result.avoidProfile) orch.avoidProfiles = [...new Set([...(orch.avoidProfiles ?? []), result.avoidProfile])];
+  if (result.avoidProfile && result.errorClass === 'output_contract') {
+    orch.contractFailures = { ...orch.contractFailures, [result.avoidProfile]: (orch.contractFailures?.[result.avoidProfile] ?? 0) + 1 };
+  }
   delete orch.recover;
 
   let state: TaskState;
@@ -217,7 +220,7 @@ export async function completeTask(db: Db, taskId: string, result: TaskResult, o
         params: withOrch(task.params, orch),
         result: persistedResult,
         lastErrorClass: result.errorClass ?? (result.status === 'done' ? null : task.lastErrorClass),
-        lastError: result.message ?? (result.status === 'done' ? null : task.lastError),
+        lastError: result.status === 'waiting' ? task.lastError : (result.message ?? (result.status === 'done' ? null : task.lastError)),
         leaseOwner: null,
         leaseExpiresAt: null,
         finishedAt: terminal ? now : null,
@@ -320,7 +323,7 @@ export async function retryTaskRow(db: Db, taskId: string, opts?: { force?: bool
       leaseOwner: null,
       leaseExpiresAt: null,
       finishedAt: null,
-      params: withOrch(task.params, { generation: (orch.generation ?? 1) + 1, transient: 0, classCounts: {}, recover: undefined, ...(ownerNotes ? { ownerNotes } : {}), outbox: undefined }),
+      params: withOrch(task.params, { generation: (orch.generation ?? 1) + 1, transient: 0, classCounts: {}, avoidProfiles: [], contractFailures: {}, recover: undefined, ...(ownerNotes ? { ownerNotes } : {}), outbox: undefined }),
       updatedAt: now,
     })
     .where(eq(tasks.id, taskId));

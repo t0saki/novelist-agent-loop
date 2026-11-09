@@ -24,7 +24,7 @@ import type { zV1ImportRequest } from '@novelist/shared';
 import type { AppDeps } from '../app.js';
 import { initBookRepo, openRepo, P, TRAILER } from '../book/index.js';
 import { books, chapters, importJobs, readers, readingProgress, v1ImportMap } from '../db/schema.js';
-import { createGenre, genreExists } from '../genres/index.js';
+import { createGenre, genreExists, v1PackFields } from '../genres/index.js';
 import { bookDir } from '../api/helpers.js';
 import { HttpProblem, badRequest, conflict } from '../api/problem.js';
 import { enqueueSpec, execEnv } from '../orchestrator/index.js';
@@ -233,6 +233,7 @@ async function importThemes(deps: AppDeps, jobId: string, c: V1Client, usedIds: 
     const dir = path.join(deps.paths.genres, id);
     const pack = zGenrePack.parse(yamlParse(await fs.readFile(path.join(dir, 'pack.yaml'), 'utf8')));
     pack.meta = { v1: { id: theme.id, keywords: jsonOf(theme.keywords, []), length_hint: theme.length_hint, min_chapters: theme.min_chapters, weight: theme.weight, nsfw: theme.nsfw, enabled: theme.enabled } };
+    Object.assign(pack, v1PackFields(pack));
     await fs.writeFile(path.join(dir, 'pack.yaml'), yamlStringify(pack, { lineWidth: 0 }), 'utf8');
     if (theme.style_prompt) await fs.appendFile(path.join(dir, 'AGENTS.md'), `\n${theme.style_prompt}\n`, 'utf8');
     themeGenre.set(theme.id, id);

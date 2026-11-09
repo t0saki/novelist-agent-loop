@@ -4,7 +4,7 @@
  */
 import { and, count, eq, inArray, or, sql } from 'drizzle-orm';
 import { books, inbox, settings, tasks } from '../db/schema.js';
-import type { TaskState } from '@novelist/shared';
+import type { SystemSettings, TaskState } from '@novelist/shared';
 import type { BookHandle, PipelineContext, TaskRow, TaskResult, TaskSpec } from '../pipeline/types.js';
 import type { BookRuntimeState } from '../pipeline/next.js';
 import { advanceCircuits, takePendingCanaries } from './circuit.js';
@@ -29,7 +29,11 @@ export interface Scheduler {
   inFlight(): { taskId: string; kind: string; book: string | null }[];
   /** 取消某个在跑任务（用户 kill / cancel） */
   abortTask(taskId: string, reason: 'kill' | 'cancel'): boolean;
+  /** 注册只在 leader 上、调度器启用时每轮调用的钩子（自动开书） */
+  setLeaderHook(hook: LeaderHook | null): void;
 }
+
+export type LeaderHook = (now: Date, settings: SystemSettings) => Promise<void>;
 
 const LEADER_KEY = 'orchestrator.leader';
 const LEADER_TTL_MS = 30_000;
@@ -206,6 +210,8 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
     return enq;
   }
 
+  let leaderHook: LeaderHook | null = null;
+
   async function tick(): Promise<{ enqueued: number; dispatched: number }> {
     const now = env.nowFn();
     let enqueued = 0;
@@ -217,6 +223,9 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
       if (settingsNow.schedulerEnabled && env.config.schedulerEnabled !== false) {
         const bookRows = await env.db.select({ id: books.id }).from(books).where(inArray(books.status, ['active', 'planning', 'completed']));
         for (const b of bookRows) enqueued += await bookTick(b);
+        if (leaderHook) {
+          await leaderHook(now, settingsNow).catch((err: Error) => env.log.error({ err: err.message }, 'leader hook failed'));
+        }
       }
     }
 
@@ -246,6 +255,9 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
   };
 
   return {
+    setLeaderHook(hook) {
+      leaderHook = hook;
+    },
     async start() {
       stopped = false;
       await safeTick();

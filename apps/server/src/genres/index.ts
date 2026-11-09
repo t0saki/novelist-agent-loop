@@ -120,6 +120,38 @@ export async function listGenres(paths: DataPaths): Promise<GenrePack[]> {
   return packs.sort((a, b) => a.id.localeCompare(b.id));
 }
 
+/** v1 主题元数据 → v2 题材包字段：继承 generic（拿到通用 gate、事件词族），自动开书配置进 auto。作者写的文本不动。 */
+export function v1PackFields(pack: GenrePack): Pick<GenrePack, 'extends' | 'auto'> {
+  const v1 = (pack.meta.v1 ?? {}) as { keywords?: unknown; length_hint?: unknown; min_chapters?: unknown; weight?: unknown; nsfw?: unknown; enabled?: unknown };
+  const minChapters = Number(v1.min_chapters);
+  return {
+    extends: pack.extends.length > 0 || pack.id === 'generic' ? pack.extends : ['generic'],
+    auto: {
+      enabled: v1.enabled === true,
+      weight: typeof v1.weight === 'number' && v1.weight >= 0 ? v1.weight : 1,
+      keywords: Array.isArray(v1.keywords) ? v1.keywords.map(String) : [],
+      length_hint: typeof v1.length_hint === 'string' ? v1.length_hint : '',
+      min_chapters: Number.isInteger(minChapters) && minChapters > 0 ? minChapters : null,
+      adult_only: v1.nsfw === true,
+    },
+  };
+}
+
+/** 启动时把已导入、还是 meta.v1 形状的包转成 v2 形状；转过的（有 auto）不再动 */
+export async function convertV1Packs(paths: DataPaths, log: { info(o: object, m: string): void }): Promise<string[]> {
+  const converted: string[] = [];
+  for (const pack of await listGenres(paths)) {
+    if (pack.auto || !pack.meta.v1) continue;
+    await fs.writeFile(path.join(paths.genres, pack.id, GENRE_FILES.pack), yamlStringify({ ...pack, ...v1PackFields(pack) }, { lineWidth: 0 }), 'utf8');
+    converted.push(pack.id);
+  }
+  if (converted.length) {
+    await commitGenres(paths, `genres: convert v1 packs (${converted.join(', ')})`, 'convert.v1');
+    log.info({ packs: converted }, 'converted v1 genre packs');
+  }
+  return converted;
+}
+
 export async function genreExists(paths: DataPaths, id: string): Promise<boolean> {
   return fs.stat(path.join(paths.genres, id, GENRE_FILES.pack)).then(
     (s) => s.isFile(),

@@ -12,7 +12,7 @@ export const zReceipt = z
     schema: z.literal('nv.receipt/1'),
     task_id: z.string().optional(),
     status: z.enum(['done', 'blocked', 'failed']),
-    artifacts: z.array(z.object({ path: z.string(), kind: z.string().optional() })).default([]),
+    artifacts: z.array(z.union([z.object({ path: z.string(), kind: z.string().optional() }), z.string().transform((path) => ({ path }))])).default([]),
     nonces: z.array(z.string()).default([]),
     title_proposal: z.string().optional(),
     questions_for_planner: z.array(z.string()).default([]),

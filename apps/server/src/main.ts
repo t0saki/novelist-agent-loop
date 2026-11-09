@@ -15,7 +15,8 @@ import { buildServer } from './api/server.js';
 import { ensureGitRepo } from './book/index.js';
 import { migrate, openDb } from './db/client.js';
 import { accounts, importJobs, settings } from './db/schema.js';
-import { seedBuiltinGenres } from './genres/index.js';
+import { convertV1Packs, seedBuiltinGenres } from './genres/index.js';
+import { createAutoStarter } from './services/auto-start.js';
 import { createLoginManager, probeIsolation } from './harness/index.js';
 import { createLogger, type Logger } from './log.js';
 import { createEventBus, createOrchestrator, loadSystemSettings, seedRouting } from './orchestrator/index.js';
@@ -64,6 +65,7 @@ export async function bootstrap(configIn: AppConfig, opts: { log?: Logger; migra
   if (opts.migrate !== false) {
     await ensureGitRepo(paths.instructionsGlobal);
     await seedBuiltinGenres(paths);
+    await convertV1Packs(paths, log);
     await seedRouting(dbh.db);
     if (config.fakeHarness) await enableFakeMode(deps);
   }
@@ -119,7 +121,10 @@ export async function startServe(config: AppConfig): Promise<RunningApp> {
   }
 
   const runOrchestrator = deps.config.roles.includes('orchestrator') || deps.config.roles.includes('runner');
-  if (runOrchestrator) await deps.orchestrator.start();
+  if (runOrchestrator) {
+    deps.orchestrator.scheduler.setLeaderHook(createAutoStarter(deps));
+    await deps.orchestrator.start();
+  }
 
   let closing: Promise<void> | null = null;
   return {

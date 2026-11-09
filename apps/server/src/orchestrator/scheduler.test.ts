@@ -136,6 +136,23 @@ describe('scheduler + fake harness', () => {
     expect(seen).toEqual(['fake2']);
   }, 180_000);
 
+  it('output_contract with a single profile keeps retrying it instead of blocking on no route', async () => {
+    let n = 0;
+    const handler = agentChapterHandler({
+      dbEffects: (task) => acceptEffect(task, task.bookId as string),
+      fake: () => {
+        n += 1;
+        return n <= 2 ? { skipArtifacts: ['manuscript/c00001.md'] } : undefined;
+      },
+    });
+    t = await createOrchTestEnv({ pipeline: { handlers: { 'chapter.write': handler }, next: writeLane(1) } });
+    const book = await addFixtureBook(t, 'single', { cards: 6 });
+    await createScheduler(t.deps).runUntilIdle({ maxTicks: 300 });
+    const done = (await t.db.select().from(tasks).where(eq(tasks.bookId, book.id))) as TaskRow[];
+    expect(done[0]?.state).toBe('done');
+    expect(n).toBe(3);
+  }, 180_000);
+
   it('hold then approve: promote commits, task waits for approval, onTaskDone only after approve', async () => {
     const onDone: string[] = [];
     const planHandler = fileHandler('plan.compass', 'write', (ctx, task) => ({ files: [{ path: 'plan/compass-note.md', content: `v-${task.attempts}\n` }] }));

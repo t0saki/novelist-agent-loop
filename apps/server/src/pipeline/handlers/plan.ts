@@ -169,7 +169,7 @@ export const planCompass: TaskHandler = {
     const c = await contractCheck(task, h);
     if (!c.ok) return contractFailure(task, h, c, task.maxAttempts);
     const compass = zCompass.safeParse(yamlParse(c.report.files[P.compass]?.text ?? ''));
-    if (!compass.success) return { status: 'retry', errorClass: 'output_contract', message: `compass 不合法：${compass.error.issues[0]?.message ?? ''}` };
+    if (!compass.success) return { status: 'retry', errorClass: 'output_contract', message: `compass 不合法：${compass.error.issues.slice(0, 20).map((i) => `${i.path.join('.') || '（根）'}: ${i.message}`).join('；')}` };
     // 规划校验（谓词语法等）
     const state = await loadBookState(book.dir);
     const v = validatePlan({ compass: compass.data, volumes: [], arcs: [], cards: [], snapshot: state.snapshot, fingerprints: [], changed: [P.compass] });
@@ -311,7 +311,8 @@ export function endgameStatus(book: BookHandle, state: BookState, volumes: Volum
   const s = book.config.scale;
   const total = state.snapshot.total_cjk;
   if (total >= s.target_cjk * 0.85) reasons.push(`字数达到目标的 85%（${total}/${s.target_cjk}）`);
-  const lastVolume = volumes.length ? volumes[volumes.length - 1]?.id === volumeId : false;
+  // 单卷书的“最终卷”就是全书，靠字数和投影判定，否则第一弧就进入收束
+  const lastVolume = volumes.length > 1 && volumes[volumes.length - 1]?.id === volumeId;
   if (lastVolume) reasons.push('进入最终卷');
   const chapterTarget = book.config.scale.chapter_length?.target ?? book.genre.pacing.chapter_length.target;
   const remainingChapters = Math.max(0, totalChapters(book) - plannedThrough);
@@ -320,7 +321,7 @@ export function endgameStatus(book: BookHandle, state: BookState, volumes: Volum
   const heavy = open.filter((o) => o.weight === 'main' || o.weight === 'major');
   const closingChapters = 5;
   const needed = heavy.length * 3 + closingChapters; // 每条 main/major 平均约 3 章回收
-  if (remainingChapters <= needed * 1.3) reasons.push(`剩余章数 ${remainingChapters} 不足以舒展收束（需要 ${needed}）`);
+  if (heavy.length > 0 && remainingChapters <= needed * 1.3) reasons.push(`剩余章数 ${remainingChapters} 不足以舒展收束（需要 ${needed}）`);
   const compassClosures = state.compass?.ending.required_closures ?? [];
   return { active: reasons.length > 0, reasons, requiredClosures: [...new Set([...compassClosures, ...heavy.map((o) => o.id)])] };
 }

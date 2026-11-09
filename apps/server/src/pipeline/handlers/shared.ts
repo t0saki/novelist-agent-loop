@@ -23,6 +23,8 @@ pre / post / must_not / final_state 使用的条件，二选一：谓词，或 o
 - { obligation: F0001, status: paid }（open/advanced/paid/abandoned）
 - { stage: [char.x, s2] } / { at_loc: [char.x, loc.y] } / { alive: char.x } / { dead: char.x } / { has_cond: [char.x, injury.arm] }
 - { and: [..] } / { or: [..] } / { not: .. } / { manual: "需 owner 判断的说明" }
+
+id 只用小写字母、数字和连字符，不要用下划线：char.lin-feng、fact.su-wan-spy。
 `;
 
 /** 规划任务用的账本概况：时间、未收束伏笔、里程碑 */

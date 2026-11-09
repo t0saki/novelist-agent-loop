@@ -7,7 +7,7 @@
  */
 import { and, count, eq, inArray } from 'drizzle-orm';
 import type { Account, FeasibilityReport, HarnessId, Profile, QualityTier, RoleId, RoleRoute, RouteDecision, RoutingPreset } from '@novelist/shared';
-import { BUILTIN_PRESETS, BUILTIN_PROFILES, DEFAULT_PRESET_ID, HARNESS_VENDOR, RISK_NOTES, ROUTABLE_ROLES, normalizeTier, zAccount, zProfile, zRoutingPreset, zSystemSettings } from '@novelist/shared';
+import { AGY_ARGON_DEFAULT_SLUG, BUILTIN_PRESETS, BUILTIN_PROFILES, DEFAULT_PRESET_ID, HARNESS_VENDOR, RISK_NOTES, ROUTABLE_ROLES, normalizeTier, zAccount, zProfile, zRoutingPreset, zSystemSettings } from '@novelist/shared';
 import type { Db } from '../db/client.js';
 import { accounts, accountsState, books, capabilities, circuitBreakers, profiles, routingPresets, runs, settings, usageLedger } from '../db/schema.js';
 import type { BookHandle } from '../pipeline/types.js';
@@ -436,6 +436,11 @@ export async function seedRouting(db: Db): Promise<void> {
   for (const p of BUILTIN_PRESETS) {
     const parsed = zRoutingPreset.parse(p);
     await db.insert(routingPresets).values({ id: parsed.id, name: parsed.name, builtin: true, body: parsed as unknown as Record<string, unknown>, updatedAt: now }).onConflictDoNothing({ target: routingPresets.id });
+  }
+  // 早期版本写入的占位 slug（不在 `agy models` 里）；用户自选的值不动
+  const [argon] = await db.select().from(profiles).where(eq(profiles.id, 'agy-argon')).limit(1);
+  if ((argon?.body as { model?: string } | undefined)?.model === 'gemini-4-argon') {
+    await db.update(profiles).set({ body: { ...(argon!.body as object), model: AGY_ARGON_DEFAULT_SLUG }, updatedAt: now }).where(eq(profiles.id, 'agy-argon'));
   }
   await db.insert(settings).values({ key: 'routing.active', value: { presetId: DEFAULT_PRESET_ID, overrides: {} }, updatedAt: now }).onConflictDoNothing({ target: settings.key });
   await db.insert(settings).values({ key: 'system', value: zSystemSettings.parse({}), updatedAt: now }).onConflictDoNothing({ target: settings.key });

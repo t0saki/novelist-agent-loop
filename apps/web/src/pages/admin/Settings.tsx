@@ -1,6 +1,6 @@
 /** 系统设置、Doctor、安全（管理员密码 / PAT）。Owner: lane H。 */
 import { useState, type ReactNode } from 'react';
-import { QUALITY_TIERS, type CreatedPat, type DoctorReport, type PatRow, type QualityTier, type RoutingPreset, type SystemInfo, type SystemSettings } from '@novelist/shared';
+import { AUTO_LENGTHS, QUALITY_TIERS, type CreatedPat, type DoctorReport, type GenreSummary, type PatRow, type QualityTier, type RoutingPreset, type SystemInfo, type SystemSettings } from '@novelist/shared';
 import { del, enc, post, put } from '../../api/client';
 import { useAction, useApi } from '../../api/hooks';
 import { Badge, Button, Card, confirmDialog, Empty, Field, Input, KV, Notice, Page, PageHeader, Pre, Q, Select, Tabs, Toggle } from '../../components/ui';
@@ -31,6 +31,65 @@ export function SettingsPage() {
 function SystemTab() {
   const q = useApi<SystemSettings>('/api/admin/settings');
   return <Q q={q}>{(s) => <SettingsForm key={JSON.stringify(s)} initial={s} />}</Q>;
+}
+
+const AUTO_LENGTH_LABEL = { short: '短篇', medium: '中篇', long: '长篇', epic: '超长篇' } as const;
+
+function AutoStartCard({ value: a, onChange }: { value: SystemSettings['autoStart']; onChange: (v: SystemSettings['autoStart']) => void }) {
+  const genres = useApi<GenreSummary[]>('/api/admin/genres');
+  const num = (v: string, min: number, fallback: number) => (v === '' || Number.isNaN(Number(v)) ? fallback : Math.max(min, Math.floor(Number(v))));
+  const all = genres.data ?? [];
+  const selected = a.genres ?? all.filter((g) => g.auto?.enabled).map((g) => g.id);
+  const toggle = (id: string, on: boolean) => onChange({ ...a, genres: on ? [...new Set([...selected, id])] : selected.filter((x) => x !== id) });
+  return (
+    <Card title="自动开书">
+      <Toggle checked={a.enabled} onChange={(v) => onChange({ ...a, enabled: v })} label="有空位时自动开新书" hint="按题材包的权重轮转选题材，规划师自拟书名和故事。开启后会持续消耗账号额度。" />
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 mt-3">
+        <Field label="同时在写的书上限">
+          <Input type="number" min={1} value={a.maxActiveBooks} onChange={(e) => onChange({ ...a, maxActiveBooks: num(e.target.value, 1, 1) })} />
+        </Field>
+        <Field label="24 小时内最多开几本" hint="0 表示不限">
+          <Input type="number" min={0} value={a.maxPerDay} onChange={(e) => onChange({ ...a, maxPerDay: num(e.target.value, 0, 0) })} />
+        </Field>
+      </div>
+      <div className="mt-3 space-y-2">
+        <div className="text-xs text-sub">各篇幅档的规模：题材包的篇幅提示（短篇 / 中篇 / 长篇 / 超长篇）决定用哪一档，没写按短篇。硬上限为目标的 1.5 倍。</div>
+        {AUTO_LENGTHS.map((k) => {
+          const l = a.lengths[k];
+          const put = (p: Partial<typeof l>) => onChange({ ...a, lengths: { ...a.lengths, [k]: { ...l, ...p } } });
+          return (
+            <div key={k} className="grid grid-cols-3 gap-3">
+              <Field label={`${AUTO_LENGTH_LABEL[k]} 目标字数`}>
+                <Input type="number" min={1000} value={l.targetCjk} onChange={(e) => put({ targetCjk: num(e.target.value, 1000, l.targetCjk) })} />
+              </Field>
+              <Field label="每卷章数 最少">
+                <Input type="number" min={1} value={l.chaptersMin} onChange={(e) => put({ chaptersMin: num(e.target.value, 1, l.chaptersMin) })} />
+              </Field>
+              <Field label="每卷章数 最多" error={l.chaptersMax < l.chaptersMin ? '不能小于最少值' : undefined}>
+                <Input type="number" min={1} value={l.chaptersMax} onChange={(e) => put({ chaptersMax: num(e.target.value, 1, l.chaptersMax) })} />
+              </Field>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-3">
+        <div className="text-xs text-sub mb-1">参与的题材包{a.genres === null ? '（当前跟随 pack.yaml 的 auto.enabled）' : ''}</div>
+        {all.length === 0 ? (
+          <Empty>还没有题材包。</Empty>
+        ) : (
+          <div className="grid sm:grid-cols-2 gap-x-3 gap-y-1">
+            {all.map((g) => (
+              <label key={g.id} className="flex items-center gap-2 text-sm min-w-0">
+                <input type="checkbox" checked={selected.includes(g.id)} onChange={(e) => toggle(g.id, e.target.checked)} />
+                <span className="truncate">{g.name}</span>
+                <span className="text-xs text-faint whitespace-nowrap">{g.books} 本{g.auto ? ` · 权重 ${g.auto.weight}${g.auto.lengthHint ? ` · ${g.auto.lengthHint}` : ''}` : ''}</span>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
 }
 
 function SettingsForm({ initial }: { initial: SystemSettings }) {
@@ -85,6 +144,8 @@ function SettingsForm({ initial }: { initial: SystemSettings }) {
           <Toggle checked={s.schedulerEnabled} onChange={(v) => set('schedulerEnabled', v)} label="启用调度器" hint="关闭后不再派发新任务，正在运行的 run 继续完成" />
         </div>
       </Card>
+
+      <AutoStartCard value={s.autoStart} onChange={(v) => set('autoStart', v)} />
 
       <Card title="时限（分钟）">
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">

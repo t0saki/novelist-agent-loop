@@ -1,6 +1,6 @@
 /** 路由 Preset 与 Profile 编辑、可行性检查。Owner: lane H。 */
 import { useMemo, useState } from 'react';
-import { AGY_ARGON_DEFAULT_SLUG, ROLE_IDS, ROUTABLE_ROLES, ROUTE_CONSTRAINTS, type AccountView, type ActiveRouting, type BookSummary, type FeasibilityReport, type HarnessStatus, type Profile, type QualityTier, type RoleId, type RoleRoute, type RoutingPreset } from '@novelist/shared';
+import { ROLE_IDS, ROUTABLE_ROLES, ROUTE_CONSTRAINTS, type AccountView, type ActiveRouting, type BookSummary, type FeasibilityReport, type HarnessStatus, type Profile, type QualityTier, type RoleId, type RoleRoute, type RoutingPreset } from '@novelist/shared';
 import { del, enc, patch, post, put, qs } from '../../api/client';
 import { useAction, useApi } from '../../api/hooks';
 import { FeasibilityView } from '../../components/admin/shared';
@@ -389,7 +389,6 @@ function ProfileEditor({ initial, isNew, onClose }: { initial: Profile; isNew: b
             ))}
           </Select>
         </Field>
-        {p.model === AGY_ARGON_DEFAULT_SLUG && <div className="sm:col-span-2"><Notice tone="warn">{AGY_ARGON_DEFAULT_SLUG} 是未经核实的占位 slug，请对照账号真实的模型列表（Harness 页 → Antigravity CLI →「模型」）修改。</Notice></div>}
         <Field label="模型" hint={models.isLoading ? '正在读取模型列表…' : models.error ? '读取模型列表失败，可手动填写' : '可从列表选，也可手填（自建网关的模型名）'}>
           <Input list="profile-models" value={p.model} onChange={(e) => setP({ ...p, model: e.target.value })} />
           <datalist id="profile-models">

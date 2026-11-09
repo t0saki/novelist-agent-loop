@@ -46,7 +46,7 @@ const DEFAULTS: CapabilityDefaults = {
 };
 
 /** D2：默认路由 = agy + Gemini 4 Argon（slug 以 `agy models` 为准，可在 UI 改）；flash-low 只用于开发测试 */
-export const AGY_KNOWN_MODELS = ['gemini-4-argon', 'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low'];
+export const AGY_KNOWN_MODELS = ['gemini-4-argon-high', 'gemini-4-argon-medium', 'gemini-4-argon-low', 'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low'];
 export const AGY_TOKEN_FILE = '.gemini/antigravity-cli/antigravity-oauth-token';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const DENY_EXTRA = [/^--settings/, /^--add-dir/, /^--remote-agent$/, /^--project/, /^--new-project$/, /^-i$/, /^--prompt-interactive/, /^--sandbox$/];

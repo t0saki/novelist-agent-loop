@@ -9,7 +9,7 @@
 5. YAML、JSON 产物必须符合工作单给出的 schema，不要用 Markdown 代码块包裹。
 6. 最后写 `out_dir/receipt.json`（`schema: nv.receipt/1`）：
    - `status`：`done`、`blocked` 或 `failed`；
-   - `artifacts`：逐条列出你写的文件；
+   - `artifacts`：逐条列出你写的文件，每项形如 `{ "path": "plan/compass.yaml" }`；
    - `nonces`：原样列出你在系统提示中看到的所有 `NV-` 开头的标记，只从系统提示抄录，不要去文件里找；
    - 工作单要求自报字数时，在 `self_count` 中填实测值。
 7. 标准输出只是日志，不会被当作正文。正文和结构化结果都只以文件为准。

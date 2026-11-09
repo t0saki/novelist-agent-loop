@@ -400,6 +400,8 @@ export interface GenreSummary {
   builtin: boolean;
   books: number;
   files: string[];
+  /** pack.yaml 的 auto 配置摘要；null 表示未配置 */
+  auto: { enabled: boolean; weight: number; keywords: number; lengthHint: string } | null;
 }
 export const zCreateGenre = z.object({ id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/), name: z.string(), extends: z.array(z.string()).default([]), copyFrom: z.string().optional() });
 
