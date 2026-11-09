@@ -435,7 +435,8 @@ export async function seedRouting(db: Db): Promise<void> {
   }
   for (const p of BUILTIN_PRESETS) {
     const parsed = zRoutingPreset.parse(p);
-    await db.insert(routingPresets).values({ id: parsed.id, name: parsed.name, builtin: true, body: parsed as unknown as Record<string, unknown>, updatedAt: now }).onConflictDoNothing({ target: routingPresets.id });
+    // 内置 preset 在 UI 里只能另存为副本，所以可以随版本更新
+    await db.insert(routingPresets).values({ id: parsed.id, name: parsed.name, builtin: true, body: parsed as unknown as Record<string, unknown>, updatedAt: now }).onConflictDoUpdate({ target: routingPresets.id, set: { name: parsed.name, body: parsed as unknown as Record<string, unknown>, updatedAt: now }, setWhere: eq(routingPresets.builtin, true) });
   }
   // 早期版本写入的占位 slug（不在 `agy models` 里）；用户自选的值不动
   const [argon] = await db.select().from(profiles).where(eq(profiles.id, 'agy-argon')).limit(1);

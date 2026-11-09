@@ -185,7 +185,7 @@ const chapterManifest = (ctx: PipelineContext, spec: TaskSpec) => buildManifest(
 // ───────── 写作类（write / revise / expand / compress）───────────
 
 const beatsText = (card: Card): string => card.beats.map((b) => `<!-- beat:${b.id} -->  （${b.mode}，约 ${b.cjk} 字）${b.goal}`).join('\n');
-const lengthRange = (l: { min: number; max: number }) => `${l.min}–${l.max}`;
+const lengthRange = (l: { min: number }) => `不少于 ${l.min} 字，多写不限`;
 
 async function writerContext(ctx: PipelineContext, b: { book: BookHandle; card: Card; cid: string }, run: RunContext) {
   const state = await loadRunState(run);
@@ -366,7 +366,8 @@ async function finalizeWriter(ctx: PipelineContext, task: TaskRow, h: HarvestedR
   if (v.ok) {
     return withInbox(await afterGates(task, b, draft));
   }
-  if (b.wf.counters.mech < 2) {
+  // lite：工艺问题记债放行；写短了仍扩写一次，这是最不能接受的问题
+  if (b.wf.counters.mech < (b.wf.tier === 'lite' ? (v.suggestion === 'expand' ? 1 : 0) : 2)) {
     b.wf.counters.mech += 1;
     const brief = `确定性检查未通过，请修正：\n\n${hardGateBrief(v.hardFailed)}`;
     const measured = v.hardFailed[0]?.measured?.total;
@@ -375,7 +376,7 @@ async function finalizeWriter(ctx: PipelineContext, task: TaskRow, h: HarvestedR
     return withInbox(chapterResult(b, 'revising', [chapterSpec(b, 'chapter.revise', { mode: 'mech', brief })]));
   }
   // 耗尽策略：长度类/工艺类 hard（§6.4 耗尽策略表）
-  const policy = b.book.config.policy.on_exhausted.craft_hard[b.wf.key ? 'key' : 'normal'];
+  const policy = b.wf.tier === 'lite' ? 'accept_with_debt' : b.book.config.policy.on_exhausted.craft_hard[b.wf.key ? 'key' : 'normal'];
   if (policy === 'accept_with_debt') {
     for (const g of v.hardFailed) b.wf.debts.push({ class: 'forward', rule: g.rule, detail: g.detail ?? '工艺 hard 问题' });
     return withInbox(await afterGates(task, b, draft));
@@ -640,6 +641,11 @@ async function routeDeltaReport(task: TaskRow, b: ChapterCtx, h: HarvestedRun, r
     ...report.mustNotHits.map((m) => `- 触犯 must_not：${JSON.stringify(m.cond)}${m.quote ? `（原文：${m.quote}）` : ''}`),
     ...report.leaks.map((l) => `- 泄漏秘密 ${l.secret}：${l.quote}`),
   ];
+  // lite：章卡没兑现、连续性提示这类问题不影响账本，记债放行；账本真冲突（writerHard）仍修一次
+  if (b.wf.tier === 'lite' && writerHard.length === 0 && extractorHard.length === 0 && writerIssues.length > 0) {
+    for (const detail of writerIssues) b.wf.debts.push({ class: 'forward', rule: 'canon.soft', detail });
+    return goToReviewOrAccept(b);
+  }
   if (extractorHard.length > 0 && writerIssues.length === 0) {
     if (b.wf.counters.rerun < 1) {
       b.wf.counters.rerun += 1;
@@ -1145,7 +1151,7 @@ export const chapterWrite: TaskHandler = {
   kind: 'chapter.write',
   role: 'writer',
   lane: 'write',
-  maxAttempts: 6,
+  maxAttempts: 3,
   manifest: chapterManifest,
   prepare: prepareWrite,
   finalize: finalizeWriter,
@@ -1155,7 +1161,7 @@ const revisionHandler = (kind: 'chapter.revise' | 'chapter.expand' | 'chapter.co
   kind,
   role: 'writer',
   lane: 'write',
-  maxAttempts: 6,
+  maxAttempts: 3,
   manifest: chapterManifest,
   prepare: (ctx, task, run) => prepareRevision(ctx, task, run, kind),
   finalize: finalizeWriter,
@@ -1168,7 +1174,7 @@ export const chapterExtract: TaskHandler = {
   kind: 'chapter.extract',
   role: 'extractor',
   lane: 'write',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: chapterManifest,
   prepare: (ctx, task, run) => prepareExtract(ctx, task, run, 'chapter.extract'),
   finalize: finalizeExtraction,
@@ -1178,7 +1184,7 @@ export const chapterCheck: TaskHandler = {
   kind: 'chapter.check',
   role: 'checker',
   lane: 'write',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: chapterManifest,
   prepare: (ctx, task, run) => prepareExtract(ctx, task, run, 'chapter.check'),
   finalize: finalizeExtraction,
@@ -1237,7 +1243,7 @@ export const chapterReview: TaskHandler = {
   kind: 'chapter.review',
   role: 'reviewer',
   lane: 'write',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: chapterManifest,
   prepare: prepareReview,
   finalize: finalizeReview,
@@ -1247,7 +1253,7 @@ export const chapterPairwise: TaskHandler = {
   kind: 'chapter.pairwise',
   role: 'judge',
   lane: 'write',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: chapterManifest,
   async prepare(ctx, task, run) {
     const b = await chapterCtx(ctx, task);
@@ -1357,7 +1363,7 @@ export const chapterReextract: TaskHandler = {
   kind: 'chapter.reextract',
   role: 'extractor',
   lane: 'write',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: (ctx, spec) => buildManifest(ctx, spec, { hard: [P.manuscript(chapterNo(spec.target)), P.ledger(chapterNo(spec.target))], extra: { from: spec.params?.draftPath ?? null } }),
   async prepare(ctx, task, run) {
     const { book, no, card, manuscript } = await reextractState(ctx, task);
@@ -1470,7 +1476,7 @@ export const chapterRepair: TaskHandler = {
   kind: 'chapter.repair',
   role: 'writer',
   lane: 'side',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: (ctx, spec) => buildManifest(ctx, spec, { hard: [P.manuscript(chapterNo(spec.target)), P.ledger(chapterNo(spec.target))], soft: [P.summaryBook] }),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);

@@ -45,7 +45,7 @@ export const summaryArc: TaskHandler = {
   kind: 'summary.arc',
   role: 'summarizer',
   lane: 'side',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: summaryManifest((s) => ({ hard: [P.arc(s.target), P.summaryArc(s.target)] })),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);
@@ -78,7 +78,7 @@ export const summaryVolume: TaskHandler = {
   kind: 'summary.volume',
   role: 'summarizer',
   lane: 'side',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: summaryManifest((s) => ({ hard: [P.volume(s.target), P.summaryVolume(s.target)] })),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);
@@ -110,7 +110,7 @@ export const bookBlurb: TaskHandler = {
   kind: 'book.blurb',
   role: 'summarizer',
   lane: 'side',
-  maxAttempts: 4,
+  maxAttempts: 2,
   manifest: summaryManifest(() => ({ hard: [P.summaryBook] })),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);

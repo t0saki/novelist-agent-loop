@@ -205,7 +205,7 @@ describe('全系统 e2e（fake harness）', () => {
       scale: { target_cjk: 3000 * CHAPTERS, hard_max_cjk: 6000 * CHAPTERS, volumes: [1, 1], chapters_per_volume: [CHAPTERS, CHAPTERS], chapter_length: { min: 2400, target: 3000, max: 3800, count_mode: 'han' } },
     });
     expect(created.slug).toBe(SLUG);
-    expect(created.tier).toBe('standard');
+    expect(created.tier).toBe('lite');
     await api('PUT', `/api/admin/books/${SLUG}/publish`, { mode: 'scheduled', cadence: '* * * * *', timezone: 'Asia/Shanghai', per_slot: 20, lag: 2, min_lag: 2, require_audited: true, max_buffer: 60, resume_buffer: 45 });
 
     // ── 跑到第 5 章完成后，趁写作 lane 还在跑时直接杀进程 ─────

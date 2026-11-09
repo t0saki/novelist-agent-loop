@@ -7,7 +7,7 @@
  */
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml';
 import type { ArtifactDecl, Arc, Card, Compass, Finding, Volume } from '@novelist/shared';
-import { chapterId, chapterNo, zArc, zCard, zCompass, zPlanChange, zVolume } from '@novelist/shared';
+import { arcId, chapterId, chapterNo, normalizeTier, zArc, zCard, zCompass, zPlanChange, zVolume } from '@novelist/shared';
 import { P } from '../../book/index.js';
 import { ledgerHash, loadBookState, projectBuffer } from '../../state/index.js';
 import type { BookState } from '../../state/index.js';
@@ -44,7 +44,7 @@ async function planWorkOrder(ctx: PipelineContext, task: TaskRow, run: RunContex
 
 const scaleText = (book: BookHandle): string => {
   const s = book.config.scale;
-  return `目标 ${s.target_cjk} 字（上限 ${s.hard_max_cjk}），${s.volumes[0]}–${s.volumes[1]} 卷，每卷 ${s.chapters_per_volume[0]}–${s.chapters_per_volume[1]} 章，单章 ${lengthFor(book, null).target} 字左右`;
+  return `目标 ${s.target_cjk} 字（宁多勿少），${s.volumes[0]}–${s.volumes[1]} 卷，每卷 ${s.chapters_per_volume[0]}–${s.chapters_per_volume[1]} 章，单章 ${lengthFor(book, null).target} 字左右`;
 };
 
 const compassBrief = (c: Compass | null): string => {
@@ -68,6 +68,19 @@ function outFiles(c: { report: { files: Record<string, { text: string }> } }): {
   return Object.entries(c.report.files)
     .filter(([p]) => p !== 'receipt.json')
     .map(([p, f]) => ({ path: rel(p), content: f.text }));
+}
+
+/** lite 档：规划做到大致可用就往下走，校验问题不打回（编号、契约除外） */
+const isLite = (book: BookHandle): boolean => normalizeTier(book.config.tier) === 'lite';
+
+function leanNote(book: BookHandle, kind: 'compass' | 'bible' | 'arc'): string {
+  if (!isLite(book)) return '';
+  if (kind === 'compass') return '\n**精简模式（以此为准）**：主线 1–2 条，每条里程碑不超过 3 个；schema 里非必填的字段都省略，`required_closures`、`final_state`、`limits`、`escalation_ladder` 不用写。\n';
+  if (kind === 'bible') {
+    const cap = Math.min(12, Math.max(3, Math.ceil(book.config.scale.target_cjk / 30_000)));
+    return `\n**精简模式（以此为准）**：\`bible/world/rules.yaml\` 只写最少内容；只给主要人物建档，不超过 ${cap} 个，必要时加少量地点，每个文件不超过 300 字。不要写 glossary、secrets、character-arcs、strands、obligations。\n`;
+  }
+  return '\n**精简模式（以此为准）**：每卡只写 `title`、`entities_present`、`beats`（每个 beat 一两句），`pre`/`post`/`must_not`/`pays`/`advances` 留空数组，弧文件的 `beats`、`character_stages` 省略，不需要规划 `arc.resolve`。\n';
 }
 
 function planValidationFailure(task: TaskRow, h: HarvestedRun, hard: Finding[], maxAttempts: number): TaskResult {
@@ -98,7 +111,7 @@ export const planInterview: TaskHandler = {
   kind: 'plan.interview',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 6,
+  maxAttempts: 3,
   manifest: (ctx, spec) => buildManifest(ctx, spec, { hard: [P.premise] }),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);
@@ -134,7 +147,7 @@ export const planPremise: TaskHandler = {
   kind: 'plan.premise',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 6,
+  maxAttempts: 3,
   manifest: (ctx, spec) => buildManifest(ctx, spec, { hard: [P.premise] }),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);
@@ -157,12 +170,12 @@ export const planCompass: TaskHandler = {
   kind: 'plan.compass',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 6,
+  maxAttempts: 3,
   manifest: (ctx, spec) => buildManifest(ctx, spec, { hard: [P.premise, P.compass] }),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);
     const art: ArtifactDecl = { path: P.compass, kind: 'plan_yaml', schema: 'nv.compass/1', required: true };
-    return planWorkOrder(ctx, task, run, [art], 'plan.compass', { premise: await book.files.premise(), scale: scaleText(book) });
+    return planWorkOrder(ctx, task, run, [art], 'plan.compass', { premise: await book.files.premise(), scale: scaleText(book), lean: leanNote(book, 'compass') });
   },
   async finalize(ctx, task, h) {
     const book = requireBook(ctx);
@@ -173,9 +186,12 @@ export const planCompass: TaskHandler = {
     // 规划校验（谓词语法等）
     const state = await loadBookState(book.dir);
     const v = validatePlan({ compass: compass.data, volumes: [], arcs: [], cards: [], snapshot: state.snapshot, fingerprints: [], changed: [P.compass] });
-    if (!v.ok) return planValidationFailure(task, h, v.hard, task.maxAttempts);
+    if (!v.ok && !isLite(book)) return planValidationFailure(task, h, v.hard, task.maxAttempts);
     const files = outFiles(c);
-    files.push(await changeLog(book, ctx, task, [P.compass], 'create', 'plan: compass'));
+    // lite 单卷书：分卷规划只是把罗盘再抄一遍，由程序直接生成
+    const singleVolume = isLite(book) && book.config.scale.volumes[1] === 1;
+    if (singleVolume) files.push({ path: P.volume('v01'), content: yamlStringify(singleVolumePlan(compass.data.logline, totalChapters(book)), { lineWidth: 0 }) });
+    files.push(await changeLog(book, ctx, task, singleVolume ? [P.compass, P.volume('v01')] : [P.compass], 'create', 'plan: compass'));
     const gate = book.config.approvals.compass;
     const inbox: InboxInput[] = [...questionsInbox(task, c)];
     if (gate.required) inbox.push(approvalInbox(book, 'approval', `approval:compass:${book.id}`, '全书罗盘待批准', { kind: 'plan.compass', stage: 'compass', path: P.compass }, gate, ctx.deps.now(), task.id, { kind: 'plan.compass', target: 'book' }));
@@ -183,11 +199,15 @@ export const planCompass: TaskHandler = {
   },
 };
 
+export function singleVolumePlan(logline: string, chapters: number): Volume {
+  return zVolume.parse({ schema: 'nv.volume/1', id: 'v01', title: '全书', detail: 'detailed', goal: logline, chapters: [chapterId(1), chapterId(Math.max(1, chapters))], arcs: [{ id: arcId(1), title: '第一弧', question: logline }] });
+}
+
 export const planBible: TaskHandler = {
   kind: 'plan.bible',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 6,
+  maxAttempts: 3,
   manifest: (ctx, spec) => buildManifest(ctx, spec, { hard: [P.compass, P.premise] }),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);
@@ -205,7 +225,7 @@ export const planBible: TaskHandler = {
       { path: P.strands, kind: 'plan_yaml', schema: 'nv.strands/1', required: false },
       { path: P.obligations, kind: 'plan_yaml', schema: 'nv.oblig/1', required: false },
     ];
-    return planWorkOrder(ctx, task, run, artifacts, 'plan.bible', { premise: await book.files.premise(), compass: yamlStringify(compass ?? {}, { lineWidth: 0 }) });
+    return planWorkOrder(ctx, task, run, artifacts, 'plan.bible', { premise: await book.files.premise(), compass: yamlStringify(compass ?? {}, { lineWidth: 0 }), lean: leanNote(book, 'bible') });
   },
   finalize: (ctx, task, h) => basicFinalize(ctx, task, h, { message: 'plan: bible', changeKind: 'create' }),
 };
@@ -214,7 +234,7 @@ export const planVolumes: TaskHandler = {
   kind: 'plan.volumes',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 6,
+  maxAttempts: 3,
   manifest: (ctx, spec) => buildManifest(ctx, spec, { hard: [P.compass] }),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);
@@ -230,7 +250,7 @@ export const planVolume: TaskHandler = {
   kind: 'plan.volume',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 6,
+  maxAttempts: 3,
   manifest: (ctx, spec) => buildManifest(ctx, spec, { hard: [P.compass, P.volume(spec.target)], soft: [P.summaryBook, P.obligations] }),
   async prepare(ctx, task, run) {
     const book = requireBook(ctx);
@@ -308,15 +328,12 @@ export interface EndgameInfo {
 /** §6.11：达到目标 85% / 进入最终卷 / 投影超上限 90% / closure capacity 触发 endgame */
 export function endgameStatus(book: BookHandle, state: BookState, volumes: Volume[], volumeId: string, plannedThrough: number): EndgameInfo {
   const reasons: string[] = [];
-  const s = book.config.scale;
-  const total = state.snapshot.total_cjk;
-  if (total >= s.target_cjk * 0.85) reasons.push(`字数达到目标的 85%（${total}/${s.target_cjk}）`);
-  // 单卷书的“最终卷”就是全书，靠字数和投影判定，否则第一弧就进入收束
+  // 单卷书的“最终卷”就是全书，靠章数判定，否则第一弧就进入收束
   const lastVolume = volumes.length > 1 && volumes[volumes.length - 1]?.id === volumeId;
   if (lastVolume) reasons.push('进入最终卷');
-  const chapterTarget = book.config.scale.chapter_length?.target ?? book.genre.pacing.chapter_length.target;
   const remainingChapters = Math.max(0, totalChapters(book) - plannedThrough);
-  if (total + remainingChapters * chapterTarget >= s.hard_max_cjk * 0.9) reasons.push('投影总字数接近 hard_max 的 90%');
+  // 按章数判断收尾：章节写得比计划长是好事，不能因此提前收束
+  if (plannedThrough >= totalChapters(book) * 0.85) reasons.push(`已规划到全书 85% 的章节（${plannedThrough}/${totalChapters(book)}）`);
   const open = Object.values(state.snapshot.obligations).filter((o) => o.status === 'open' || o.status === 'advanced');
   const heavy = open.filter((o) => o.weight === 'main' || o.weight === 'major');
   const closingChapters = 5;
@@ -330,7 +347,7 @@ export const planArc: TaskHandler = {
   kind: 'plan.arc',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 6,
+  maxAttempts: 3,
   async manifest(ctx, spec) {
     const book = requireBook(ctx);
     const state = await loadBookState(book.dir);
@@ -366,9 +383,9 @@ export const planArc: TaskHandler = {
       card_min: String(Math.max(1, bounds.min)),
       card_max: String(Math.max(1, bounds.max)),
       length_target: String(l.target),
-      length_range: `${l.min}–${l.max}`,
+      length_range: `不少于 ${l.min} 字`,
       beats_range: `${book.genre.pacing.beats_per_chapter[0]}–${book.genre.pacing.beats_per_chapter[1]}`,
-      endgame: `${endgameText}${closingNote}`,
+      endgame: `${endgameText}${closingNote}${leanNote(book, 'arc')}`,
       volume_yaml: volumeYaml,
       compass_brief: compassBrief(state.compass),
       state_brief: stateBrief(state.snapshot),
@@ -407,13 +424,13 @@ export const planArc: TaskHandler = {
     const stale = projectBuffer(state.snapshot, [...buffer, ...cards], { entities: state.entities.map((e) => e.entity) }).stale;
     const newIds = new Set(cards.map((x) => x.id));
     const staleNew = stale.filter((s) => newIds.has(s.card));
-    if (staleNew.length) return planValidationFailure(task, h, staleNew.map((s) => ({ id: s.card, severity: 'hard' as const, category: 'plan.projection', message: `${s.card}：${s.reasons.join('；')}`, conflicts_with_author_layer: false })), task.maxAttempts);
+    if (staleNew.length && !isLite(book)) return planValidationFailure(task, h, staleNew.map((s) => ({ id: s.card, severity: 'hard' as const, category: 'plan.projection', message: `${s.card}：${s.reasons.join('；')}`, conflicts_with_author_layer: false })), task.maxAttempts);
     const v = validatePlan({ compass: state.compass, volumes: state.volumes, arcs: mergeById(state.arcs, [arc]), cards: [...buffer, ...cards], snapshot: state.snapshot, fingerprints: await book.files.arcFingerprints(), changed: [P.arc(task.target)] });
-    if (!v.ok) return planValidationFailure(task, h, v.hard, task.maxAttempts);
+    if (!v.ok && !isLite(book)) return planValidationFailure(task, h, v.hard, task.maxAttempts);
     // §6.11 endgame：required_closures + open major/main 必须排进最后一弧（含 is_final 的弧）
     const volumeId = params.volume ?? arc.volume;
     const end = endgameStatus(book, state, state.volumes, volumeId, start - 1 + cards.length);
-    if (end.active) {
+    if (end.active && !isLite(book)) {
       const heavyOpens = cards.flatMap((x) => x.post.filter((p) => (p as { op?: string; weight?: string }).op === 'obligation.open' && ['major', 'main'].includes((p as { weight?: string }).weight ?? '')).map(() => x.id));
       if (heavyOpens.length) return planValidationFailure(task, h, [{ id: 'endgame-opens', severity: 'hard', category: 'plan.endgame', message: `endgame 期间不得新开 major/main 伏笔：${[...new Set(heavyOpens)].join('、')}`, conflicts_with_author_layer: false }], task.maxAttempts);
     }
@@ -421,7 +438,7 @@ export const planArc: TaskHandler = {
     if (isLastArc) {
       const paid = new Set(cards.flatMap((x) => x.pays));
       const missing = end.requiredClosures.filter((id) => !paid.has(id));
-      if (missing.length) return planValidationFailure(task, h, [{ id: 'closures', severity: 'hard', category: 'plan.endgame', message: `最后一弧没有回收：${missing.join('、')}`, conflicts_with_author_layer: false }], task.maxAttempts);
+      if (missing.length && !isLite(book)) return planValidationFailure(task, h, [{ id: 'closures', severity: 'hard', category: 'plan.endgame', message: `最后一弧没有回收：${missing.join('、')}`, conflicts_with_author_layer: false }], task.maxAttempts);
     }
     const files = outFiles(c).filter((f) => !/^plan\/cards\/c\d+\.yaml$/.test(f.path) && f.path !== P.arc(task.target));
     files.push({ path: P.arc(task.target), content: yamlStringify(arc, { lineWidth: 0 }) });
@@ -451,7 +468,7 @@ export const planFix: TaskHandler = {
   kind: 'plan.fix',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 6,
+  maxAttempts: 3,
   async manifest(ctx, spec) {
     const state = await loadBookState(requireBook(ctx).dir);
     // 账本前进后在 HEAD 上重跑投影校验，不通过转 card.repair（§7.2）
@@ -492,7 +509,7 @@ export const cardRepair: TaskHandler = {
   kind: 'card.repair',
   role: 'planner',
   lane: 'side',
-  maxAttempts: 4,
+  maxAttempts: 3,
   async manifest(ctx, spec) {
     const params = spec.params as { cards?: string[] } | undefined;
     const ids = params?.cards ?? [spec.target];

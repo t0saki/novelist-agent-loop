@@ -18,4 +18,5 @@
 {{compass}}
 ```
 
+{{lean}}
 {{output}}{{retry}}

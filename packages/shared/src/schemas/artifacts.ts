@@ -9,15 +9,16 @@ import { zDelta, zDeltaOp } from './delta.js';
  */
 export const zReceipt = z
   .object({
-    schema: z.literal('nv.receipt/1'),
-    task_id: z.string().optional(),
-    status: z.enum(['done', 'blocked', 'failed']),
-    artifacts: z.array(z.union([z.object({ path: z.string(), kind: z.string().optional() }), z.string().transform((path) => ({ path }))])).default([]),
-    nonces: z.array(z.string()).default([]),
-    title_proposal: z.string().optional(),
-    questions_for_planner: z.array(z.string()).default([]),
-    self_count: z.object({ total: z.number().int().optional(), beats: z.record(z.string(), z.number().int()).optional() }).optional(),
-    notes: z.string().optional(),
+    schema: z.literal('nv.receipt/1').catch('nv.receipt/1'),
+    task_id: z.string().optional().catch(undefined),
+    status: z.enum(['done', 'blocked', 'failed']).catch('done'),
+    artifacts: z.array(z.union([z.object({ path: z.string(), kind: z.string().optional() }), z.string().transform((path) => ({ path }))])).default([]).catch([]),
+    nonces: z.array(z.string()).default([]).catch([]),
+    title_proposal: z.string().optional().catch(undefined),
+    questions_for_planner: z.array(z.string()).default([]).catch([]),
+    // 回执只是记账：字段写错不值得重跑整章（真实 run 里 self_count 写成数字就重写过一次，4.8 万 token）
+    self_count: z.object({ total: z.number().int().optional(), beats: z.record(z.string(), z.number().int()).optional() }).optional().catch(undefined),
+    notes: z.string().optional().catch(undefined),
   })
   .passthrough();
 export type Receipt = z.infer<typeof zReceipt>;

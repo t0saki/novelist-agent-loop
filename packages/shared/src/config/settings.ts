@@ -16,7 +16,7 @@ export const AUTO_LENGTH_DEFAULTS = {
 export const zSystemSettings = z.object({
   /** 当前生效的路由 preset（D2 修订默认：agy-argon） */
   activePreset: z.string().default('agy-argon'),
-  defaultTier: zQualityTier.default('standard'),
+  defaultTier: zQualityTier.default('lite'),
   defaultGenre: z.string().optional(),
   isolation: z.enum([...ISOLATION_BACKENDS, 'auto']).default('auto'),
   /** 全局配额余量（账号可覆盖） */

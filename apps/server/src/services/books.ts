@@ -51,6 +51,7 @@ export async function createBook(deps: AppDeps, input: CreateBook): Promise<Book
   const config: Record<string, unknown> = { slug, title: parsed.title, genre: parsed.genre, tier };
   if (parsed.scale) config.scale = parsed.scale;
   if (parsed.preset) config.routing = { preset: parsed.preset };
+  if (parsed.approvals) config.approvals = parsed.approvals;
   const { commit } = await initBookRepo(dir, { config: config as never, premise: parsed.seed });
   const id = randomUUID();
   await deps.db.insert(books).values({ id, slug, title: parsed.title, genre: parsed.genre, status: 'draft', tier, headCommit: commit });

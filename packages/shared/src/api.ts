@@ -27,6 +27,7 @@ import { zProfile, zRoleRoute, zRoutingPreset } from './config/routing.js';
 import type { SystemSettings } from './config/settings.js';
 import { zSystemSettings } from './config/settings.js';
 import type { BookConfig, PublishConfig } from './schemas/book.js';
+import { zBookConfig } from './schemas/book.js';
 import { zPublishConfig } from './schemas/book.js';
 import type { Card } from './schemas/plan.js';
 import type { Delta } from './schemas/delta.js';
@@ -149,6 +150,8 @@ export const zCreateBook = z.object({
   tier: zQualityTier.optional(),
   preset: z.string().optional(),
   interview: z.boolean().default(false),
+  /** 覆盖 book.yaml 的审批关卡（无人值守开书用） */
+  approvals: zBookConfig.shape.approvals.unwrap().partial().optional(),
   scale: z
     .object({
       target_cjk: z.number().int().positive(),

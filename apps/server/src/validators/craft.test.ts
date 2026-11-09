@@ -83,8 +83,11 @@ describe('runCraftGates', () => {
 
   it('suggests compress only within 25% overrun', () => {
     const body = (n: number) => `<!-- beat:b1 -->\n${'字'.repeat(n / 2)}。\n\n<!-- beat:b2 -->\n${'词'.repeat(n / 2)}。\n`;
-    expect(gateVerdict(run(body(60))).suggestion).toBe('compress');
-    expect(gateVerdict(run(body(100))).suggestion).toBe('revise');
+    const capped = { overrides: { 'length.total': { params: { max: 50 } } } };
+    expect(gateVerdict(run(body(60), capped)).suggestion).toBe('compress');
+    expect(gateVerdict(run(body(100), capped)).suggestion).toBe('revise');
+    // 默认没有上限：写多了直接通过
+    expect(one(run(body(1000)), 'length.total')?.ok).toBe(true);
   });
 
   it('reports missing beat markers with the missing ids', () => {

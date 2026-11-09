@@ -48,9 +48,10 @@ function extraRegexes(params: Record<string, unknown>, flags = 'gu'): RegExp[] {
 const lengthTotal: Rule = (gate, { draft, length }) => {
   const total = countCjk(stripBeatMarkers(draft), length.count_mode);
   const min = num(gate.params.min, length.min);
-  const max = num(gate.params.max, length.max);
+  // 只怕写少：默认没有上限，要限制得在 gates.yaml 里明确配 max
+  const max = typeof gate.params.max === 'number' ? gate.params.max : Number.POSITIVE_INFINITY;
   const ok = total >= min && total <= max;
-  return { ok, measured: { total, min, max, target: length.target }, ...(ok ? {} : { detail: `字数 ${total} 不在 [${min}, ${max}]（${length.count_mode}）` }) };
+  return { ok, measured: { total, min, ...(Number.isFinite(max) ? { max } : {}), target: length.target }, ...(ok ? {} : { detail: Number.isFinite(max) ? `字数 ${total} 不在 [${min}, ${max}]（${length.count_mode}）` : `字数 ${total} 少于 ${min}（${length.count_mode}）` }) };
 };
 
 interface BeatSegment {

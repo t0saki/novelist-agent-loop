@@ -62,7 +62,7 @@ export const zBookConfig = z.object({
     .default({ target_cjk: 3_000_000, hard_max_cjk: 3_500_000, volumes: [10, 12], chapters_per_volume: [80, 110] }),
   /** D2 修订：默认 standard */
   tier: zQualityTier.default('standard'),
-  tiers: z.object({ key_chapters: zQualityTier.default('standard') }).default({ key_chapters: 'standard' }),
+  tiers: z.object({ key_chapters: zQualityTier.default('lite') }).default({ key_chapters: 'lite' }),
   /** opt-in 机制开关 */
   optin: z
     .object({

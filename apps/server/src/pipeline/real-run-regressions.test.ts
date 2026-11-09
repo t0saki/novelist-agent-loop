@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { type Volume, zCompass, zReceipt } from '@novelist/shared';
 import { outputBlock, retryHint, schemaBlock } from './common.js';
-import { endgameStatus } from './handlers/plan.js';
+import { endgameStatus, singleVolumePlan } from './handlers/plan.js';
 import type { BookState } from '../state/index.js';
 import type { BookHandle, TaskRow } from './types.js';
 
@@ -34,6 +34,19 @@ describe('regressions from the first real run', () => {
   it('receipt.artifacts 写成路径字符串也接受', () => {
     const r = zReceipt.parse({ schema: 'nv.receipt/1', status: 'done', artifacts: ['plan/compass.yaml', { path: 'b' }] });
     expect(r.artifacts).toEqual([{ path: 'plan/compass.yaml' }, { path: 'b' }]);
+  });
+
+  it('回执字段写错不算失败', () => {
+    const r = zReceipt.parse({ status: 'done', self_count: 2507, artifacts: 'x', nonces: 3 });
+    expect(r.self_count).toBeUndefined();
+    expect(r.artifacts).toEqual([]);
+  });
+
+  it('lite 单卷书由程序生成分卷，一弧起步', () => {
+    const v = singleVolumePlan('一句话', 20);
+    expect(v.detail).toBe('detailed');
+    expect(v.chapters).toEqual(['c00001', 'c00020']);
+    expect(v.arcs).toHaveLength(1);
   });
 
   it('模型猜出来的 compass 形状确实被拒绝（文档化当时的失败）', () => {

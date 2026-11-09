@@ -15,4 +15,5 @@
 
 {{predicates}}
 
+{{lean}}
 {{output}}{{retry}}

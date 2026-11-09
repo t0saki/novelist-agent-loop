@@ -43,7 +43,7 @@ export function NewBookPage() {
   const [genre, setGenre] = useState('');
   const [scale, setScale] = useState<Scale>(DEFAULT_SCALE);
   const [pickedTier, setTier] = useState<QualityTier | null>(null);
-  const tier: QualityTier = pickedTier ?? settings.data?.defaultTier ?? 'standard';
+  const tier: QualityTier = pickedTier ?? settings.data?.defaultTier ?? 'lite';
   const [preset, setPreset] = useState<string | null>(null);
   const [publish, setPublish] = useState<PublishConfig>(() => zPublishConfig.parse({}));
   const [start, setStart] = useState(true);

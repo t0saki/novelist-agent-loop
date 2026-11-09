@@ -91,6 +91,8 @@ describe('auto-start against a real app', () => {
     const yaml = yamlParse((await openRepo(bookDir(t.deps, slug!)).readFile(P.bookYaml))!);
     expect(yaml.scale.chapters_per_volume).toEqual([40, 40]);
     expect(yaml.scale.target_cjk).toBe(120000);
+    expect(yaml.approvals.compass.required).toBe(false);
+    expect(yaml.approvals.first_volume.required).toBe(false);
     expect(await t.deps.db.select().from(bookEvents).where(eq(bookEvents.kind, 'book.auto_created'))).toHaveLength(1);
   });
 

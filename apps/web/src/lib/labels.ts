@@ -13,9 +13,9 @@ export const BOOK_STATUS: Record<BookStatus, { label: string; tone: Tone }> = {
 };
 
 export const TIER_INFO: Record<QualityTier, { label: string; desc: string }> = {
-  lite: { label: 'Lite', desc: '写作 + 单次校验抽取，不跑评审与评委，soft 问题记债。最省额度。' },
+  lite: { label: 'Lite（默认）', desc: '规划从简，写作 + 单次校验抽取，不跑评审与评委，校验问题记债不打回。最省额度。' },
   lean: { label: 'Lean', desc: '与 Lite 相同（别名）。' },
-  standard: { label: 'Standard（默认）', desc: '增加独立评审和分开路由的抽取、摘要，token 约为 Lite 的 1.2–2.6 倍。' },
+  standard: { label: 'Standard', desc: '增加独立评审和分开路由的抽取、摘要，token 约为 Lite 的 1.2–2.6 倍。' },
   key: { label: 'Key', desc: '最高档，评委组与更多把关，token 约为 Standard 的 3 倍。' },
 };
 

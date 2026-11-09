@@ -196,6 +196,8 @@ export async function maybeStartBook(deps: AppDeps, now: Date, s: SystemSettings
     interview: false,
     start: true,
     scale: size,
+    // 无人值守：罗盘和第一卷的人工审批会让书一直占着名额。换账号 / 厂商的 failover 审批保留
+    approvals: { compass: { required: false, on_timeout: 'wait' }, first_volume: { required: false, on_timeout: 'wait' } },
   });
   const row = await bookBySlug(deps, created.slug);
   await deps.db.insert(bookEvents).values({ bookId: row.id, kind: AUTO_EVENT, body: { genre: pack.id } });

@@ -1,17 +1,20 @@
 /**
  * 内置 profile 与路由 preset（D2 修订）。
  * - 默认 preset = agy-argon：所有角色走 agy + Gemini 4 Argon（slug 可在 UI 改；以 `agy models` 列表为准）。
- * - 廉价模型（gpt-6-luna / claude-haiku-5-5 / gemini-3.8-flash-low）只出现在 dev-cheap preset，标记 tags:[dev]，**不是默认**。
+ * - 测试用廉价模型（gpt-6-luna / claude-haiku-5-5 / gemini-3.8-flash-low）只出现在 dev-cheap preset，标记 tags:[dev]。
+ *   默认 preset 里不产出正文的角色用 Flash（agy-flash-check），这是用户定的成本取舍，写作和规划仍是 Argon。
  * lane F（orchestrator/routing）在首次启动时把这些写入 DB（不存在才写），用户随后可在 UI 任意修改。
  */
 import type { RoleId } from '../enums.js';
 import type { ProfileInput, RoleRouteInput, RoutingPresetInput } from './routing.js';
 
 /** Ultra 账号的 `agy models` 里只有 gemini-4-argon-{low,medium,high}（2026-11-09 核实）；UI 可改 */
-export const AGY_ARGON_DEFAULT_SLUG = 'gemini-4-argon-high';
+export const AGY_ARGON_DEFAULT_SLUG = 'gemini-4-argon-medium';
 
 export const BUILTIN_PROFILES: ProfileInput[] = [
-  { id: 'agy-argon', label: 'agy · Gemini 4 Argon', harness: 'agy', model: AGY_ARGON_DEFAULT_SLUG, effort: 'high' },
+  { id: 'agy-argon', label: 'agy · Gemini 4 Argon', harness: 'agy', model: AGY_ARGON_DEFAULT_SLUG, effort: 'medium' },
+  { id: 'agy-argon-high', label: 'agy · Gemini 4 Argon（高推理，规划和裁决用）', harness: 'agy', model: 'gemini-4-argon-high', effort: 'high' },
+  { id: 'agy-flash-check', label: 'agy · Gemini 3.8 Flash（校验抽取用，不产出正文）', harness: 'agy', model: 'gemini-3.8-flash-medium', effort: 'medium' },
   { id: 'cc-opus', label: 'Claude Code · Opus 5.5', harness: 'claude-code', model: 'claude-opus-5-5', effort: 'high' },
   { id: 'cx-sol', label: 'Codex · gpt-6.1-sol', harness: 'codex', model: 'gpt-6.1-sol', effort: 'high' },
   { id: 'cx-terra', label: 'Codex · gpt-6.1-terra', harness: 'codex', model: 'gpt-6.1-terra', effort: 'medium' },
@@ -53,6 +56,11 @@ const WRITER_STICKY: Omit<RoleRouteInput, 'chain'> = {
   failover_requires_approval: true,
 };
 
+/** 决定全书走向的角色：调用次数少，错了后面全受影响 */
+const DECISION_ROLES: RoleId[] = ['planner', 'showrunner', 'plan_judge', 'judge'];
+/** 不产出正文的角色：推理深度对结果影响小，调用又多 */
+const MECHANICAL_ROLES: RoleId[] = ['checker', 'extractor', 'extractor_cross', 'format_checker', 'summarizer', 'auditor'];
+
 function allRoles(profile: string, extra: Partial<Record<RoleId, RoleRouteInput>> = {}): Partial<Record<RoleId, RoleRouteInput>> {
   const roles: Partial<Record<RoleId, RoleRouteInput>> = {};
   for (const r of ROUTABLE_ROLES) roles[r] = { chain: [profile] };
@@ -65,9 +73,12 @@ export const BUILTIN_PRESETS: RoutingPresetInput[] = [
   {
     id: 'agy-argon',
     name: 'agy + Gemini 4 Argon（全部角色）',
-    description: '默认。所有角色都走 Antigravity CLI 的 Gemini 4 Argon。需要 Google AI Pro/Ultra。',
+    description: '默认。规划和裁决用 high，写作和评审用 medium，校验、抽取、摘要等不产出正文的角色用 Gemini 3.8 Flash，都走 Antigravity CLI。需要 Google AI Pro/Ultra。',
     builtin: true,
-    roles: allRoles('agy-argon'),
+    roles: allRoles('agy-argon', {
+      ...Object.fromEntries(MECHANICAL_ROLES.map((r) => [r, { chain: ['agy-flash-check'] }])),
+      ...Object.fromEntries(DECISION_ROLES.map((r) => [r, { chain: ['agy-argon-high'] }])),
+    }),
   },
   {
     id: 'cc-only',

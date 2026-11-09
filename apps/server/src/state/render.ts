@@ -205,7 +205,7 @@ export function renderCard(ctx: RenderCtx, card: Card): string {
   const L: string[] = [];
   L.push(`### ${card.id}「${card.title}」`);
   L.push(`- 卷/弧：${card.volume} / ${card.arc}${card.key ? '｜关键章' : ''}${card.is_final ? '｜终章' : ''}`);
-  if (card.length) L.push(`- 长度：${card.length.min}–${card.length.max}（目标 ${card.length.target}，口径 ${card.length.count_mode}）`);
+  if (card.length) L.push(`- 长度：不少于 ${card.length.min}，多写不限（目标 ${card.length.target}，口径 ${card.length.count_mode}）`);
   if (card.pov) L.push(`- 视角：${nameOf(ctx, card.pov)}（${card.pov}）`);
   if (card.entities_present.length) L.push(`- 在场：${card.entities_present.map((e) => `${nameOf(ctx, e)}（${e}）`).join('、')}`);
   if (card.strands.length) L.push(`- 线索：${card.strands.join('、')}`);
