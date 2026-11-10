@@ -208,6 +208,7 @@ describe('v3 e2e (fake harness, in-process)', () => {
 
   it('chaos never loses accepted prose and never loops', async () => {
     await boot();
+    // 失控兜底保持默认的 2 倍（开着时不能低于 2）：这本书写不到 54 章，兜底在这里不会触发（兜底的 e2e 在 v3.p2.e2e）
     // 计划 27 章、每批 3 章；存稿上限调高，整本都不用发布
     const b = await v3Book('chaos', { length: 'medium', target: 27 * 4000, batch: 3, min: 500, publish: { max_buffer: 100, resume_buffer: 90 } });
     const blobs = new Map<number, string>();
@@ -301,15 +302,19 @@ describe('v3 e2e (fake harness, in-process)', () => {
     expect(await accepted()).toBe(17);
     expect((await hints()).some((h) => h.kind === 'notes_missing')).toBe(true);
 
-    // 9. 一章写短：照收，提示一次
+    // 9. 一章写短：照收，提示一次（还剩 10 章 > 3 批：普通写作批）
     r = await step({ v3: { shortChapter: 1 } });
+    expect(r.order).toMatchObject({ mode: 'write', phase: 'normal', effort: 'medium' });
     expect(await accepted()).toBe(20);
     expect((await hints()).filter((h) => h.kind === 'short').map((h) => h.chapter)).toEqual([18]);
     expect((await metaOf(b)).hintedShort).toContain(18);
 
-    // 10. 写完 2 章后进程被杀：判 harness_crash，2 章照样提交；下一批从第 23 章开始
+    // 10. 写完 2 章后进程被杀：判 harness_crash，2 章照样提交；下一批从第 23 章开始。
+    // 还剩 7 章 ≤ 3 批：收尾阶段（effort high），任务单要求先写结局章节清单（fake 在动笔前写进 outline.md）
     r = await step({ v3: { killAfter: 2 } });
     expect(r.order.from).toBe(21);
+    expect(r.order).toMatchObject({ mode: 'write', phase: 'closing', effort: 'high', endingListExists: false, runawayWarn: false });
+    expect(await b.repo.readFile('outline.md')).toMatch(/^## 结局章节清单$/m);
     expect(r.run.errorClass).toBe('harness_crash');
     expect(await accepted()).toBe(22);
     // 短章提示不重复
@@ -318,23 +323,32 @@ describe('v3 e2e (fake harness, in-process)', () => {
     // 11. 写完后额度用完：章节照样提交，账号睡下
     r = await step({ fail: 'quota', failAfterWrite: true });
     expect(r.order.from).toBe(23);
+    // 清单已在；还剩 5 章，多于一批半（4 章）：仍是收尾阶段的写作批；22 章没到提醒线 ceil(0.75 × 2 × 27)
+    expect(r.order).toMatchObject({ mode: 'write', phase: 'closing', effort: 'high', endingListExists: true, runawayWarn: false, runawayBase: 27 });
     expect(r.run.errorClass).toBe('quota');
     expect(await accepted()).toBe(25);
     const slept = (await t.deps.db.select().from(accountsState).where(eq(accountsState.accountId, 'fake')))[0];
     expect(Date.parse(slept?.sleepUntil ?? '')).toBeGreaterThan(Date.now());
     await t.deps.db.update(accountsState).set({ sleepUntil: null, sleepReason: null }).where(eq(accountsState.accountId, 'fake'));
 
-    // 12–13. 结局批两次都没写“（全书完）”：第二次按完结处理 + v3_end 待办
+    // 12–14. 结局批不写“（全书完）”：两次没写也不按完结处理（no_marker_twice 已删除），只提示补标记；第三次写了标记 → 完结
     r = await step({ v3: { noMarker: true } });
-    expect(r.order.mode).toBe('finale');
+    expect(r.order).toMatchObject({ mode: 'finale', from: 26, count: 2, forced: false });
     expect(await accepted()).toBe(27);
     expect((await bookRow(b)).status).not.toBe('completed');
-    expect((await metaOf(b)).finaleNoMarker).toBe(1);
+    expect((await metaOf(b))).toMatchObject({ finaleNoMarker: 1, runawayBatches: 0 });
+    expect((await hints()).find((h) => h.kind === 'finale_no_marker')?.chapter).toBe(27);
     r = await step({ v3: { noMarker: true } });
-    expect(r.order).toMatchObject({ mode: 'finale', from: 28 });
+    expect(r.order).toMatchObject({ mode: 'finale', from: 28, forced: false });
+    expect(r.order.hintsShown.some((h) => h.kind === 'finale_no_marker')).toBe(true);
+    expect((await bookRow(b)).status).not.toBe('completed');
+    expect((await metaOf(b))).toMatchObject({ finaleNoMarker: 2, runawayBatches: 0 });
+    r = await step({});
+    expect(r.order).toMatchObject({ mode: 'finale', from: 29, forced: false, effort: 'high' });
+    expect(await accepted()).toBe(29);
     expect((await bookRow(b)).status).toBe('completed');
-    expect((await metaOf(b)).completedReason).toBe('no_marker_twice');
-    expect(await inboxOf(`v3_end:${b.id}`)).toHaveLength(1);
+    expect((await metaOf(b)).completedReason).toBe('marker');
+    expect(await inboxOf(`v3_end:${b.id}`)).toHaveLength(0);
 
     // 完结后不再开 run
     await t.deps.orchestrator.runUntilIdle({ maxTicks: 5 });
@@ -381,7 +395,7 @@ describe('v3 e2e (fake harness, in-process)', () => {
     expect(await b.repo.tags('ch/*')).toHaveLength(4);
   }, 180_000);
 
-  it('promote fails three times: task blocked, v3_pending inbox with retry/discard, no new run; retry lands the batch', async () => {
+  it('promote fails three times: task blocked, pending.failures 3, no v3_pending inbox, no new run; POST v3/pending retry lands the batch', async () => {
     await boot();
     const b = await v3Book('pf', { length: 'short', min: 500 });
     await scenarios(b, [{ v3: { serverFault: 'promote', serverFaultTimes: 3 } }]);
@@ -395,13 +409,17 @@ describe('v3 e2e (fake harness, in-process)', () => {
     }
     expect(task.state).toBe('blocked');
     expect((await metaOf(b)).pending?.failures).toBe(3);
-    const items = await inboxOf(`v3_pending:${b.id}`);
-    expect(items).toHaveLength(1);
-    expect((items[0]!.actions as { id: string }[]).map((a) => a.id)).toEqual(['retry', 'discard']);
+    // 收稿失败不进待办（WP-3）：状态句和书页显示，主人在书页上重试 / 放弃
+    expect(await inboxOf(`v3_pending:${b.id}`)).toHaveLength(0);
+    // 状态句和书页（WP-4）：等主人处理
+    const page = (await inject('GET', `/api/admin/books/${b.slug}/v3`)).json() as { status: { kind: string; sentence: string }; pending: { failures: number; blocked: boolean } | null };
+    expect(page.status).toMatchObject({ kind: 'needs_owner', sentence: '收稿出错 3 次，等你处理（重试或放弃）' });
+    expect(page.pending).toMatchObject({ failures: 3, blocked: true });
     // blocked 期间不开新 run
     await t.deps.orchestrator.runUntilIdle({ maxTicks: 5 });
     expect(await runsOf(b)).toHaveLength(1);
-    await t.deps.orchestrator.actInbox(items[0]!.id, 'retry');
+    const res = await inject('POST', `/api/admin/books/${b.slug}/v3/pending`, { action: 'retry' });
+    expect(res.statusCode).toBe(200);
     await t.deps.orchestrator.runUntilIdle({ maxTicks: 30 });
     expect((await bookRow(b)).acceptedThrough).toBe(4);
     expect((await metaOf(b)).pending).toBeNull();

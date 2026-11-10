@@ -2,6 +2,7 @@
 
 任务：新写第 6–10 章（共 5 章）
 允许改写的旧章：第 4 章（见下面的系统提示）。除此之外，已写好的章节不要动。
+主人给你留了话：notes/from-owner.md（只读）。动笔前先读一遍，照着做。
 
 进度：已写 5 章，共 18234 字；计划共 15 章，全书不少于 60000 字。每章不少于 3000 字，不设上限。
 
@@ -14,7 +15,6 @@
 - notes/progress.md、outline.md、bible.md、notes/cast.md、notes/threads.md；
 - notes/chapters.md 的最后 30 行；
 - 上一章全文：manuscript/c00005.md。
-- 主人给你的话：notes/from-owner.md（只读）。
 更早的细节确实要核对时，到 notes/chapters.md 里找到章号，再去翻那一章。
 
 写作：

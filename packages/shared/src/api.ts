@@ -26,8 +26,8 @@ import type { Profile, RouteDecision, RoutingPreset } from './config/routing.js'
 import { zProfile, zRoleRoute, zRoutingPreset } from './config/routing.js';
 import type { SystemSettings } from './config/settings.js';
 import { zSystemSettings } from './config/settings.js';
-import type { BookConfig, PublishConfig } from './schemas/book.js';
-import { FLOWS, V3_LENGTHS, zBookConfig } from './schemas/book.js';
+import type { BookConfig, Effort, Flow, PublishConfig, V3Length } from './schemas/book.js';
+import { FLOWS, V3_LENGTHS, zBookConfig, zEffort } from './schemas/book.js';
 import { zPublishConfig } from './schemas/book.js';
 import type { Card } from './schemas/plan.js';
 import type { Delta } from './schemas/delta.js';
@@ -131,6 +131,10 @@ export interface BookSummary {
   waiting: { reason: string; until: string | null } | null;
   inboxOpen: number;
   updatedAt: string;
+  /** 流程（meta.v3 存在 = v3；列表不读 book.yaml） */
+  flow: Flow;
+  /** 新流程书的状态句与花费；旧流程书为 null */
+  v3: V3BookSummary | null;
 }
 export interface BookOverview extends BookSummary {
   config: BookConfig;
@@ -279,8 +283,164 @@ export interface ChapterAdminDetail extends ChapterRow {
   runs: RunRow[];
   commit: string | null;
 }
-export const CHAPTER_ACTIONS = ['rewrite', 'repair', 'reextract', 'approve', 'hold', 'unhold', 'publish_now'] as const;
+/** rewrite_from：v3 书“从这里起重写后续”（= 回退到第 N−1 章再写） */
+export const CHAPTER_ACTIONS = ['rewrite', 'repair', 'reextract', 'approve', 'hold', 'unhold', 'publish_now', 'rewrite_from'] as const;
 export const zChapterAction = z.object({ action: z.enum(CHAPTER_ACTIONS), note: z.string().optional(), confirm: z.boolean().default(false), ignoreAudit: z.boolean().optional() });
+
+// ───────────────────────── v3：主人的操作（p2-plan §1.4 WP-2） ─────────────────────────
+/** 给作者的话（一次性）；'' = 撤回还没被读的那段 */
+export const zV3OwnerMessage = z.object({ text: z.string().max(4000) });
+export const zV3AdoptDraft = z.object({ path: z.string().min(1) });
+export const zV3DiscardDraft = z.object({ path: z.string().min(1) });
+export const zV3Rewind = z.object({ to: z.number().int().min(0), note: z.string().max(2000).optional() });
+export const zV3PendingAction = z.object({ action: z.enum(['retry', 'discard']) });
+export type V3OwnerMessageInput = z.infer<typeof zV3OwnerMessage>;
+/** 主人操作的结果：detail 是给提示条的一句中文 */
+export interface V3ActionResult {
+  ok: true;
+  detail: string;
+}
+/** 书页“草稿”一栏的一行 */
+export interface V3DraftRow {
+  path: string;
+  size: number;
+  kind: 'unfinished' | 'rewrite' | 'dup' | 'pre' | 'retro' | 'owner_conflict' | 'rewound' | 'replaced' | 'other';
+  chapter: number | null;
+  target: string | null;
+  adoptable: boolean;
+  reason: string | null;
+  handled: boolean;
+}
+
+// ───────────────────────── v3：读模型与设置（p2-plan §1.4 WP-4） ─────────────────────────
+export type V3StatusKind =
+  | 'draft'
+  | 'opening'
+  | 'writing'
+  | 'finale'
+  | 'retro'
+  | 'harvesting'
+  | 'queued'
+  | 'waiting_quota'
+  | 'waiting_account'
+  | 'waiting_retry'
+  | 'needs_owner'
+  | 'buffer_full'
+  | 'paused'
+  | 'completed'
+  | 'archived'
+  | 'idle'
+  | 'rewinding';
+/** 一句状态（首页、书页） */
+export interface V3Status {
+  kind: V3StatusKind;
+  sentence: string;
+  since: string | null;
+  until: string | null;
+  notes: string[];
+}
+/** 累计花费：运行次数、小时、输出 token、每千字输出 token */
+export interface V3Cost {
+  runs: number;
+  hours: number;
+  outputTokens: number;
+  tokensPer1kChars: number | null;
+}
+export interface V3BookSummary {
+  length: V3Length;
+  targetCjk: number;
+  plannedChapters: number;
+  status: V3Status;
+  cost: V3Cost;
+}
+export interface V3RunCostRow {
+  runId: string;
+  taskKind: TaskKind;
+  mode: string | null;
+  chapters: [number, number] | null;
+  startedAt: string | null;
+  minutes: number | null;
+  outputTokens: number;
+  inputTokens: number;
+  cachedTokens: number;
+  model: string | null;
+  state: RunState;
+  errorClass: ErrorClass | null;
+  toolSteps: number | null;
+}
+export interface V3OwnerMessageView {
+  text: string;
+  setAt: string;
+  readIn: { kind: string; from: number; to: number; at: string } | null;
+  archivedPath: string | null;
+}
+export interface V3OwnerRequestView {
+  id: string;
+  chapter: number;
+  note: string;
+  at: string;
+  status: 'waiting' | 'done' | 'not_done' | 'dropped';
+}
+export interface V3BatchRow {
+  kind: string;
+  from: number;
+  to: number;
+  at: string;
+  runId: string | null;
+}
+export interface V3StoryFile {
+  path: string;
+  size: number;
+  budget: number | null;
+  over: boolean;
+}
+export interface V3Settings {
+  target_cjk: number;
+  min_chapter_cjk: number;
+  batch: number;
+  effort: { open: Effort; write: Effort; finale: Effort; retro: Effort };
+  publish: { mode: PublishConfig['mode']; cadence: string; timezone: string; per_slot: number; max_buffer: number };
+}
+export const zV3Settings = z.object({
+  target_cjk: z.number().int().positive(),
+  min_chapter_cjk: z.number().int().positive(),
+  batch: z.number().int().min(1).max(8),
+  effort: z.object({ open: zEffort, write: zEffort, finale: zEffort, retro: zEffort }),
+  publish: z.object({ mode: zPublishConfig.shape.mode, cadence: z.string(), timezone: z.string(), per_slot: z.number().int().positive(), max_buffer: z.number().int().positive() }),
+});
+export interface V3AgentsSizeView {
+  bytes: number;
+  hard: boolean;
+  limit: number;
+  harness: string;
+  at: string;
+  layers: { layer: string; bytes: number }[];
+}
+/** 新流程书页的全部数据（GET /api/admin/books/:slug/v3） */
+export interface V3BookView {
+  slug: string;
+  length: V3Length;
+  planned: number;
+  accepted: number;
+  published: number;
+  totalCjk: number;
+  status: V3Status;
+  settings: V3Settings;
+  ownerMessage: V3OwnerMessageView | null;
+  ownerHistory: V3OwnerMessageView[];
+  ownerRequests: V3OwnerRequestView[];
+  batches: V3BatchRow[];
+  drafts: V3DraftRow[];
+  story: V3StoryFile[];
+  runs: V3RunCostRow[];
+  cost: V3Cost;
+  retro: { enabled: boolean; batchesSince: number; every: number; lastAt: string | null };
+  hints: { kind: string; text: string }[];
+  pending: { failures: number; lastError: string | null; blocked: boolean } | null;
+  rewindPoints: { to: number; label: string }[];
+  locked: number[];
+  agentsSize: V3AgentsSizeView | null;
+}
 export const zPutChapterText = z.object({ text: z.string().min(1), baseSha: z.string(), confirm: z.boolean().default(false) });
 
 export interface StateView {
@@ -332,6 +492,8 @@ export interface RunRow {
   errorClass: ErrorClass | null;
   usage: { input: number; output: number; cached: number; costUsd: number | null };
   denials: number;
+  /** tool_call 事件数（runs.outcome.toolSteps；旧 run 为 null） */
+  toolSteps: number | null;
 }
 export interface RunDetail extends RunRow {
   outcome: Outcome | null;
@@ -675,6 +837,14 @@ export const ROUTES: RouteSpec[] = [
   { method: 'GET', path: '/api/admin/books/:slug/publish', auth: 'admin', res: 'PublishOverview', desc: '发布配置与前沿' },
   { method: 'PUT', path: '/api/admin/books/:slug/publish', auth: 'admin', req: 'PutPublish', res: 'PublishOverview', desc: '改发布配置（写回 book.yaml）' },
   { method: 'POST', path: '/api/admin/books/:slug/publish/now', auth: 'admin', req: 'PublishNow', res: 'Ok', desc: '立即发布' },
+  // admin: v3 书的主人操作
+  { method: 'PUT', path: '/api/admin/books/:slug/v3/message', auth: 'admin', req: 'V3OwnerMessage', res: 'V3ActionResult', desc: '给作者的话（一次性）' },
+  { method: 'POST', path: '/api/admin/books/:slug/v3/drafts/adopt', auth: 'admin', req: 'V3AdoptDraft', res: 'V3ActionResult', desc: '采用草稿' },
+  { method: 'POST', path: '/api/admin/books/:slug/v3/drafts/discard', auth: 'admin', req: 'V3DiscardDraft', res: 'V3ActionResult', desc: '收起草稿（移到 drafts/discarded/）' },
+  { method: 'POST', path: '/api/admin/books/:slug/v3/rewind', auth: 'admin', req: 'V3Rewind', res: 'V3ActionResult', desc: '回退到第 N 章' },
+  { method: 'POST', path: '/api/admin/books/:slug/v3/pending', auth: 'admin', req: 'V3PendingAction', res: 'V3ActionResult', desc: '收稿失败：重试 / 放弃' },
+  { method: 'GET', path: '/api/admin/books/:slug/v3', auth: 'admin', res: 'V3BookView', desc: '新流程书页数据' },
+  { method: 'PUT', path: '/api/admin/books/:slug/v3/settings', auth: 'admin', req: 'V3Settings', res: 'V3BookView', desc: '新流程设置（写回 book.yaml）' },
   // tasks / runs
   { method: 'GET', path: '/api/admin/tasks', auth: 'admin', res: 'Page<TaskRow>', desc: '任务（?book&state&kind）' },
   { method: 'POST', path: '/api/admin/tasks/:id/retry', auth: 'admin', res: 'Ok', desc: '重试任务' },

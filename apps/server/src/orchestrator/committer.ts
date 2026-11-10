@@ -24,7 +24,7 @@ import { ignoredPaths } from '../book/harvest.js';
 import { buildTmpIdContext, resolveTmpIds } from '../state/index.js';
 import { runDbEffect, type DbEffectExtra } from '../pipeline/effects.js';
 import { isFrozenChapter } from '../flow/contract.js';
-import { readV3Meta } from '../flow/state.js';
+import { clearPending, readV3Meta } from '../flow/state.js';
 import type { V3CommitPart, V3CommitPlan } from '../flow/types.js';
 import { REBASE_VALIDATORS } from '../validators/index.js';
 import { orchOf, taskTrailerValue, withOrch } from './orch-state.js';
@@ -384,7 +384,7 @@ async function commitOrEmpty(repo: BookRepo, input: { message: string; trailers:
  * v3 一批的提交（p1-plan §2.15）：持仓库锁；幂等键 = pending.trailerKey（Novelist-Task: <taskTrailer>@<runId>，在最后一个提交上），
  * 每章一个提交带 Novelist-Part: <key>#<no>（崩溃后按它续上）。主人在运行期间改过的文件按文件以主人为准，作者版本进 drafts/owner-conflicts/。
  */
-export async function promoteV3(db: Db, repo: BookRepo, task: TaskRow, plan: PromotePlan & { v3: V3CommitPlan }, meta: PromoteMeta): Promise<PromoteV3Outcome> {
+export async function promoteV3(db: Db, repo: BookRepo, task: TaskRow, plan: PromotePlan & { v3: V3CommitPlan }, meta: PromoteMeta, log?: { warn: (obj: object, msg: string) => void }): Promise<PromoteV3Outcome> {
   void task;
   const v3 = plan.v3;
   const key = v3.key;
@@ -487,23 +487,27 @@ export async function promoteV3(db: Db, repo: BookRepo, task: TaskRow, plan: Pro
       }
     }
 
-    // v3 书不能回退（门面 409）；HEAD 缺上一章只可能是手工改 git：照常逐文件落地，发一条待办
+    // HEAD 缺上一章只可能是手工改 git：照常逐文件落地，只记日志（不进待办）
     const notices: InboxInput[] = [];
     const firstNew = parts.filter((p) => !p.rewrite).reduce((m, p) => Math.min(m, p.no), Number.POSITIVE_INFINITY);
     if (Number.isFinite(firstNew) && firstNew > 1 && !(await repo.exists(P.manuscript(firstNew - 1), head))) {
-      notices.push({
-        kind: 'notice',
-        bookId: plan.bookId,
-        title: `书库里缺第 ${firstNew - 1} 章，本批照常入库`,
-        body: { missing: P.manuscript(firstNew - 1), from: firstNew, commit: head },
-        actions: [{ id: 'dismiss', label: '知道了' }],
-        dedupeKey: `v3_gap:${plan.bookId}`,
-      });
+      log?.warn({ bookId: plan.bookId, missing: P.manuscript(firstNew - 1), from: firstNew, commit: head }, 'v3 batch lands although HEAD misses the previous chapter');
     }
 
     // 5. 被 .gitignore 忽略的尾部文件（git add 会拒收，留着只会让提交反复失败）
     const ignored = await ignoredPaths(repo.dir, [...tail.keys()]);
     for (const p of ignored) tail.delete(p);
+
+    // 5b. 服务器替主人写的文件（清空读过的留言并归档）：整组只在 HEAD 上每个路径都还是预期的版本时写，
+    // 并且这一批还有章落地（计划里的章被主人改动整批顶掉时留言没被消化；只在已冻结的末章上完结时计划里本来就没有章）
+    const serverTail = v3.serverTail ?? [];
+    if (serverTail.length > 0 && (parts.length > 0 || v3.parts.length === 0)) {
+      const now = await repo.blobShas(
+        serverTail.map((s) => s.path),
+        head,
+      );
+      if (serverTail.every((s) => (now[s.path] ?? '') === (s.expectSha ?? ''))) for (const s of serverTail) tail.set(s.path, s.content);
+    }
 
     // 6–7. 提交：每章一个；最后一个带尾部文件、book.yaml 补丁和本批的最终 trailer
     const landed = parts.map((p) => p.no);
@@ -561,23 +565,33 @@ export class StaleBaseError extends Error {
 }
 
 /** owner 在 UI 编辑书库文件：走同一提交协议（Novelist-Owner-Edit trailer），使受影响的待执行任务失效 */
-export async function commitOwnerEdit(db: Db, repo: BookRepo, bookId: string, input: { files: { path: string; content: string | null }[]; message: string; baseSha: string | null; extraTrailers?: Record<string, string> }): Promise<{ commit: string; invalidated: string[] }> {
-  const commit = await withRepoLock(db, bookId, repo, async () => {
-    const paths = input.files.map((f) => f.path);
-    if (input.baseSha) {
-      const headSha = await repo.head();
-      const blobs = paths.length === 1 ? await repo.blobShas(paths, headSha) : {};
-      const blob = paths.length === 1 ? blobs[paths[0] as string] : undefined;
-      if (input.baseSha !== headSha && input.baseSha !== blob) throw new StaleBaseError(paths.join(','));
-    }
-    try {
-      await repo.writeFiles(input.files);
-      return await withGitLockRetry(repo, () => repo.commit({ message: input.message, trailers: { [TRAILER.owner]: 'true', ...input.extraTrailers }, paths }));
-    } catch (e) {
-      await repo.resetHard().catch(() => {});
-      throw e;
-    }
-  });
+type OwnerEditInput = { files: { path: string; content: string | null }[]; message: string; baseSha: string | null; extraTrailers?: Record<string, string> };
+
+/** 主人编辑的 git 那一步（调用方已持仓库锁） */
+async function ownerCommitLocked(repo: BookRepo, input: OwnerEditInput): Promise<string> {
+  const paths = input.files.map((f) => f.path);
+  if (input.baseSha) {
+    const headSha = await repo.head();
+    const blobs = paths.length === 1 ? await repo.blobShas(paths, headSha) : {};
+    const blob = paths.length === 1 ? blobs[paths[0] as string] : undefined;
+    if (input.baseSha !== headSha && input.baseSha !== blob) throw new StaleBaseError(paths.join(','));
+  }
+  try {
+    await repo.writeFiles(input.files);
+    return await withGitLockRetry(repo, () => repo.commit({ message: input.message, trailers: { [TRAILER.owner]: 'true', ...input.extraTrailers }, paths }));
+  } catch (e) {
+    await repo.resetHard().catch(() => {});
+    throw e;
+  }
+}
+
+export async function commitOwnerEdit(db: Db, repo: BookRepo, bookId: string, input: OwnerEditInput): Promise<{ commit: string; invalidated: string[] }> {
+  const commit = await withRepoLock(db, bookId, repo, () => ownerCommitLocked(repo, input));
+  return afterOwnerCommit(db, bookId, input, commit);
+}
+
+/** 主人编辑提交之后：动到硬清单的排队任务作废，记下 HEAD */
+async function afterOwnerCommit(db: Db, bookId: string, input: Pick<OwnerEditInput, 'files'>, commit: string): Promise<{ commit: string; invalidated: string[] }> {
   const live = (await db.select().from(tasks).where(and(eq(tasks.bookId, bookId), inArray(tasks.state, ['pending', 'ready', 'waiting'])))) as TaskRow[];
   const changed = new Set(input.files.map((f) => f.path));
   const invalidated: string[] = [];
@@ -632,7 +646,34 @@ export async function recoverBook(db: Db, repo: BookRepo, bookId: string, opts?:
  * 而 DB 从没计入它们（v3.batch 效果只在最后一个提交之后执行）。这里用主人提交把这些章恢复成 base 上的版本（base 上没有就删掉），
  * 已提交的正文另存到 drafts/cNNNNN.discarded.md，新章的 ch/NNNNN 标签一并删掉；HEAD 和 DB 重新一致。返回撤回的章号。
  */
-export async function revertPartialV3(db: Db, repo: BookRepo, bookId: string, p: { trailerKey: string; baseCommit: string }): Promise<number[]> {
+/** 放弃收稿被拒：pending 已经不是这一次的了（gone），或者这一批已经整批提交（landed：应该重试，不能放弃） */
+export class V3DiscardRefused extends Error {
+  constructor(public readonly code: 'gone' | 'landed') {
+    super(code === 'gone' ? '这次收稿已经处理过了' : '这一批已经整批提交了，请改用重试');
+  }
+}
+
+/**
+ * 放弃 pending 时撤回这次运行已经提交的分章（Novelist-Part: <key>#<no>）：正文退回 base 版本，提交过的版本进 drafts/cNNNNN.discarded.md。
+ * 日志扫描、读文件、提交全在仓库锁内；给了 runId 时还在锁内复查 pending 仍是这一次、这一批的最终提交（Novelist-Task: <key>）不存在，
+ * 然后在锁内清掉 pending（与 promoteV3 互斥：重放刚落地的整批不会被撤回）。返回撤回的章号。
+ */
+export async function revertPartialV3(db: Db, repo: BookRepo, bookId: string, p: { trailerKey: string; baseCommit: string; runId?: string }): Promise<number[]> {
+  const out = await withRepoLock(db, bookId, repo, async () => {
+    if (p.runId !== undefined) {
+      const row = (await db.select({ meta: books.meta }).from(books).where(eq(books.id, bookId)).limit(1))[0];
+      if (readV3Meta(row?.meta).pending?.runId !== p.runId) throw new V3DiscardRefused('gone');
+      if (await repo.findCommitByTrailer(TRAILER.task, p.trailerKey)) throw new V3DiscardRefused('landed');
+    }
+    const r = await revertPartsLocked(repo, p);
+    if (p.runId !== undefined) await clearPending(db, bookId, p.runId);
+    return r;
+  });
+  if (out.commit) await afterOwnerCommit(db, bookId, { files: out.files }, out.commit);
+  return out.nos;
+}
+
+async function revertPartsLocked(repo: BookRepo, p: { trailerKey: string; baseCommit: string }): Promise<{ nos: number[]; files: { path: string; content: string | null }[]; commit: string | null }> {
   const prefix = `${p.trailerKey}#`;
   const items = (await repo.log({ limit: 500 })).items;
   const nos = [
@@ -644,7 +685,7 @@ export async function revertPartialV3(db: Db, repo: BookRepo, bookId: string, p:
         .filter((n) => Number.isInteger(n) && n > 0),
     ),
   ].sort((a, b) => a - b);
-  if (nos.length === 0) return [];
+  if (nos.length === 0) return { nos, files: [], commit: null };
   const files: { path: string; content: string | null }[] = [];
   const fresh: number[] = [];
   for (const no of nos) {
@@ -655,7 +696,7 @@ export async function revertPartialV3(db: Db, repo: BookRepo, bookId: string, p:
     files.push({ path: rel, content: base });
     if (base === null) fresh.push(no);
   }
-  await commitOwnerEdit(db, repo, bookId, { files, message: `owner: discard partial v3 batch (${nos.join(',')})`, baseSha: null });
+  const commit = await ownerCommitLocked(repo, { files, message: `owner: discard partial v3 batch (${nos.join(',')})`, baseSha: null });
   for (const no of fresh) await gitRaw(repo.dir, ['tag', '-d', `ch/${String(no).padStart(5, '0')}`]).catch(() => null);
-  return nos;
+  return { nos, files, commit };
 }

@@ -5,7 +5,8 @@
 import path from 'node:path';
 import { type V3Length, countCjk, isChapterHeading, parseChapterHeading, parseCnNumber } from '@novelist/shared';
 import { DUP_RUN_CHARS, EMPTY_CJK, checkNewChapter, checkRewrite, longestSharedRun, normaliseChapter } from './checks.js';
-import { END_MARKER, isFrozenChapter, noteSize } from './contract.js';
+import { END_MARKER, SHORT_END_RATIO, isFrozenChapter, noteSize } from './contract.js';
+import { plannedUpper, runawayOver } from './decide.js';
 import type { HarvestPlan, OrderSpec, V3BookMeta, V3Hint, V3HintKind } from './types.js';
 
 export interface MapInput {
@@ -28,11 +29,24 @@ export interface MapInput {
   runId: string;
   /** 书的篇幅档（notes_missing 的短篇规则）；缺省时只有 open-short 按短篇算 */
   length?: V3Length;
-  /** base 上 drafts/ 下的文件（入库的新章顺手删掉自己的旧残稿） */
-  draftsAtBase?: string[];
+  /** base 上 drafts/ 下的文件 → 原文（只有 drafts/cNNNNN.md 带原文，其余为 ''）；入库的新章把自己的旧残稿移到 drafts/discarded/ */
+  draftsAtBase?: Map<string, string>;
+  // ── phase 2 ──
+  /** settings.v3.runawayFactor（0 = 关闭失控兜底；缺省 0） */
+  runawayFactor?: number;
+  /** 失控基准 max(planned_chapters_initial, plannedFloor)（缺省 max(plannedInitial, meta.plannedFloor)） */
+  runawayBase?: number;
+  /** run 自己结束（没被杀、没超时、没丢）；缺省 true */
+  cleanExit?: boolean;
+  /** WP-2：主人要求改写的章 */
+  ownerRewrites?: number[];
+  /** WP-2：这些章在 base 上的原文（含标题行；改写通过时原样存进 drafts/replaced/） */
+  ownerRewriteBase?: Map<number, string>;
 }
 
 const pad5 = (n: number) => String(n).padStart(5, '0');
+/** 2026-11-10T08:30:00.000Z → 20261110T083000（UTC；drafts/replaced/、回退目录用） */
+export const compactTs = (iso: string): string => iso.replace(/\.\d+Z$/, '').replace(/Z$/, '').replace(/[-:]/g, '');
 const squash = (s: string) => s.replace(/\s+/gu, '');
 const TEXT_EXT_RE = /\.(md|markdown|txt)$/i;
 const CN_NUM = '[〇零一二两三四五六七八九十百千万0-9０-９]+';
@@ -153,8 +167,8 @@ export function parsePlannedChapters(outline: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-/** bible.md 第一行 "# 《X》"，前几行里的 "一句话：Y" */
-export function parseBibleHead(bible: string): { title: string | null; blurb: string | null } {
+/** bible.md 第一行 "# 《X》"，前几行里的 "一句话：Y"、"标签：a、b"（标签按原文切分，最多 8 个） */
+export function parseBibleHead(bible: string): { title: string | null; blurb: string | null; tags: string[] | null } {
   const lines = bible.split(/\r?\n/).filter((l) => l.trim() !== '');
   const t = /^\s*#{1,3}\s*《\s*(.+?)\s*》\s*$/u.exec(lines[0] ?? '');
   let blurb: string | null = null;
@@ -165,7 +179,20 @@ export function parseBibleHead(bible: string): { title: string | null; blurb: st
       break;
     }
   }
-  return { title: t ? (t[1] ?? '').trim() || null : null, blurb };
+  let tags: string[] | null = null;
+  for (const l of lines.slice(1, 5)) {
+    const m = /^\s*(?:[-*]\s*)?标签\s*[:：]\s*(.+)$/u.exec(l);
+    if (m) {
+      const list = (m[1] ?? '')
+        .split(/[、，,;；/|｜]+/u)
+        .map((x) => x.trim())
+        .filter((x) => x !== '')
+        .slice(0, 8);
+      tags = list.length ? list : null;
+      break;
+    }
+  }
+  return { title: t ? (t[1] ?? '').trim() || null : null, blurb, tags };
 }
 
 interface Cand {
@@ -188,7 +215,7 @@ interface RewriteCand {
 }
 
 /** 提示在任务单里的先后（越靠前越要紧） */
-const HINT_ORDER: V3HintKind[] = ['owner_edit', 'unfinished', 'rewrite_rejected', 'unauthorized_edit', 'early_end', 'end_marker', 'short', 'notes_missing', 'notes_shrunk', 'no_bible', 'renumbered', 'relocated', 'misplaced', 'ignored', 'meta_stripped'];
+const HINT_ORDER: V3HintKind[] = ['rewound', 'owner_rewrite', 'owner_edit', 'unfinished', 'rewrite_rejected', 'unauthorized_edit', 'end_too_short', 'early_end', 'end_marker', 'finale_no_marker', 'short', 'notes_missing', 'notes_shrunk', 'no_bible', 'renumbered', 'relocated', 'misplaced', 'ignored', 'meta_stripped'];
 
 const nonEmptyLines = (t: string | null) => (t ?? '').split(/\r?\n/).filter((l) => l.trim() !== '').length;
 const list = (xs: (string | number)[]) => [...new Set(xs)].join('、');
@@ -214,6 +241,7 @@ function segNominals(segs: ChapterSeg[], fileNo: number | null, inManuscript: bo
 }
 
 export function planHarvest(input: MapInput): HarvestPlan {
+  if (input.order.mode === 'retro') return planRetroHarvest(input);
   const { order } = input;
   const frozen = (k: number) => isFrozenChapter(k, input.frozen);
   const from = order.from;
@@ -419,42 +447,71 @@ export function planHarvest(input: MapInput): HarvestPlan {
   const relocated = seq.map((c, i) => ({ c, no: finalNo(i) })).filter((x) => x.c.relocated && newChapters.some((ch) => ch.no === x.no));
   if (relocated.length) hints.push({ kind: 'relocated', text: `第 ${list(relocated.map((x) => x.no))} 章写在了 ${list(relocated.map((x) => x.c.path))}，已移到 manuscript/。正文请直接写在 manuscript/cNNNNN.md。` });
 
-  // 8（先算）. 计划章数：outline.md "计划：共 N 章"，夹在 [ceil(N0/2), 2·N0]
-  let planned = order.planned;
-  let plannedChapters: number | undefined;
-  const outlineText = files.find((f) => f.path === 'outline.md')?.text ?? input.outlineAtBase;
-  if (outlineText) {
-    const n = parsePlannedChapters(outlineText);
-    if (n !== null) {
-      const n0 = Math.max(1, input.plannedInitial);
-      const clamped = Math.min(2 * n0, Math.max(Math.ceil(n0 / 2), n));
-      if (clamped !== order.planned) plannedChapters = clamped;
-      planned = clamped;
-    }
-  }
+  // 8（先算）. 计划章数：outline.md "计划：共 N 章"，夹在 [max(ceil(N0/2), plannedFloor), plannedUpper]
+  const pl = plannedFromOutline(input, files);
+  let planned = pl.planned;
+  let plannedChapters = pl.plannedChapters;
 
-  // 4. 全书完标记与第一阶段的停止规则
+  // 4. 全书完标记与结局规则（DESIGN §5；p2-plan §3.1 map.ts step 4）
   const last = newChapters[newChapters.length - 1];
+  const total = order.totalCjk + newChapters.reduce((s, c) => s + c.cjk, 0);
+  const longish = input.length === 'long' || input.length === 'epic';
+  /** 能不能在这里收：短篇 / 中篇总能；长篇 / 超长要到目标的六成，或者是强制收尾、或者已经延长过一次 */
+  const endOk = !longish || order.forced === true || input.meta.shortEndUsed || total >= SHORT_END_RATIO * order.targetCjk;
   let completed: HarvestPlan['completed'] = false;
+  let completedNote: 'short' | undefined;
   let finaleNoMarker = order.finale ? input.meta.finaleNoMarker : 0;
+  let shortEndUsed = input.meta.shortEndUsed;
+  let plannedFloor = input.meta.plannedFloor;
+  /** 篇幅不到六成就收尾（长篇 / 超长第一次）：标记不收，计划章数往后延 */
+  const extend = (endNo: number, rewrite: number | undefined) => {
+    shortEndUsed = true;
+    const avg = Math.max(endNo > 0 ? total / endNo : 0, order.minChars);
+    const more = Math.max(order.batch, Math.ceil(Math.max(order.targetCjk - total, 0) / avg));
+    const p2 = Math.max(planned, endNo + more);
+    plannedFloor = Math.max(p2, plannedFloor ?? 0);
+    planned = Math.max(planned, p2);
+    plannedChapters = planned !== order.planned ? planned : undefined;
+    hints.push({
+      kind: 'end_too_short',
+      chapter: endNo,
+      ...(rewrite !== undefined ? { rewrite } : {}),
+      text: `第 ${endNo} 章写了"（全书完）"，但全书篇幅还不到目标的六成，标记已删除。先改写第 ${endNo} 章的后半，不收束，给后面留出情节；再把 outline.md 里的计划改为"计划：共 ${p2} 章"，按大纲接着往下写。`,
+    });
+  };
+  let tooShort = false;
   if (last && markers.get(last.no) && (order.finale || last.no >= planned)) {
-    completed = 'marker';
-    last.content = `${last.content}\n${END_MARKER}\n`;
     finaleNoMarker = 0;
+    if (endOk) {
+      completed = 'marker';
+      last.content = `${last.content}\n${END_MARKER}\n`;
+    } else {
+      tooShort = true;
+      extend(last.no, frozen(last.no) ? undefined : last.no);
+    }
   }
   if (!order.finale) {
     for (const ch of newChapters) {
-      if (!markers.get(ch.no) || (completed && ch === last) || frozen(ch.no)) continue;
+      if (!markers.get(ch.no) || ((completed || tooShort) && ch === last) || frozen(ch.no)) continue;
       hints.push({ kind: 'early_end', chapter: ch.no, rewrite: ch.no, text: `第 ${ch.no} 章出现了"（全书完）"，但还没到结局批，标记已删除。先改写第 ${ch.no} 章的后半，不收束，接着 outline.md 的下一段往下写。` });
     }
-  } else if (last && !completed && !failed) {
+  } else if (last && !completed && !tooShort && !failed) {
     // 有章被检查截下（进了 drafts/）时不算"写完了却没收尾"：下一个结局批还得先把截下的补回来
-    finaleNoMarker = input.meta.finaleNoMarker + 1;
-    if (finaleNoMarker >= 2) completed = 'no_marker_twice';
+    if (order.forced) completed = 'backstop';
+    else {
+      finaleNoMarker = input.meta.finaleNoMarker + 1;
+      hints.push({ kind: 'finale_no_marker', chapter: last.no, text: `上一批写到第 ${last.no} 章，没有写"（全书完）"。故事如果已经写完，只要在第 ${last.no} 章末尾单独一行补上"（全书完）"；还没写完，就接着写到结局。` });
+    }
   }
-
+  const finaleNoMarkerAlert = (input.runawayFactor ?? 0) === 0 && finaleNoMarker >= 2 && !input.meta.finaleNoMarkerAlerted;
+  // 失控计数：开写时已到 factor × 基准、且这一批有新章入库的批数；回到线下就归零
+  const factor = input.runawayFactor ?? 0;
+  const runawayBase = input.runawayBase ?? Math.max(input.plannedInitial, input.meta.plannedFloor ?? 0);
+  const over = runawayOver(order.accepted, factor, runawayBase, order.planned);
+  const runawayBatches = !over ? 0 : input.meta.runawayBatches + (newChapters.length > 0 ? 1 : 0);
   // 5. 改写旧章：只有任务单点名、且没冻结的章可以改；不合格保留旧版
   const rewrites: HarvestPlan['rewrites'] = [];
+  const ownerRewrites = new Set(input.ownerRewrites ?? []);
   const unauthorized: number[] = [];
   const draftCount = new Map<number, number>();
   const rewriteDraft = (no: number, content: string) => {
@@ -476,13 +533,17 @@ export function planHarvest(input: MapInput): HarvestPlan {
       rewriteDraft(rc.no, content);
       continue;
     }
-    const r = checkRewrite(rc.baseBody ?? '', n.body);
+    // 主人要求的改写：可以比原版短，但不能只剩提纲；通过时原版存进 drafts/replaced/<ts>/
+    const owner = ownerRewrites.has(rc.no);
+    const r = owner ? checkRewrite(rc.baseBody ?? '', n.body, { allowShorter: true, minChars: order.minChars }) : checkRewrite(rc.baseBody ?? '', n.body);
     if (r.ok) {
-      rewrites.push({ no: rc.no, title, content, cjk: n.cjk });
+      const old = input.ownerRewriteBase?.get(rc.no) ?? (rc.baseBody !== null ? `# 第${rc.no}章${rc.baseTitle ? ` ${rc.baseTitle}` : ''}\n\n${rc.baseBody}\n` : null);
+      rewrites.push({ no: rc.no, title, content, cjk: n.cjk, ...(owner && old !== null ? { extra: [{ path: `drafts/replaced/${compactTs(input.nowIso)}/c${pad5(rc.no)}.md`, content: old }] } : {}) });
       if (n.stripped.length) strippedNos.push(rc.no);
     } else {
       rewriteDraft(rc.no, content);
-      hints.push({ kind: 'rewrite_rejected', chapter: rc.no, text: `第 ${rc.no} 章的改写${r.reason === 'shorter' ? '比原版短了三成以上' : '结尾停在半句话'}，保留了原版，改写稿在 drafts/c${pad5(rc.no)}.rewrite.md。` });
+      const why = r.reason === 'truncated' ? '结尾停在半句话' : owner ? '太短了，不到原版的一半' : '比原版短了三成以上';
+      hints.push({ kind: 'rewrite_rejected', chapter: rc.no, text: `第 ${rc.no} 章的改写${why}，保留了原版，改写稿在 drafts/c${pad5(rc.no)}.rewrite.md。` });
     }
   }
   rewrites.sort((a, b) => a.no - b.no);
@@ -494,7 +555,11 @@ export function planHarvest(input: MapInput): HarvestPlan {
   let completedOn: number | undefined;
   const endOn = endOnExisting as { no: number; content: string; title: string; cjk: number } | null;
   if (endOn && !completed) {
-    if (seq.length === 0) {
+    if (seq.length === 0 && !endOk) {
+      // 长篇 / 超长不到六成：不收，计划往后延；末章的后半授权改写（冻结的章不授权）
+      finaleNoMarker = 0;
+      extend(endOn.no, frozen(endOn.no) ? undefined : endOn.no);
+    } else if (seq.length === 0) {
       completed = 'marker';
       finaleNoMarker = 0;
       completedOn = endOn.no;
@@ -507,24 +572,33 @@ export function planHarvest(input: MapInput): HarvestPlan {
     }
   }
 
-  // 6. 入库的新章删掉自己的旧残稿
-  const draftsAtBase = new Set(input.draftsAtBase ?? []);
+  if (completed) {
+    finaleNoMarker = 0;
+    if (total < SHORT_END_RATIO * order.targetCjk) completedNote = 'short';
+  }
+
+  // 6. 入库的新章把自己的旧残稿移进 drafts/discarded/（随该章的提交；不直接删）
+  const draftsAtBase = input.draftsAtBase ?? new Map<string, string>();
   for (const ch of newChapters) {
     const dp = `drafts/c${pad5(ch.no)}.md`;
+    const runVersion = tail.get(dp);
     tail.delete(dp);
-    if (draftsAtBase.has(dp)) ch.extra = [{ path: dp, content: null }];
+    const atBase = draftsAtBase.get(dp);
+    if (atBase === undefined) continue;
+    // 这次运行改过残稿就存改过的版本，否则存 base 上的
+    const old = typeof runVersion === 'string' ? runVersion : atBase;
+    let to = `drafts/discarded/c${pad5(ch.no)}.md`;
+    for (let k = 2; draftsAtBase.has(to) || tail.has(to); k += 1) to = `drafts/discarded/c${pad5(ch.no)}-${k}.md`;
+    ch.extra = [
+      { path: dp, content: null },
+      { path: to, content: old },
+    ];
   }
 
   // 7. 笔记
-  for (const f of files) {
-    if (!f.path.startsWith('notes/') || f.path.startsWith('notes/archive/') || !/\.md$/i.test(f.path) || f.baseText === null) continue;
-    const b = noteSize(f.baseText);
-    const n = noteSize(f.text);
-    if (b >= 500 && n < 0.6 * b) {
-      const archive = `notes/archive/${f.path.slice('notes/'.length).replace(/\.md$/i, '').replace(/\//g, '-')}-c${pad5(order.accepted)}.md`;
-      tail.set(archive, f.baseText);
-      hints.push({ kind: 'notes_shrunk', text: `${f.path} 这次缩短了 ${Math.round((1 - n / b) * 100)}%，旧版存在 ${archive}。确认没有丢掉在场人物和未收线索。` });
-    }
+  for (const s of notesShrunk(files, order.accepted)) {
+    tail.set(s.archive, s.baseText);
+    hints.push(s.hint);
   }
   const first = newChapters[0];
   if (first && last) {
@@ -545,15 +619,10 @@ export function planHarvest(input: MapInput): HarvestPlan {
   }
 
   // 8. 书名、简介（每次收稿都试，直到拿到为止）
-  let title: string | undefined;
-  let blurb: string | undefined;
-  const bibleText = files.find((f) => f.path === 'bible.md')?.text ?? input.bibleAtBase;
-  const head = bibleText ? parseBibleHead(bibleText) : { title: null, blurb: null };
-  if (input.autoTitle && input.titleIsPlaceholder) {
-    if (head.title) title = head.title;
-    else hints.push({ kind: 'no_bible', text: '没有找到 bible.md，或者前两行格式不对。请按约定补上：第一行"# 《书名》"，第二行"一句话：……"。' });
+  const { title, blurb, tags, missingTitle } = titleAndBlurb(input, files);
+  if (missingTitle) {
+    hints.push({ kind: 'no_bible', text: '没有找到 bible.md，或者前两行格式不对。请按约定补上：第一行"# 《书名》"，第二行"一句话：……"。' });
   }
-  if (!input.hasBlurb && head.blurb) blurb = head.blurb;
 
   // 1（提示）. 放错地方 / 不入库目录
   if (misplaced.length) hints.push({ kind: 'misplaced', text: `这些文件放在了约定位置之外：${list(misplaced)}。已原样收下；以后笔记放 notes/，设定放 bible.md，大纲放 outline.md，manuscript/ 里只放正文。` });
@@ -579,13 +648,118 @@ export function planHarvest(input: MapInput): HarvestPlan {
     tail: [...tail.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([p, content]) => ({ path: p, content })),
     hints: ordered.map(({ h }) => ({ ...h, at: input.nowIso })),
     completed,
+    ...(completedNote !== undefined ? { completedNote } : {}),
     finaleNoMarker,
+    ...(finaleNoMarkerAlert ? { finaleNoMarkerAlert } : {}),
+    runawayBatches,
+    shortEndUsed,
+    plannedFloor,
     ...(completedOn !== undefined ? { completedOn } : {}),
     zeroDiff: input.files.length === 0,
     changed: input.files.length,
     ...(title !== undefined ? { title } : {}),
     ...(blurb !== undefined ? { blurb } : {}),
+    ...(tags !== undefined ? { tags } : {}),
     ...(plannedChapters !== undefined ? { plannedChapters } : {}),
     hintedShort,
+  };
+}
+
+// ───────────────────────── 共用小步骤 ─────────────────────────
+
+/** "计划：共 N 章"（本次改了 outline.md 就用新版），夹在 [max(ceil(N0/2), plannedFloor), plannedUpper]（开书任务单的 planned_max 同一个上限） */
+function plannedFromOutline(input: MapInput, files: MapInput['files']): { planned: number; plannedChapters: number | undefined } {
+  const outlineText = files.find((f) => f.path === 'outline.md')?.text ?? input.outlineAtBase;
+  const n = outlineText ? parsePlannedChapters(outlineText) : null;
+  if (n === null) return { planned: input.order.planned, plannedChapters: undefined };
+  const n0 = Math.max(1, input.plannedInitial);
+  const floor = input.meta.plannedFloor ?? 0;
+  const lower = Math.max(Math.ceil(n0 / 2), floor);
+  const upper = plannedUpper(n0, input.meta.plannedFloor, input.runawayFactor ?? 0, input.order.batch);
+  const clamped = Math.min(upper, Math.max(lower, n));
+  return { planned: clamped, plannedChapters: clamped !== input.order.planned ? clamped : undefined };
+}
+
+/** 笔记一次缩小超过四成：旧版存进 notes/archive/，并给一条 notes_shrunk 提示 */
+function notesShrunk(files: MapInput['files'], accepted: number): { archive: string; baseText: string; hint: Omit<V3Hint, 'at'> }[] {
+  const out: { archive: string; baseText: string; hint: Omit<V3Hint, 'at'> }[] = [];
+  for (const f of files) {
+    if (!f.path.startsWith('notes/') || f.path.startsWith('notes/archive/') || !/\.md$/i.test(f.path) || f.baseText === null) continue;
+    const b = noteSize(f.baseText);
+    const n = noteSize(f.text);
+    if (b >= 500 && n < 0.6 * b) {
+      const archive = `notes/archive/${f.path.slice('notes/'.length).replace(/\.md$/i, '').replace(/\//g, '-')}-c${pad5(accepted)}.md`;
+      out.push({ archive, baseText: f.baseText, hint: { kind: 'notes_shrunk', text: `${f.path} 这次缩短了 ${Math.round((1 - n / b) * 100)}%，旧版存在 ${archive}。确认没有丢掉在场人物和未收线索。` } });
+    }
+  }
+  return out;
+}
+
+/** 书名（只在自动取名且还是占位名时）、简介（还没有时）；missingTitle = 该取名却没取到 */
+function titleAndBlurb(input: MapInput, files: MapInput['files']): { title?: string; blurb?: string; tags?: string[]; missingTitle: boolean } {
+  const changedBible = files.find((f) => f.path === 'bible.md')?.text;
+  const bibleText = changedBible ?? input.bibleAtBase;
+  const head = bibleText ? parseBibleHead(bibleText) : { title: null, blurb: null, tags: null };
+  const out: { title?: string; blurb?: string; tags?: string[]; missingTitle: boolean } = { missingTitle: false };
+  // 标签（WP-3）：只在这次改了 bible.md、且第三行能解析出标签时更新 books.meta.tags
+  if (changedBible !== undefined && head.tags) out.tags = head.tags;
+  if (input.autoTitle && input.titleIsPlaceholder) {
+    if (head.title) out.title = head.title;
+    else out.missingTitle = true;
+  }
+  if (!input.hasBlurb && head.blurb) out.blurb = head.blurb;
+  return out;
+}
+
+/**
+ * 复盘的收稿（p2-plan §3.1）：不收正文。改过的正文、章节候选一律进 drafts/cNNNNN.retro.md（认不出章号的进 drafts/retro/<原路径>），
+ * 其余文件照收；笔记缩水照样存档，但正常结束的复盘不提示（DESIGN §3.3：复盘不做这项检查）。提示、连击、结局状态原样保留。
+ */
+export function planRetroHarvest(input: MapInput): HarvestPlan {
+  const { order } = input;
+  const tail = new Map<string, string | null>();
+  const putDraft = (p: string, content: string) => {
+    let q = p;
+    for (let k = 2; tail.has(q); k++) q = p.replace(/\.md$/, `-${k}.md`);
+    tail.set(q, content);
+  };
+  const files = [...input.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  for (const f of files) {
+    const p = f.path;
+    const noteish = p.startsWith('notes/') || p.startsWith('drafts/') || p === 'bible.md' || p === 'outline.md';
+    const chapterish = p.startsWith('manuscript/') || (!noteish && isChapterCandidate(p, f.text));
+    if (chapterish) {
+      const no = chapterNoFromPath(p) ?? parseChapterHeading(firstLine(f.text))?.no ?? null;
+      putDraft(no !== null && no > 0 ? `drafts/c${pad5(no)}.retro.md` : `drafts/retro/${p}`, f.text);
+      continue;
+    }
+    if (f.ignored) continue;
+    tail.set(p, f.text);
+  }
+  const hints: V3Hint[] = [...input.meta.hints];
+  for (const s of notesShrunk(files, order.accepted)) {
+    tail.set(s.archive, s.baseText);
+    if (input.cleanExit === false) hints.push({ ...s.hint, at: input.nowIso });
+  }
+  const ordered = hints.map((h, i) => ({ h, i })).sort((x, y) => HINT_ORDER.indexOf(x.h.kind) - HINT_ORDER.indexOf(y.h.kind) || x.i - y.i);
+  const { plannedChapters } = plannedFromOutline(input, files);
+  const { title, blurb, tags } = titleAndBlurb(input, files);
+  return {
+    newChapters: [],
+    rewrites: [],
+    tail: [...tail.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([p, content]) => ({ path: p, content })),
+    hints: ordered.map(({ h }) => h),
+    completed: false,
+    finaleNoMarker: input.meta.finaleNoMarker,
+    runawayBatches: input.meta.runawayBatches,
+    shortEndUsed: input.meta.shortEndUsed,
+    plannedFloor: input.meta.plannedFloor,
+    zeroDiff: input.files.length === 0,
+    changed: input.files.length,
+    ...(title !== undefined ? { title } : {}),
+    ...(blurb !== undefined ? { blurb } : {}),
+    ...(tags !== undefined ? { tags } : {}),
+    ...(plannedChapters !== undefined ? { plannedChapters } : {}),
+    hintedShort: [...input.meta.hintedShort],
   };
 }

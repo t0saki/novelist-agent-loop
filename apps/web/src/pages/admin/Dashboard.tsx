@@ -10,7 +10,8 @@ import { Badge, Card, Empty, Meter, Page, PageHeader, Q, Stat } from '../../comp
 import { useAdminEvent } from '../../lib/adminEvents';
 import { buildAlerts } from '../../lib/alerts';
 import { fmtCjk, fmtRel, fmtTime, toRatio } from '../../lib/format';
-import { ACTIVE_RUN_STATES, BOOK_STATUS, WINDOW_LABEL } from '../../lib/labels';
+import { ACTIVE_RUN_STATES, BOOK_STATUS, V3_LENGTH_LABEL, WINDOW_LABEL } from '../../lib/labels';
+import { V3CostLine, V3StatusLine } from '../../components/admin/V3Status';
 
 const LANE_LABEL: Record<string, string> = { write: '写作', side: '旁路', system: '系统' };
 
@@ -33,6 +34,66 @@ function describeSse(e: SseEvent): string | null {
     default:
       return null;
   }
+}
+
+type V3Filter = 'live' | 'completed' | 'all';
+const V3_FILTERS: { id: V3Filter; label: string }[] = [
+  { id: 'live', label: '在写和等待' },
+  { id: 'completed', label: '已完结' },
+  { id: 'all', label: '全部' },
+];
+
+/** 新流程的书：每本一行（书名、题材、篇幅；已写/目标；一句状态；存稿/已发布；累计花费）。导入的书（旧流程）不在这里 */
+function V3BooksCard({ books }: { books: BookSummary[] }) {
+  const [filter, setFilter] = useState<V3Filter>('live');
+  const v3 = books.filter((b) => b.flow === 'v3' && b.v3 !== null);
+  if (v3.length === 0) return null;
+  const rows = v3.filter((b) => (filter === 'all' ? true : filter === 'completed' ? b.status === 'completed' : b.status !== 'completed' && b.status !== 'archived'));
+  return (
+    <Card
+      title="新流程的书"
+      className="mb-4"
+      padded={false}
+      actions={
+        <span className="inline-flex gap-1">
+          {V3_FILTERS.map((f) => (
+            <button key={f.id} type="button" onClick={() => setFilter(f.id)} className={`text-xs px-2 py-0.5 rounded-full border ${filter === f.id ? 'border-accent text-accent' : 'border-line text-sub hover:text-ink'}`}>
+              {f.label}
+            </button>
+          ))}
+        </span>
+      }
+    >
+      {rows.length === 0 ? (
+        <Empty>没有。</Empty>
+      ) : (
+        <ul className="divide-y divide-line">
+          {rows.map((b) => {
+            const s = b.v3 as NonNullable<BookSummary['v3']>;
+            return (
+              <li key={b.slug} className="px-4 py-2.5 grid gap-1 md:grid-cols-[minmax(10rem,1.2fr)_2fr_auto] md:items-center">
+                <div className="min-w-0">
+                  <Link to="/admin/books/$slug/$tab" params={{ slug: b.slug, tab: 'overview' }} className="text-sm font-medium hover:underline truncate block">
+                    {b.title}
+                  </Link>
+                  <div className="text-xs text-sub truncate">
+                    {b.genre} · {V3_LENGTH_LABEL[s.length]} · {fmtCjk(b.totalCjk)} / {fmtCjk(s.targetCjk)}
+                  </div>
+                </div>
+                <V3StatusLine status={s.status} compact />
+                <div className="text-xs text-sub md:text-right space-y-0.5">
+                  <div className="tabular-nums">
+                    存稿 {b.frontiers.buffer} · 已发布 {b.frontiers.published}
+                  </div>
+                  <V3CostLine cost={s.cost} />
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </Card>
+  );
 }
 
 export function DashboardPage() {
@@ -80,6 +141,7 @@ export function DashboardPage() {
   return (
     <Page>
       <PageHeader title="仪表盘" />
+      <V3BooksCard books={books.data ?? []} />
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
         <Stat label="写作中的书" value={activeBooks} sub={`共 ${books.data?.length ?? 0} 本`} />
         <Stat label="累计字数" value={fmtCjk(totalCjk)} />

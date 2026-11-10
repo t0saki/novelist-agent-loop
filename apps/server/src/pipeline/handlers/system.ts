@@ -18,7 +18,9 @@ import { deltaCheck } from '../../validators/index.js';
 import { buildAliasIndex } from '../../context/index.js';
 import { aliasEntities } from '../../state/index.js';
 import { buildManifest, contractCheck, contractFailure, effectiveLexicon, frontmatterFor, lengthFor, loadRunState, outputBlock, questionsInbox, requireBook, retryHint } from '../common.js';
-import type { PipelineContext, TaskHandler, TaskResult, TaskRow, TaskSpec } from '../types.js';
+import type { BookHandle, PipelineContext, TaskHandler, TaskResult, TaskRow, TaskSpec } from '../types.js';
+import { requestHoldCap } from '../../flow/publish.js';
+import { readV3Meta } from '../../flow/state.js';
 import { renderTemplate } from '../workorder.js';
 import { OP_REFERENCE } from './shared.js';
 
@@ -85,6 +87,30 @@ function publishThrough(target: string): number {
   return m ? Number(m[1]) : chapterNo(target);
 }
 
+/**
+ * v3 书的发布（p2-plan §3.2）：在事务里锁住书行再算上限，和采用草稿、改写请求、回退的检查用同一把锁；
+ * 回退进行中（meta.v3.rewinding）最多发布到回退目标。git 的 published/N 标签在事务提交之后打（-f 幂等）。
+ */
+async function publishV3(ctx: PipelineContext, book: BookHandle, through: number, nowIso: string, manual: boolean): Promise<TaskResult> {
+  const r = await ctx.deps.db.transaction(async (tx) => {
+    const row = (await tx.select({ published: books.publishedThrough, accepted: books.acceptedThrough, status: books.status, meta: books.meta }).from(books).where(eq(books.id, book.id)).limit(1).for('update'))[0];
+    const from = (row?.published ?? 0) + 1;
+    const meta = readV3Meta(row?.meta);
+    const rewinding = meta.rewinding;
+    // 入队之后主人才提的改写请求：锁内复查（手动发布越过请求，之后由 dropPublishedRequests 作废）
+    const hold = manual ? Number.MAX_SAFE_INTEGER : Math.min(Number.MAX_SAFE_INTEGER, requestHoldCap(meta, row?.status, row?.status === 'completed'));
+    const to = Math.min(through, row?.accepted ?? through, rewinding ? rewinding.to : Number.MAX_SAFE_INTEGER, hold);
+    if (to < from) return { from, to };
+    await tx.update(chapters).set({ publishedAt: sql`COALESCE(${chapters.publishedAt}, ${nowIso})` }).where(and(eq(chapters.bookId, book.id), gte(chapters.no, from), lte(chapters.no, to)));
+    await tx.update(publishSchedule).set({ state: 'published', publishedAt: nowIso }).where(and(eq(publishSchedule.bookId, book.id), gte(publishSchedule.no, from), lte(publishSchedule.no, to)));
+    await tx.update(books).set({ publishedThrough: sql`GREATEST(${books.publishedThrough}, ${to})`, updatedAt: nowIso }).where(eq(books.id, book.id));
+    return { from, to };
+  });
+  if (r.to < r.from) return { status: 'done', summary: { published: 0, through } };
+  for (let no = r.from; no <= r.to; no++) await book.repo.tag(gitTags.published(no));
+  return { status: 'done', summary: { published: r.to - r.from + 1, through: r.to } };
+}
+
 export const publish: TaskHandler = {
   kind: 'publish',
   role: null,
@@ -95,12 +121,13 @@ export const publish: TaskHandler = {
     const book = requireBook(ctx);
     const through = publishThrough(task.target);
     const nowIso = ctx.deps.now().toISOString();
+    if (book.config.flow === 'v3') return publishV3(ctx, book, through, nowIso, (task.params as { manual?: boolean } | null)?.manual === true);
     const rows = await ctx.deps.db.select({ published: books.publishedThrough, accepted: books.acceptedThrough, audited: books.auditedThrough }).from(books).where(eq(books.id, book.id)).limit(1);
     const from = (rows[0]?.published ?? 0) + 1;
     const params = task.params as { manual?: boolean; ignoreAudit?: boolean };
     // 手动发布默认也服从 require_audited，只有显式 ignoreAudit 才越过审计
-    // v3 书不看审计前沿（发布规则见 flow/publish.ts）
-    const auditCap = book.config.flow !== 'v3' && params.manual && params.ignoreAudit !== true && book.config.publish.require_audited ? (rows[0]?.audited ?? 0) : Number.MAX_SAFE_INTEGER;
+    // v3 书走 publishV3（不看审计前沿，发布规则见 flow/publish.ts）
+    const auditCap = params.manual && params.ignoreAudit !== true && book.config.publish.require_audited ? (rows[0]?.audited ?? 0) : Number.MAX_SAFE_INTEGER;
     const to = Math.min(through, rows[0]?.accepted ?? through, auditCap);
     if (to < from) return { status: 'done', summary: { published: 0, through } };
     // tag 幂等（-f）；DB 更新重放也幂等（COALESCE / GREATEST）

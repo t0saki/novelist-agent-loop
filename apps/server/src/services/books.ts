@@ -11,10 +11,12 @@ import type { AppDeps } from '../app.js';
 import { bookFiles, CanonicalParseError, initBookRepo, openRepo, P, type BookRepo } from '../book/index.js';
 import { books, chapters, inbox, runs, tasks, publishSchedule, readingProgress, bookEvents } from '../db/schema.js';
 import { genreExists } from '../genres/index.js';
+import { syncBibleMeta } from '../flow/library.js';
 import { HttpProblem, conflict } from '../api/problem.js';
 import { bookBySlug, bookDir, type BookRow } from '../api/helpers.js';
-import { bufferState, commitOwnerEdit, loadSystemSettings, nextSlots } from '../orchestrator/index.js';
+import { bufferState, commitOwnerEdit, ensureBatchLog, loadSystemSettings, nextSlots } from '../orchestrator/index.js';
 import { loadBookState, milestoneStatus } from '../state/index.js';
+import { isV3Row, v3Summaries } from './v3-view.js';
 import type { PublishConfig } from '@novelist/shared';
 
 export const AUTO_CREATED_EVENT = 'book.auto_created';
@@ -161,6 +163,13 @@ export async function reindexBook(deps: AppDeps, slug: string): Promise<void> {
   const cards = (await repo.list('plan/cards', { rev: head })).map((p) => Number(/c(\d{5})\.yaml$/.exec(p)?.[1] ?? 0));
   const cardsThrough = cards.length ? Math.max(...cards) : 0;
   await deps.db.update(books).set({ acceptedThrough, totalCjk, cursor: acceptedThrough + 1, cardsThrough, headCommit: head, publishedThrough: Math.max(book.publishedThrough, pubThrough), updatedAt: nowIso }).where(eq(books.id, book.id));
+  // v3（phase 1 写的书没有 batchLog）：按提交 trailer 回填批次（回退点、复盘用）
+  if (v3 && acceptedThrough > 0) await ensureBatchLog(deps.db, repo, book.id);
+  // v3：标签（书库摘要用）按 HEAD 上 bible.md 的第三行补上
+  if (v3) {
+    const bible = await repo.readFile('bible.md', head).catch(() => null);
+    if (bible) await syncBibleMeta(deps.db, book.id, bible);
+  }
   deps.bus.publish({ type: 'book_changed', book: slug });
 }
 
@@ -175,9 +184,11 @@ function frontiers(row: BookRow, bufferDays: number | null): Frontiers {
   };
 }
 
-export async function summarize(deps: Pick<AppDeps, 'db'>, rows: BookRow[]): Promise<BookSummary[]> {
+export async function summarize(deps: Pick<AppDeps, 'db' | 'paths'>, rows: BookRow[]): Promise<BookSummary[]> {
   const ids = rows.map((r) => r.id);
   if (ids.length === 0) return [];
+  // v3 书：状态句与花费（批量查询；flow 按 meta.v3 是否存在判断，旧流程书不读 book.yaml）
+  const v3 = await v3Summaries(deps, rows, new Date());
   const [taskRows, inboxRows, waitingRows] = await Promise.all([
     deps.db.select({ bookId: tasks.bookId, n: count() }).from(tasks).where(and(inArray(tasks.bookId, ids), inArray(tasks.state, [...LIVE_TASK_STATES]))).groupBy(tasks.bookId),
     deps.db.select({ bookId: inbox.bookId, n: count() }).from(inbox).where(and(inArray(inbox.bookId, ids), eq(inbox.state, 'open'))).groupBy(inbox.bookId),
@@ -201,10 +212,12 @@ export async function summarize(deps: Pick<AppDeps, 'db'>, rows: BookRow[]): Pro
     waiting: waiting.get(row.id) ?? null,
     inboxOpen: inboxCount.get(row.id) ?? 0,
     updatedAt: row.updatedAt,
+    flow: isV3Row(row) ? 'v3' : 'v2',
+    v3: v3.get(row.id) ?? null,
   }));
 }
 
-export async function listBookSummaries(deps: Pick<AppDeps, 'db'>): Promise<BookSummary[]> {
+export async function listBookSummaries(deps: Pick<AppDeps, 'db' | 'paths'>): Promise<BookSummary[]> {
   const rows = await deps.db.select().from(books).orderBy(desc(books.updatedAt));
   return summarize(deps, rows);
 }

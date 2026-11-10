@@ -181,6 +181,22 @@ describe('runner + nv-shim + fake harness', () => {
     expect(third.events).toHaveLength(0);
   });
 
+  it('toolSteps counts tool_call events incl. on reattach (fromSeq > 0)', async () => {
+    const f = await fx({ fake: { sleepMs: 1200, dripMs: 100 } });
+    const first = collector();
+    const h = await startRun(f.prepared, first.sink);
+    const r = await h.wait();
+    const calls = first.events.filter((e) => e.t === 'tool_call').length;
+    expect(calls).toBeGreaterThan(0);
+    expect(r.toolSteps).toBe(calls);
+    // 已结束的 run 从末尾接管：一个事件都不再投递，步数照样从头数
+    const late = collector();
+    const h2 = await reattachRun(f.spec.runDir, getAdapter('fake'), f.spec, late.sink, r.eventCount);
+    const r2 = await h2!.wait();
+    expect(late.events).toHaveLength(0);
+    expect(r2.toolSteps).toBe(calls);
+  });
+
   it('reattach returns null when the shim is gone and no exit.json exists', async () => {
     const f = await fx();
     const lf = logFiles(f.spec.logDir);

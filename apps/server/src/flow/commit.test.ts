@@ -64,10 +64,13 @@ describe('buildPromote', () => {
     expect((p?.effect?.args as unknown as V3BatchEffectArgs).batchFrom).toBeNull();
     expect(buildPromote({ book, task, run, order, plan: planHarvest(mapInput({ order, files: [] })), trailerKey: 'k', noChapterStreak: 0, nowIso })).toBeNull();
   });
-  it('stale drafts delete travels with its chapter commit', () => {
+  it('stale drafts move (to drafts/discarded/) travels with its chapter commit', () => {
     const order = orderSpec();
-    const plan = planHarvest(mapInput({ order, draftsAtBase: ['drafts/c00006.md'], files: [file('manuscript/c00006.md', chapterText(6)), ...notesFor(6, 6)] }));
+    const plan = planHarvest(mapInput({ order, draftsAtBase: new Map([['drafts/c00006.md', '残稿']]), files: [file('manuscript/c00006.md', chapterText(6)), ...notesFor(6, 6)] }));
     const p = buildPromote({ book, task, run, order, plan, trailerKey: 'k', noChapterStreak: 0, nowIso });
-    expect(p?.v3?.parts[0]?.extra).toEqual([{ path: 'drafts/c00006.md', content: null }]);
+    expect(p?.v3?.parts[0]?.extra).toEqual([
+      { path: 'drafts/c00006.md', content: null },
+      { path: 'drafts/discarded/c00006.md', content: '残稿' },
+    ]);
   });
 });

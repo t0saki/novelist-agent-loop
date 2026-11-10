@@ -112,3 +112,23 @@ describe('classifyV3Run: finale completed on an already-accepted chapter', () =>
     expect(classifyV3Run(facts({ accepted: 0, completed: false, changed: 1, noChapterStreak: 1 })).status).toBe('waiting');
   });
 });
+
+describe('classifyV3Run: retro runs', () => {
+  it('retro: zero diff → done, no zeroDiff, bookEmpty keep, no inbox', () => {
+    for (const outcome of [{ status: 'completed' as const }, { status: 'failed' as const, errorClass: 'harness_crash' as const }, { status: 'timeout' as const, errorClass: 'timeout_wall' as const }]) {
+      for (const lost of [false, true]) {
+        const v = classifyV3Run(facts({ retro: true, outcome, lost, emptyStreak: 4, accountStreak: 1 }));
+        expect(v).toMatchObject({ status: 'done', zeroDiff: false, bookEmpty: 'keep', pauseAccount: false, bookInbox: null });
+        expect(v.retryAfter).toBeUndefined();
+      }
+    }
+    expect(classifyV3Run(facts({ retro: true, changed: 4, noChapterStreak: 5 }))).toMatchObject({ status: 'done', bookEmpty: 'keep', bookInbox: null });
+  });
+  it('retro infra quota → done with infraClass (the executor still applies the account sleep)', () => {
+    const v = classifyV3Run(facts({ retro: true, outcome: { status: 'failed', errorClass: 'quota' }, planFailure: { status: 'waiting', retryAfter: plus(3600_000) } }));
+    expect(v).toMatchObject({ status: 'done', infraClass: 'quota', zeroDiff: false, bookEmpty: 'keep' });
+  });
+  it('retro owner-cancelled → keep_cancelled', () => {
+    expect(classifyV3Run(facts({ retro: true, ownerCancelled: true, outcome: { status: 'cancelled' } }))).toMatchObject({ status: 'keep_cancelled', bookEmpty: 'keep' });
+  });
+});

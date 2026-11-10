@@ -9,6 +9,7 @@ import type { V3Hint } from '../flow/types.js';
 import { publish } from '../pipeline/handlers/system.js';
 import { eligibleThrough, publishTick, type PublishIo } from './publisher.js';
 import { createScheduler } from './scheduler.js';
+import { execEnv } from './executor.js';
 import { createOrchTestEnv, type OrchTestEnv } from './testing.js';
 
 let t: OrchTestEnv;
@@ -129,5 +130,50 @@ describe('v3 publishing', () => {
     await s.stop({ drain: true });
     const pubs = (await t.db.select().from(tasks).where(eq(tasks.bookId, b.id))).filter((x) => x.kind === 'publish');
     expect(pubs.map((p) => p.target)).toEqual(['through-3']);
+  });
+});
+
+describe('v3 publishing: owner rewrite requests (WP-2)', () => {
+  const req = (chapter: number, status: 'waiting' | 'done' | 'not_done' | 'dropped' = 'waiting') => ({ id: `q${chapter}`, kind: 'rewrite', chapter, note: '改', at: ago(1), status });
+  const setReqs = async (id: string, reqs: unknown[], status?: string) =>
+    t.db
+      .update(books)
+      .set({ ...(status ? { status } : {}), meta: { v3: { ...emptyV3Meta(), lastBatchFrom: 6, ownerRequests: reqs } } })
+      .where(eq(books.id, id));
+
+  it('v3Cap holds back from the first waiting request while the book is active', async () => {
+    const id = await book({ accepted: 10, lastBatchFrom: 6 });
+    expect(await v3PublishCap(t.db, id, NOW, 24)).toBe(5);
+    await setReqs(id, [req(4), req(2, 'done')]);
+    expect(await v3PublishCap(t.db, id, NOW, 24)).toBe(3);
+    await setReqs(id, [req(4), req(3)]);
+    expect(await v3PublishCap(t.db, id, NOW, 24)).toBe(2);
+  });
+
+  it('no hold when the book is paused or completed', async () => {
+    const id = await book({ accepted: 10, lastBatchFrom: 6 });
+    await setReqs(id, [req(4)], 'paused');
+    expect(await v3PublishCap(t.db, id, NOW, 24)).toBe(5);
+    await setReqs(id, [req(4)], 'completed');
+    expect(await v3PublishCap(t.db, id, NOW, 24)).toBe(10);
+  });
+
+  it('hold ends when the request is done / not_done / dropped', async () => {
+    const id = await book({ accepted: 10, lastBatchFrom: 6 });
+    for (const s of ['done', 'not_done', 'dropped'] as const) {
+      await setReqs(id, [req(4, s)], 'active');
+      expect(await v3PublishCap(t.db, id, NOW, 24), s).toBe(5);
+    }
+  });
+
+  it('publish task during a rewind caps at the rewind target (v3 publish under the row lock)', async () => {
+    const b = await addV3Book(t, 'rwpub', { chapters: 8 });
+    await t.db.update(books).set({ meta: { v3: { ...emptyV3Meta(), rewinding: { to: 5, ts: '20261110T000000', at: NOW.toISOString() } } } }).where(eq(books.id, b.id));
+    const env = execEnv(t.deps);
+    const ctx = { deps: env.pdeps, book: await env.pipe.openBook(env.pdeps, b.id) };
+    const r = await publish.execute!(ctx as never, { id: 'p1', target: 'through-8', params: { manual: true } } as never);
+    expect(r.summary).toMatchObject({ published: 5, through: 5 });
+    expect((await t.db.select().from(books).where(eq(books.id, b.id)))[0]?.publishedThrough).toBe(5);
+    expect(await b.repo.tags('pub/*')).toHaveLength(5);
   });
 });

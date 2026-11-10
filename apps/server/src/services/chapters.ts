@@ -63,6 +63,7 @@ export function toRunRow(r: typeof runs.$inferSelect, slug: string | null): RunR
     errorClass: r.errorClass as RunRow['errorClass'],
     usage: { input: usage.input ?? 0, output: usage.output ?? 0, cached: usage.cachedInput ?? 0, costUsd: usage.costUsd ?? null },
     denials: r.denials,
+    toolSteps: typeof r.outcome?.toolSteps === 'number' ? r.outcome.toolSteps : null,
   };
 }
 

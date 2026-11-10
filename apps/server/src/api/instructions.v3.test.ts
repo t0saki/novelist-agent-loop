@@ -1,6 +1,10 @@
 /** v3 书保存书层指令时检查根 AGENTS.md 的大小（p1-plan §3 WP-C、§6 instructions.v3）。 */
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { parse as yamlParse, stringify as yamlStringify } from 'yaml';
 import { openRepo, P } from '../book/index.js';
+import { createGenre } from '../genres/index.js';
 import { V3_AGENTS_SOFT_LIMIT } from '../instructions/v3.js';
 import { createBook } from '../services/books.js';
 import { createTestApp, TEST_ADMIN_PASSWORD, type TestApp } from '../testing.js';
@@ -69,5 +73,124 @@ describe('v3 instruction size check', () => {
     const res = await put('iv2', P.instructionsAgents, BIG);
     expect(res.statusCode).toBe(200);
     expect(await openRepo(bookDir(t.deps, 'iv2')).readFile(P.instructionsAgents)).toBe(BIG);
+  });
+});
+
+describe('v3 size check on global and genre saves (WP-3)', () => {
+  const putScope = (scope: string, p: string, content: string) => t.app.inject({ method: 'PUT', url: '/api/admin/instructions/file', headers: { cookie }, payload: { scope, path: p, content, baseSha: null } });
+  const globalFile = () => fs.readFile(path.join(t.deps.paths.instructionsGlobal, 'AGENTS.md'), 'utf8').catch(() => null);
+  const genreFile = (id: string) => fs.readFile(path.join(t.deps.paths.genres, id, 'AGENTS.md'), 'utf8').catch(() => null);
+  const setAuto = async (id: string, auto: Record<string, unknown> | null) => {
+    const file = path.join(t.deps.paths.genres, id, 'pack.yaml');
+    const { auto: _old, ...pack } = yamlParse(await fs.readFile(file, 'utf8')) as Record<string, unknown>;
+    await fs.writeFile(file, yamlStringify({ ...pack, ...(auto ? { auto } : {}) }), 'utf8');
+  };
+
+  it('a global save that pushes a v3 book over 16 KB → 400 with the book and the layer sizes; nothing written, nothing truncated', async () => {
+    const before = await globalFile();
+    const res = await putScope('global', 'AGENTS.md', BIG);
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.code).toBe('instructions_too_large');
+    expect(body.message ?? body.title ?? JSON.stringify(body)).toContain('《新》');
+    expect((body.errors as { path: string }[]).map((e) => e.path)).toContain('L1');
+    expect(await globalFile()).toBe(before);
+    // 一个小改动照常保存，原样写入
+    const ok = await putScope('global', 'AGENTS.md', '全局：多写对白。\n');
+    expect(ok.statusCode).toBe(200);
+    expect(await globalFile()).toBe('全局：多写对白。\n');
+  });
+
+  it('a genre save is checked against the books of that genre and a new book of every length for an auto-start pack', async () => {
+    // 题材 xianxia：《新》在用
+    const used = await putScope('genre:xianxia', 'AGENTS.md', BIG);
+    expect(used.statusCode).toBe(400);
+    expect(JSON.stringify(used.json())).toContain('《新》');
+    // 没有书在用、但自动开书能选到的题材包：按“新书”检查
+    await createGenre(t.deps.paths, { id: 'p-auto', name: '自动包', extends: [] });
+    await setAuto('p-auto', { enabled: true });
+    const tpl = await genreFile('p-auto');
+    const auto = await putScope('genre:p-auto', 'AGENTS.md', BIG);
+    expect(auto.statusCode).toBe(400);
+    expect(auto.json().code).toBe('instructions_too_large');
+    expect(JSON.stringify(auto.json())).toMatch(/题材「自动包」的新书（(短篇|中篇|长篇|超长)）/);
+    expect(await genreFile('p-auto')).toBe(tpl);
+    // 权重 0 = 自动开书选不到：不再检查
+    await setAuto('p-auto', { enabled: true, weight: 0 });
+    const zero = await putScope('genre:p-auto', 'AGENTS.md', BIG);
+    expect(zero.statusCode).toBe(200);
+    expect(await genreFile('p-auto')).toBe(BIG);
+  });
+
+  it('a large pack that no v3 book uses and auto-start cannot pick does not block a global save; a genre save affecting nothing passes', async () => {
+    await createGenre(t.deps.paths, { id: 'p-big', name: '大包', extends: [] });
+    const big = await putScope('genre:p-big', 'AGENTS.md', BIG);
+    expect(big.statusCode).toBe(200);
+    expect(await genreFile('p-big')).toBe(BIG);
+    const g = await putScope('global', 'AGENTS.md', '全局：少写旁白。\n');
+    expect(g.statusCode).toBe(200);
+    // 非 .md 文件不量
+    expect((await putScope('global', 'notes.txt', BIG)).statusCode).toBe(200);
+  });
+});
+
+describe('v2-only install: global saves are not size-checked (WP-3)', () => {
+  it('a big global AGENTS.md saves when there is no v3 book and no auto-start pack', async () => {
+    const t2 = await createTestApp();
+    try {
+      const r = await t2.app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: TEST_ADMIN_PASSWORD } });
+      const c2 = String(r.headers['set-cookie'] ?? '').split(';')[0] ?? '';
+      await createBook(t2.deps, { title: '旧', slug: 'only-v2', genre: 'xianxia', start: false });
+      const res = await t2.app.inject({ method: 'PUT', url: '/api/admin/instructions/file', headers: { cookie: c2 }, payload: { scope: 'global', path: 'AGENTS.md', content: BIG, baseSha: null } });
+      expect(res.statusCode).toBe(200);
+      expect(await fs.readFile(path.join(t2.deps.paths.instructionsGlobal, 'AGENTS.md'), 'utf8')).toBe(BIG);
+    } finally {
+      await t2.close();
+    }
+  }, 60_000);
+});
+
+describe('global / genre / book saves only reject what the save itself breaks (before/after)', () => {
+  it('a target already over 16 KB or already failing to render does not lock the global layer; growing it is still rejected; a book layer can be shrunk in steps', async () => {
+    const t3 = await createTestApp();
+    try {
+      const r = await t3.app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: TEST_ADMIN_PASSWORD } });
+      const c3 = String(r.headers['set-cookie'] ?? '').split(';')[0] ?? '';
+      const putAs = (scope: string, p: string, content: string) => t3.app.inject({ method: 'PUT', url: '/api/admin/instructions/file', headers: { cookie: c3 }, payload: { scope, path: p, content, baseSha: null } });
+      await createBook(t3.deps, { title: '超', slug: 'over', genre: 'xianxia', flow: 'v3', start: false });
+      await createBook(t3.deps, { title: '坏', slug: 'broken', genre: 'xianxia', flow: 'v3', start: false });
+      // 绕过 API 写进书目录：一本已超标，一本的 include 已经坏了
+      const overFile = path.join(bookDir(t3.deps, 'over'), P.instructionsAgents);
+      await fs.writeFile(overFile, BIG + BIG.slice(0, 2000), 'utf8');
+      await fs.writeFile(path.join(bookDir(t3.deps, 'broken'), P.instructionsAgents), '<!-- nv:include ../style/nope.md -->\n', 'utf8');
+      await fs.mkdir(t3.deps.paths.instructionsGlobal, { recursive: true });
+      await fs.writeFile(path.join(t3.deps.paths.instructionsGlobal, 'AGENTS.md'), '全局：一句话。还有第二句。\n', 'utf8');
+      // 和这两本书无关的小改动（全局层不变大）：照收
+      const small = await putAs('global', 'AGENTS.md', '全局：一句话。\n');
+      expect(small.statusCode, JSON.stringify(small.json())).toBe(200);
+      // 让全局层变大：《超》更大了 → 拒收，消息带保存前的字节数
+      const grow = await putAs('global', 'AGENTS.md', `全局：一句话。\n${'再多写一点。\n'.repeat(50)}`);
+      expect(grow.statusCode).toBe(400);
+      expect(grow.json().code).toBe('instructions_too_large');
+      expect(JSON.stringify(grow.json())).toMatch(/《超》.*保存前 \d+ 字节/);
+      // 书层：一步步缩短，仍超标也照收；再变大拒收
+      expect((await putAs('book:over', P.instructionsAgents, BIG)).statusCode).toBe(200);
+      expect((await putAs('book:over', P.instructionsAgents, `${BIG}再多一行。\n`)).statusCode).toBe(400);
+    } finally {
+      await t3.close();
+    }
+  }, 60_000);
+});
+
+describe('overLimit', () => {
+  it('after > 16 KB and (before ≤ 16 KB, unknown, or after > before)', async () => {
+    const { overLimit } = await import('./routes/admin/instructions.js');
+    const L = V3_AGENTS_SOFT_LIMIT;
+    expect(overLimit(L - 10, L + 1)).toBe(true);
+    expect(overLimit(null, L + 1)).toBe(true);
+    expect(overLimit(L + 100, L + 50)).toBe(false);
+    expect(overLimit(L + 100, L + 100)).toBe(false);
+    expect(overLimit(L + 100, L + 101)).toBe(true);
+    expect(overLimit(L + 100, L - 1)).toBe(false);
   });
 });

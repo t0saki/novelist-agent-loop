@@ -26,6 +26,8 @@ export interface V3RunFacts {
   /** planFailure(infraClass) result, when infraClass */
   planFailure: { status: TaskResult['status']; retryAfter?: string; avoidProfile?: string } | null;
   now: Date;
+  /** book.retro（来自任务行）：从不重试，不记账号和书的账 */
+  retro?: boolean;
 }
 
 export interface V3Verdict {
@@ -63,6 +65,8 @@ export function classifyV3Run(f: V3RunFacts): V3Verdict {
   if (f.accepted > 0 || f.completed) return { ...base, status: 'done', bookEmpty: 'reset' };
   // 2. 主人取消：收下的东西照提交，任务保持 cancelled，不计数
   if (f.ownerCancelled) return { ...base, status: 'keep_cancelled', bookEmpty: 'keep' };
+  // 2b. 复盘：不管结果如何都算做过了（不重试、不记空跑、不进待办）；基础设施的副作用照样由执行器执行
+  if (f.retro) return { ...base, status: 'done', bookEmpty: 'keep' };
   // 3. killRun（任务本身没取消）
   if (f.outcome.status === 'cancelled') return { ...base, status: 'waiting', retryAfter: at(f.now, KILLED_WAIT_MS), bookEmpty: 'keep' };
   // 4. 有改动但没有合格章节：书的阶梯

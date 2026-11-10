@@ -8,12 +8,14 @@ import { P } from '../book/layout.js';
 import { openRepo } from '../book/repo.js';
 import type { PipelineContext, TaskRow, TaskSpec } from '../pipeline/types.js';
 import type { BookAction, ChapterAction, FeasibilityReport, InboxItem } from './facade-types.js';
-import { commitOwnerEdit, revertPartialV3 } from './committer.js';
+import { V3DiscardRefused, commitOwnerEdit, revertPartialV3 } from './committer.js';
 import type { EventBus } from './bus.js';
-import { enqueueSpec, execEnv, type ExecutorDeps } from './executor.js';
-import { actOnInbox, createInboxItem } from './inbox.js';
+import { enqueueSpec, execEnv, type ExecEnv, type ExecutorDeps } from './executor.js';
+import { actOnInbox } from './inbox.js';
 import { ACTIVE_STATES, QUEUED_STATES, retryTaskRow, setTaskState } from './queue.js';
 import { rewindBook } from './rewind.js';
+import { rewindV3, type RewindV3Result } from './rewind-v3.js';
+import { requestChapterRewrite } from '../flow/owner.js';
 import { chapterActionSpecs } from '../pipeline/next.js';
 import type { ChapterWorkflow } from '../pipeline/workflow.js';
 import { ROOT_AGENTS_PLACEHOLDER } from '../book/repo.js';
@@ -33,7 +35,66 @@ import { clearPending, patchPending, readPending } from '../flow/state.js';
 /** v3 的 nextTasks 自己读 DB，不用 BookRuntimeState */
 const EMPTY_STATE: BookRuntimeState = { active: [], acceptedThrough: 0, cardsThrough: 0, publishedThrough: 0, auditedThrough: 0, productionPaused: false, openApprovals: [] };
 
-const v3Unsupported = (): HttpProblem => new HttpProblem(409, 'v3_unsupported', '新流程的书暂不支持回退/重写（P1b 提供）');
+const V3_FLOW_KINDS = ['book.open', 'book.write', 'book.retro'] as const;
+
+const v3Unsupported = (): HttpProblem => new HttpProblem(409, 'v3_unsupported', '新流程的书没有这个操作');
+
+/**
+ * v3 收稿连续失败后的“重试 / 放弃”（p2-plan §3.2 pendingAction）。重试 = failures 归零；放弃 = 先把这次运行已经提交的分章撤回到 drafts/，再清 pending
+ * （收到的改动留在 work/ 下，GC 保留 30 天）。wakeTask：把这本书 blocked 的 v3 任务放回 ready（待办的旧入口由 actOnInbox 自己放）。返回给提示条的一句话。
+ */
+export async function v3PendingAction(env: ExecEnv, bookId: string, action: 'retry' | 'discard', opts: { runId?: string; wakeTask?: boolean } = {}): Promise<string> {
+  const pending = await readPending(env.db, bookId);
+  const runId = opts.runId ?? pending?.runId ?? '';
+  if (!pending || pending.runId !== runId) {
+    if (opts.runId !== undefined) return '这次收稿已经处理过了';
+    throw new HttpProblem(400, 'nothing_pending', '没有等着处理的收稿');
+  }
+  let detail: string;
+  if (action === 'retry') {
+    await patchPending(env.db, bookId, runId, { failures: 0 });
+    detail = '已重试收稿';
+  } else {
+    // 1. 先把这本书的 v3 任务原地占住：有任务在排队就绪或在跑（可能正在重放 promote）→ 409；
+    //    blocked / waiting 的在同一个事务里锁住行（claimNext 用 skip locked，认领不到）并改成 blocked，撤回做完再放回去
+    const parked = await env.db.transaction(async (tx) => {
+      const rows = await tx
+        .select({ id: tasks.id, state: tasks.state, notBefore: tasks.notBefore, waitReason: tasks.waitReason })
+        .from(tasks)
+        .where(and(eq(tasks.bookId, bookId), inArray(tasks.kind, [...V3_FLOW_KINDS]), inArray(tasks.state, [...QUEUED_STATES, ...ACTIVE_STATES, 'blocked'])))
+        .for('update');
+      if (rows.some((r) => r.state !== 'blocked' && r.state !== 'waiting')) throw new HttpProblem(409, 'v3_busy', '这本书的任务正在排队或在跑（可能正在重试收稿），等它结束再放弃');
+      const waiting = rows.filter((r) => r.state === 'waiting');
+      if (waiting.length) await tx.update(tasks).set({ state: 'blocked', waitReason: 'v3_discard', updatedAt: env.nowFn().toISOString() }).where(inArray(tasks.id, waiting.map((r) => r.id)));
+      return waiting;
+    });
+    const unpark = async () => {
+      for (const r of parked) await env.db.update(tasks).set({ state: 'waiting', notBefore: r.notBefore, waitReason: r.waitReason, updatedAt: env.nowFn().toISOString() }).where(and(eq(tasks.id, r.id), eq(tasks.state, 'blocked')));
+    };
+    // 2. 提交中途失败留下的分章提交 DB 从没计入：先撤回到 drafts/，否则下一批会按旧的 acceptedThrough 编号、把它们覆盖掉。
+    //    锁内复查 pending 仍是这一次、整批没提交过，再清 pending
+    let reverted: number[];
+    try {
+      const bookRows = await env.db.select({ slug: books.slug }).from(books).where(eq(books.id, bookId)).limit(1);
+      reverted = bookRows[0] ? await revertPartialV3(env.db, openRepo(`${env.paths.books}/${bookRows[0].slug}`), bookId, { ...pending, runId }) : [];
+      if (!bookRows[0]) await clearPending(env.db, bookId, runId);
+    } catch (e) {
+      await unpark();
+      if (e instanceof V3DiscardRefused) {
+        if (e.code === 'gone' && opts.runId !== undefined) return e.message;
+        throw new HttpProblem(409, e.code === 'gone' ? 'nothing_pending' : 'v3_landed', e.message);
+      }
+      throw e;
+    }
+    if (!opts.wakeTask) await unpark();
+    detail = reverted.length ? `已放弃这次的稿：已提交的第 ${reverted.join('、')} 章撤回到 drafts/（cNNNNN.discarded.md）` : '已放弃这次的稿';
+  }
+  if (opts.wakeTask) {
+    const blocked = await env.db.select({ id: tasks.id }).from(tasks).where(and(eq(tasks.bookId, bookId), inArray(tasks.kind, ['book.open', 'book.write', 'book.retro']), inArray(tasks.state, ['blocked', 'waiting'])));
+    for (const t of blocked) await retryTaskRow(env.db, t.id);
+  }
+  return detail;
+}
 
 export * from './bus.js';
 export * from './queue.js';
@@ -48,6 +109,7 @@ export * from './inbox.js';
 export * from './notify.js';
 export * from './recovery.js';
 export * from './orch-state.js';
+export { rewindV3, applyRewindDb, recoverRewinds, batchBaseFor, backfillBatchLog, ensureBatchLog, rewindPoints, type RewindV3Result } from './rewind-v3.js';
 export { planFailure, INFRA_CLASSES } from './actions.js';
 export { defaultPipeline, type PipelineBinding } from './binding.js';
 export type { BookRuntimeState } from '../pipeline/next.js';
@@ -68,6 +130,10 @@ export interface Orchestrator {
   startBook(bookId: string, opts: { interview: boolean }): Promise<void>;
   bookAction(bookId: string, action: BookAction): Promise<void>;
   chapterAction(bookId: string, no: number, action: ChapterAction): Promise<void>;
+  /** v3：回退到第 to 章（p2-plan §2.6） */
+  rewindV3(bookId: string, to: number, opts?: { note?: string }): Promise<RewindV3Result>;
+  /** v3：收稿失败的重试 / 放弃；返回给提示条的一句话 */
+  v3PendingAction(bookId: string, action: 'retry' | 'discard'): Promise<string>;
   retryTask(taskId: string): Promise<void>;
   cancelTask(taskId: string): Promise<void>;
   killRun(runId: string): Promise<void>;
@@ -181,8 +247,11 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
             (c) => c.book?.config.flow === 'v3',
             () => false,
           );
-          if (isV3) throw v3Unsupported();
           if (a.to === undefined) throw new Error('rewind 需要 to');
+          if (isV3) {
+            await rewindV3(env, bookId, a.to, { reason: 'rewind' });
+            break;
+          }
           await rewindBook(env, bookId, a.to, a.confirm === true);
           break;
         }
@@ -205,7 +274,23 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
       const chapterRow = chapterRows[0];
       const bookHandle = (await ctxFor(bookId)).book as NonNullable<PipelineContext['book']>;
       const workflow = (chapterRow?.workflow ?? {}) as Partial<ChapterWorkflow>;
-      if (bookHandle.config.flow === 'v3' && (a.action === 'rewrite' || a.action === 'repair' || a.action === 'reextract')) throw v3Unsupported();
+      if (bookHandle.config.flow === 'v3') {
+        // 带意见重写：记一条改写请求，并入下一批写作（不单开运行）；从这里起重写 = 回退到上一章再写
+        if (a.action === 'rewrite') {
+          if (!a.note?.trim()) throw new HttpProblem(400, 'bad_request', '带意见重写需要写一句意见');
+          await requestChapterRewrite(env.db, bookId, no, a.note, env.nowFn());
+          await notifyBook(bookId);
+          return;
+        }
+        if (a.action === 'rewrite_from') {
+          const pub = (await env.db.select({ p: books.publishedThrough }).from(books).where(eq(books.id, bookId)).limit(1))[0]?.p ?? 0;
+          if (no <= pub) throw new HttpProblem(409, 'published', '已发布的章节只能直接修改');
+          await rewindV3(env, bookId, no - 1, { ...(a.note ? { note: a.note } : {}), reason: 'rewrite_from' });
+          await notifyBook(bookId);
+          return;
+        }
+        if (a.action === 'repair' || a.action === 'reextract') throw v3Unsupported();
+      } else if (a.action === 'rewrite_from') throw new HttpProblem(400, 'bad_request', '旧流程不支持');
       const instance = `${a.action}-${randomUUID().slice(0, 12)}`;
       const assertNotFrozen = (): void => {
         if (chapterRow?.publishedAt && bookHandle.config.publish.freeze_on_publish && !a.confirm) throw new Error(`第 ${no} 章已发布，受 freeze_on_publish 保护；确认要修改请带 confirm=true`);
@@ -267,6 +352,16 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
       }
       await notifyBook(bookId);
     },
+    async rewindV3(bookId, to, opts) {
+      const r = await rewindV3(env, bookId, to, { ...(opts?.note ? { note: opts.note } : {}), reason: 'rewind' });
+      await notifyBook(bookId);
+      return r;
+    },
+    async v3PendingAction(bookId, action) {
+      const detail = await v3PendingAction(env, bookId, action, { wakeTask: true });
+      await notifyBook(bookId);
+      return detail;
+    },
     async retryTask(taskId) {
       // 取消后本进程还在收尾（杀 harness、收稿、提交）：这时复活同一个任务会让两份执行去收同一个快照
       if (scheduler.inFlight().some((x) => x.taskId === taskId)) throw new Error(`任务还在收尾，稍后再重试：${taskId}`);
@@ -312,29 +407,9 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
           .returning({ bookId: tasks.bookId });
         for (const b of new Set(woken.map((w) => w.bookId).filter((x): x is string => !!x))) await notifyBook(b);
       }
-      // v3 收稿连续失败：重试 = failures 归零（任务回 ready）；放弃 = 清 pending（收到的改动留在 work/ 下，GC 保留 30 天）
+      // v3 收稿连续失败（旧的待办入口）：重试 / 放弃，任务由 actOnInbox 放回 ready
       if (dedupe.startsWith('v3_pending:') && row?.bookId && (action === 'retry' || action === 'discard')) {
-        const runId = String((row.body as { runId?: unknown }).runId ?? '');
-        if (action === 'retry') await patchPending(env.db, row.bookId, runId, { failures: 0 });
-        else {
-          // 提交中途失败留下的分章提交 DB 从没计入：先撤回到 drafts/，否则下一批会按旧的 acceptedThrough 编号、把它们覆盖掉
-          const pending = await readPending(env.db, row.bookId);
-          const bookRows = await env.db.select({ slug: books.slug }).from(books).where(eq(books.id, row.bookId)).limit(1);
-          if (pending && pending.runId === runId && bookRows[0]) {
-            const reverted = await revertPartialV3(env.db, openRepo(`${env.paths.books}/${bookRows[0].slug}`), row.bookId, pending);
-            if (reverted.length) {
-              await createInboxItem(env.db, env.bus, {
-                kind: 'notice',
-                bookId: row.bookId,
-                title: `第 ${reverted.join('、')} 章已提交过，已撤回到 drafts/`,
-                body: { runId, chapters: reverted, detail: `放弃收稿时，这次运行已经提交的第 ${reverted.join('、')} 章从正文里撤回，原文存在 drafts/cNNNNN.discarded.md。` },
-                actions: [{ id: 'dismiss', label: '知道了' }],
-                dedupeKey: `v3_discard:${row.bookId}:${runId}`,
-              });
-            }
-          }
-          await clearPending(env.db, row.bookId, runId);
-        }
+        await v3PendingAction(env, row.bookId, action, { runId: String((row.body as { runId?: unknown }).runId ?? '') });
       }
       if (row?.kind === 'agents_md_edit' && action === 'migrate' && row.bookId && row.state === 'open') {
         const bookRows = await env.db.select({ slug: books.slug }).from(books).where(eq(books.id, row.bookId)).limit(1);

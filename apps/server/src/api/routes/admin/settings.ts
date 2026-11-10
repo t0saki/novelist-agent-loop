@@ -19,9 +19,15 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
   app.get('/api/admin/settings', async (): Promise<SystemSettings> => loadSystemSettings(deps.db));
 
   app.put('/api/admin/settings', async (req): Promise<SystemSettings> => {
+    // 失控兜底倍数：0（关闭）或 ≥ 2（schema 只是把旧值抬到 2，新保存的直接拒收）
+    const rawFactor = (req.body as { v3?: { runawayFactor?: unknown } } | null)?.v3?.runawayFactor;
+    if (typeof rawFactor === 'number' && rawFactor > 0 && rawFactor < 2) throw badRequest('失控兜底倍数要么是 0（关闭），要么不小于 2', 'invalid_runaway_factor');
     const patch = parsePatch(zPutSettings, req.body);
     const current = await loadSystemSettings(deps.db);
     const next = zSystemSettings.parse({ ...current, ...patch });
+    // 自动开书的篇幅分布：四档按本数的百分比，必须加起来是 100（schema 上不能 refine，否则 zPutSettings = partial() 会坏）
+    const mix = next.autoStart.lengthMix;
+    if (Math.abs(mix.short + mix.medium + mix.long + mix.epic - 100) > 1e-9) throw badRequest('篇幅分布四档加起来要等于 100', 'invalid_length_mix');
     if (next.activePreset !== current.activePreset) {
       const exists = await deps.db.select({ id: routingPresets.id }).from(routingPresets).where(eq(routingPresets.id, next.activePreset)).limit(1);
       if (!exists[0]) throw badRequest(`preset ${next.activePreset} 不存在`);

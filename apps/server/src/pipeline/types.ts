@@ -149,7 +149,7 @@ export interface HarvestedRun {
   nonce: NonceCheckReport;
   audit: { ok: boolean; extraFiles: string[]; tamperedConfig: string[] };
   /** v3：收稿清单（book/harvest.ts 的 changes.json；null = 没有收到任何改动）与本次 run 的幂等键 */
-  v3?: { manifestFile: string | null; lost: boolean; stderrTail: string; trailerKey: string; ownerCancelled: boolean };
+  v3?: { manifestFile: string | null; lost: boolean; stderrTail: string; trailerKey: string; ownerCancelled: boolean; /** tool_call 事件数（runner；消化 pending 时取自 runs.outcome） */ toolSteps?: number };
 }
 
 export interface InboxInput {

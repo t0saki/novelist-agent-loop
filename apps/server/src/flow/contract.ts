@@ -39,3 +39,22 @@ export const HARVEST_MAX_FILE_BYTES = 1_048_576;
 export function noteSize(text: string): number {
   return [...text.replace(/\s+/gu, '')].length;
 }
+
+// ───────────────────────── phase 2 ─────────────────────────
+
+/** 一次运行的工具步数超过它（且有改动）：每批章数减一（不低于 1） */
+export const V3_STEP_LIMIT = 200;
+/** 结局批交回时全书不到目标的六成：长篇 / 超长不收（只一次），短篇 / 中篇照收并记“篇幅偏短” */
+export const SHORT_END_RATIO = 0.6;
+/** 最近 10 章均值低于下限的 1.2 倍：任务单提醒“近期偏短” */
+export const SHORT_RECENT_RATIO = 1.2;
+/** outline.md 里的“## 结局章节清单”（收尾阶段的第一批要求作者写出） */
+export const ENDING_LIST_RE = /^#{1,6}\s*结局(?:章节)?清单/m;
+
+// ───────── 等待原因（tasks.wait_reason；flow/status.ts 按它们写状态句） ─────────
+/** 任务单因存稿满了跳过（flow/order.ts） */
+export const BUFFER_FULL_WAIT = 'buffer_full';
+/** judge 的没出章 / 空批阶梯：只有它才说“上一次没写出合格的新章” */
+export const NO_PROSE_WAIT = 'v3 阶梯：没有合格新章';
+/** 书的预算到顶（orchestrator/executor.ts checkBookBudget） */
+export const BUDGET_WAIT_PREFIX = '预算：';

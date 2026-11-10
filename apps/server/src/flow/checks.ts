@@ -187,11 +187,17 @@ export function checkNewChapter(
   return { ok: true, short: cjk < minChars };
 }
 
-/** 改写旧章：比旧版短三成以上或截断就不收 */
-export function checkRewrite(oldBody: string, newBody: string): { ok: true } | { ok: false; reason: 'shorter' | 'truncated'; detail: string } {
+/**
+ * 改写旧章：比旧版短三成以上或截断就不收。
+ * allowShorter（主人要求的改写）：主人可以要一章更短的，但新稿至少要有 min(每章下限, 旧版的一半)，空稿、提纲式的几百字不替换整章。
+ */
+export function checkRewrite(oldBody: string, newBody: string, opts: { allowShorter?: boolean; minChars?: number } = {}): { ok: true } | { ok: false; reason: 'shorter' | 'truncated'; detail: string } {
   const oldCjk = countCjk(oldBody);
   const newCjk = countCjk(newBody);
-  if (newCjk < 0.7 * oldCjk) return { ok: false, reason: 'shorter', detail: `${newCjk} 字，旧版 ${oldCjk} 字` };
+  if (opts.allowShorter) {
+    const floor = Math.max(EMPTY_CJK, Math.min(opts.minChars ?? oldCjk, Math.ceil(0.5 * oldCjk)));
+    if (newCjk < floor) return { ok: false, reason: 'shorter', detail: `${newCjk} 字，旧版 ${oldCjk} 字` };
+  } else if (newCjk < 0.7 * oldCjk) return { ok: false, reason: 'shorter', detail: `${newCjk} 字，旧版 ${oldCjk} 字` };
   const t = checkTruncation(newBody, { sentence: true, variantEnds: true });
   if (!t.ok) return { ok: false, reason: 'truncated', detail: t.detail ?? '结尾不完整' };
   return { ok: true };

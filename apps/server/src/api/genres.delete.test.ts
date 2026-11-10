@@ -129,13 +129,13 @@ describe('genre pack delete / hide', () => {
     await createGenre(t.deps.paths, { id: 'p-auto', name: '自动', extends: [] });
     const file = path.join(t.deps.paths.genres, 'p-auto', 'pack.yaml');
     await fs.writeFile(file, yamlStringify({ ...yamlParse(await fs.readFile(file, 'utf8')), auto: { enabled: true } }), 'utf8');
-    // 只在内存里打开自动开书，不写 settings
-    const on = zSystemSettings.parse({ autoStart: { enabled: true, maxActiveBooks: 9, maxPerDay: 0 } });
+    // maybeStartBook 从不读开关（开关在 createAutoStarter）：fixture 一律 enabled: false，也不写 settings
+    const on = zSystemSettings.parse({ autoStart: { enabled: false, maxUnfinishedBooks: 9, maxPerDay: 0 } });
     const now = new Date('2026-11-10T00:00:00Z');
     expect((await admin('POST', '/api/admin/genres/p-auto/visibility', { hidden: true })).statusCode).toBe(200);
     expect(await maybeStartBook(t.deps, now, on)).toBeNull();
     // settings 里显式列出也不用停用的包
-    expect(await maybeStartBook(t.deps, now, zSystemSettings.parse({ autoStart: { enabled: true, maxActiveBooks: 9, maxPerDay: 0, genres: ['p-auto'] } }))).toBeNull();
+    expect(await maybeStartBook(t.deps, now, zSystemSettings.parse({ autoStart: { enabled: false, maxUnfinishedBooks: 9, maxPerDay: 0, genres: ['p-auto'] } }))).toBeNull();
     expect((await admin('POST', '/api/admin/genres/p-auto/visibility', { hidden: false })).statusCode).toBe(200);
     const slug = await maybeStartBook(t.deps, now, on);
     expect(slug).not.toBeNull();

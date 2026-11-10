@@ -15,9 +15,11 @@ import { publishTick } from './publisher.js';
 import { ACTIVE_STATES, LIVE_STATES, advancePending, claimNext, reapExpiredLeases, renewLease } from './queue.js';
 import { expireReservations } from './quota.js';
 import { reconcileRuns, recoverStuckPromotes } from './recovery.js';
+import { recoverRewinds } from './rewind-v3.js';
 import { gcRetention } from './retention.js';
 import { loadSystemSettings } from './routing.js';
 import { v3PublishCap } from '../flow/publish.js';
+import { reconcileV3Inbox } from '../flow/inbox-v3.js';
 
 export interface Scheduler {
   start(): Promise<void>;
@@ -195,6 +197,10 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
       lastPublishTick = now.getTime();
       const published = await publishTick(env.db, now, publisherIo(env));
       enq += published.length;
+      // v3 回退中途失败的补做（同样每分钟一次）
+      await recoverRewinds(env).catch((err: Error) => env.log.warn({ err: err.message }, 'recoverRewinds failed'));
+      // v3 待办卫生：条件消失的自动关闭，存稿将尽且写不动的全站一条（同样每分钟一次）
+      await reconcileV3Inbox(env, now).catch((err: Error) => env.log.warn({ err: err.message }, 'reconcileV3Inbox failed'));
     }
     // 保留期 GC：每天一次，后台执行（首次可能很慢，不能拖住 tick 和 leader 续租）
     if (!retentionInFlight && now.getTime() - lastRetention >= RETENTION_INTERVAL_MS) {

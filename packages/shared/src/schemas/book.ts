@@ -64,9 +64,10 @@ export const zV3BookConfig = z.object({
   publish_after_hours: z.number().positive().default(24),
   /** Title left empty at creation: take the title from line 1 of bible.md after a harvest, until one is found */
   auto_title: z.boolean().default(false),
+  /** finale 也用于收尾阶段的写作批（DESIGN §7）；retro = 复盘 */
   effort: z
-    .object({ open: zEffort.default('medium'), write: zEffort.default('medium'), finale: zEffort.default('high') })
-    .default({ open: 'medium', write: 'medium', finale: 'high' }),
+    .object({ open: zEffort.default('medium'), write: zEffort.default('medium'), finale: zEffort.default('high'), retro: zEffort.default('medium') })
+    .default({ open: 'medium', write: 'medium', finale: 'high', retro: 'medium' }),
 });
 export type V3BookConfig = z.infer<typeof zV3BookConfig>;
 

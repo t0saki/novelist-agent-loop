@@ -43,16 +43,34 @@ function AutoStartCard({ value: a, onChange }: { value: SystemSettings['autoStar
   const selected = a.genres ?? all.filter((g) => g.auto?.enabled && !g.hidden).map((g) => g.id);
   const usable = selected.filter((id) => all.some((g) => g.id === id && !g.hidden));
   const toggle = (id: string, on: boolean) => onChange({ ...a, genres: on ? [...new Set([...selected, id])] : selected.filter((x) => x !== id) });
+  const setWeight = (id: string, raw: string) => {
+    const next = { ...a.genreWeights };
+    if (raw === '' || Number.isNaN(Number(raw))) delete next[id];
+    else next[id] = Math.max(0, Number(raw));
+    onChange({ ...a, genreWeights: next });
+  };
+  const mixSum = AUTO_LENGTHS.reduce((n, k) => n + a.lengthMix[k], 0);
   return (
     <Card title="自动开书">
-      <Toggle checked={a.enabled} onChange={(v) => onChange({ ...a, enabled: v })} label="有空位时自动开新书" hint="按题材包的权重轮转选题材，规划师自拟书名和故事。开启后会持续消耗账号额度。" />
+      <Toggle checked={a.enabled} onChange={(v) => onChange({ ...a, enabled: v })} label="有空位时自动开新书" hint="按题材权重和篇幅分布挑选，作者自拟书名。开启后会持续消耗账号额度。" />
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 mt-3">
-        <Field label="同时在写的书上限">
-          <Input type="number" min={1} value={a.maxActiveBooks} onChange={(e) => onChange({ ...a, maxActiveBooks: num(e.target.value, 1, 1) })} />
+        <Field label="未完结的书上限" hint="在写、等待和暂停的都算，导入的书不算">
+          <Input type="number" min={1} value={a.maxUnfinishedBooks} onChange={(e) => onChange({ ...a, maxUnfinishedBooks: num(e.target.value, 1, a.maxUnfinishedBooks) })} />
         </Field>
         <Field label="24 小时内最多开几本" hint="0 表示不限">
           <Input type="number" min={0} value={a.maxPerDay} onChange={(e) => onChange({ ...a, maxPerDay: num(e.target.value, 0, 0) })} />
         </Field>
+      </div>
+      <div className="mt-3">
+        <div className="text-xs text-sub mb-1">篇幅分布（按本数的百分比）：看最近 20 本自动开的书，补缺口最大的一档；题材包的篇幅倾向只是加权</div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {AUTO_LENGTHS.map((k) => (
+            <Field key={k} label={`${AUTO_LENGTH_LABEL[k]} %`}>
+              <Input type="number" min={0} max={100} value={a.lengthMix[k]} onChange={(e) => onChange({ ...a, lengthMix: { ...a.lengthMix, [k]: Math.min(100, num(e.target.value, 0, a.lengthMix[k])) } })} />
+            </Field>
+          ))}
+        </div>
+        <div className={`text-xs mt-1 tabular-nums ${mixSum === 100 ? 'text-sub' : 'text-danger'}`}>合计 {mixSum}%{mixSum === 100 ? '' : '（要等于 100% 才能保存）'}</div>
       </div>
       <div className="mt-3 space-y-2">
         <div className="text-xs text-sub">各篇幅档的规模：题材包的篇幅提示（短篇 / 中篇 / 长篇 / 超长篇）决定用哪一档，没写按短篇。硬上限为目标的 1.5 倍。</div>
@@ -64,10 +82,10 @@ function AutoStartCard({ value: a, onChange }: { value: SystemSettings['autoStar
               <Field label={`${AUTO_LENGTH_LABEL[k]} 目标字数`}>
                 <Input type="number" min={1000} value={l.targetCjk} onChange={(e) => put({ targetCjk: num(e.target.value, 1000, l.targetCjk) })} />
               </Field>
-              <Field label="每卷章数 最少">
+              <Field label="每卷章数 最少（旧流程）">
                 <Input type="number" min={1} value={l.chaptersMin} onChange={(e) => put({ chaptersMin: num(e.target.value, 1, l.chaptersMin) })} />
               </Field>
-              <Field label="每卷章数 最多" error={l.chaptersMax < l.chaptersMin ? '不能小于最少值' : undefined}>
+              <Field label="每卷章数 最多（旧流程）" error={l.chaptersMax < l.chaptersMin ? '不能小于最少值' : undefined}>
                 <Input type="number" min={1} value={l.chaptersMax} onChange={(e) => put({ chaptersMax: num(e.target.value, 1, l.chaptersMax) })} />
               </Field>
             </div>
@@ -75,7 +93,7 @@ function AutoStartCard({ value: a, onChange }: { value: SystemSettings['autoStar
         })}
       </div>
       <div className="mt-3">
-        <div className="text-xs text-sub mb-1">参与的题材包{a.genres === null ? '（当前跟随 pack.yaml 的 auto.enabled）' : ''}</div>
+        <div className="text-xs text-sub mb-1">参与的题材包与权重（按“自动开过的书数 ÷ 权重”最小的先开）{a.genres === null ? '；当前跟随 pack.yaml 的 auto.enabled' : ''}</div>
         {all.length === 0 ? (
           <Empty>还没有题材包。</Empty>
         ) : (
@@ -85,12 +103,40 @@ function AutoStartCard({ value: a, onChange }: { value: SystemSettings['autoStar
                 <input type="checkbox" checked={selected.includes(g.id)} disabled={g.hidden && !selected.includes(g.id)} onChange={(e) => toggle(g.id, e.target.checked)} />
                 <span className="truncate">{g.name}</span>
                 {g.hidden && <span className="text-xs text-faint whitespace-nowrap">已停用</span>}
-                <span className="text-xs text-faint whitespace-nowrap">{g.books} 本{g.auto ? ` · 权重 ${g.auto.weight}${g.auto.lengthHint ? ` · ${g.auto.lengthHint}` : ''}` : ''}</span>
+                <span className="text-xs text-faint whitespace-nowrap">{g.books} 本{g.auto?.lengthHint ? ` · ${g.auto.lengthHint}` : ''}</span>
+                <span className="flex-1" />
+                <Input
+                  type="number"
+                  min={0}
+                  step="any"
+                  className="!w-20 !py-0.5 text-xs"
+                  aria-label={`${g.name} 的权重`}
+                  title="权重（0 = 不参与；空 = 用 pack.yaml 的值）"
+                  placeholder={String(g.auto?.weight ?? 1)}
+                  value={a.genreWeights[g.id] ?? ''}
+                  onChange={(e) => setWeight(g.id, e.target.value)}
+                />
               </label>
             ))}
           </div>
         )}
         {a.enabled && all.length > 0 && usable.length === 0 && <div className="text-xs text-warn mt-1">没有可用的题材包（停用的包不参与），自动开书不会开新书。</div>}
+      </div>
+    </Card>
+  );
+}
+
+/** 新流程（v3）的全站设置 */
+function V3FlowCard({ value, onChange }: { value: SystemSettings['v3']; onChange: (v: SystemSettings['v3']) => void }) {
+  return (
+    <Card title="新流程">
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        <Field
+          label="失控兜底倍数"
+          hint={'0 = 关闭；开着时至少 2。写到计划章数（按目标字数算出的章数）的这个倍数后再写两批仍未完结，就强制收尾；关闭后，连续两次结局批没写"（全书完）"只在待办里提醒'}
+        >
+          <Input type="number" min={0} max={10} step="0.5" value={value.runawayFactor} onChange={(e) => onChange({ ...value, runawayFactor: e.target.value === '' || Number.isNaN(Number(e.target.value)) ? value.runawayFactor : Number(e.target.value) <= 0 ? 0 : Math.min(10, Math.max(2, Number(e.target.value))) })} />
+        </Field>
       </div>
     </Card>
   );
@@ -150,6 +196,7 @@ function SettingsForm({ initial }: { initial: SystemSettings }) {
       </Card>
 
       <AutoStartCard value={s.autoStart} onChange={(v) => set('autoStart', v)} />
+      <V3FlowCard value={s.v3} onChange={(v) => set('v3', v)} />
 
       <Card title="时限（分钟）">
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">

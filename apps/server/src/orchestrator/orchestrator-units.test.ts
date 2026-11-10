@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { zPublishConfig, type Outcome } from '@novelist/shared';
 import type { Db } from '../db/client.js';
@@ -534,5 +534,76 @@ describe('inbox', () => {
     const item = await createInboxItem(t.db, bus, { kind: 'approval', bookId: 'bk', title: 'x', body: { failover: { to: 'cx-sol' } }, actions: [{ id: 'approve', label: 'y' }] });
     await actOnInbox(t.db, bus, item.id, 'approve');
     expect((await t.db.select().from(books).where(and(eq(books.id, 'bk'))))[0]?.writerProfile).toBe('cx-sol');
+  });
+});
+
+describe('claimNext: max_buffer exemption for v3 owner rewrite requests (WP-2)', () => {
+  it('max_buffer-paused book with a waiting owner request: book.write is claimed; without request it is not; chapter.write unaffected', async () => {
+    const waiting = { v3: { ownerRequests: [{ id: 'q', kind: 'rewrite', chapter: 3, note: '改', at: '2026-11-10T00:00:00.000Z', status: 'waiting' }] } };
+    await t.db.insert(books).values([
+      { id: 'rq', slug: 'rq', title: 'rq', genre: 'g', status: 'active', pausedReason: 'max_buffer', meta: waiting },
+      { id: 'nr', slug: 'nr', title: 'nr', genre: 'g', status: 'active', pausedReason: 'max_buffer', meta: { v3: { ownerRequests: [{ ...waiting.v3.ownerRequests[0], status: 'done' }] } } },
+    ]);
+    await addTask(t.db, 'bw-nr', { bookId: 'nr', lane: 'write', kind: 'book.write' });
+    await addTask(t.db, 'cw-rq', { bookId: 'rq', lane: 'side', kind: 'chapter.write' });
+    await addTask(t.db, 'bw-rq', { bookId: 'rq', lane: 'write', kind: 'book.write' });
+    expect((await claimNext(t.db, { owner: 'o', leaseMs: 1000 }))?.id).toBe('bw-rq');
+    expect(await claimNext(t.db, { owner: 'o', leaseMs: 1000 })).toBeNull();
+  });
+});
+
+describe('claimNext: v3 book choice (WP-3, DESIGN §8.2)', () => {
+  const sched = (bufferDays: number | null, lastBatchAt: string | null) => ({ v3: { sched: { bufferDays, bufferFull: false, at: '2026-11-10T00:00:00.000Z' }, lastBatchAt } });
+  it('fewer buffer days first; tie → older lastBatchAt first; a due retro of a book with fewer buffer days beats another book\'s write', async () => {
+    await t.db.insert(books).values([
+      { id: 'ba', slug: 'ba', title: 'a', genre: 'g', status: 'active', meta: sched(2, '2026-11-09T00:00:00.000Z') },
+      { id: 'bb', slug: 'bb', title: 'b', genre: 'g', status: 'active', meta: sched(0.5, '2026-11-08T00:00:00.000Z') },
+      { id: 'bc', slug: 'bc', title: 'c', genre: 'g', status: 'active', meta: sched(0.5, '2026-11-01T00:00:00.000Z') },
+      { id: 'bd', slug: 'bd', title: 'd', genre: 'g', status: 'active', meta: sched(null, null) },
+    ]);
+    await addTask(t.db, 'wd', { bookId: 'bd', lane: 'write', kind: 'book.write' });
+    await addTask(t.db, 'wa', { bookId: 'ba', lane: 'write', kind: 'book.write' });
+    await addTask(t.db, 'wb', { bookId: 'bb', lane: 'write', kind: 'book.write' });
+    await addTask(t.db, 'rc', { bookId: 'bc', lane: 'write', kind: 'book.retro' });
+    const order: (string | undefined)[] = [];
+    for (let i = 0; i < 4; i += 1) order.push((await claimNext(t.db, { owner: 'o', leaseMs: 60_000 }))?.id);
+    expect(order).toEqual(['rc', 'wb', 'wa', 'wd']);
+  });
+
+  it('v2 ordering unchanged: fewer buffered chapters first, then age', async () => {
+    await t.db.insert(books).values([
+      { id: 'x', slug: 'x', title: 'x', genre: 'g', status: 'active', acceptedThrough: 10, publishedThrough: 2 },
+      { id: 'y', slug: 'y', title: 'y', genre: 'g', status: 'active', acceptedThrough: 5, publishedThrough: 2 },
+    ]);
+    await addTask(t.db, 'cx', { bookId: 'x', lane: 'side' });
+    await addTask(t.db, 'cy', { bookId: 'y', lane: 'side' });
+    expect((await claimNext(t.db, { owner: 'o', leaseMs: 1000 }))?.id).toBe('cy');
+    expect((await claimNext(t.db, { owner: 'o', leaseMs: 1000 }))?.id).toBe('cx');
+  });
+
+  it('a run end wakes every v3 task parked on 路由等待 at once, so the claim order decides (v2 timers untouched); repeat with swapped buffers', async () => {
+    const { wakeRouteWaiters } = await import('./executor.js');
+    for (const [round, daysB, daysC] of [[1, 0.5, 3], [2, 3, 0.5]] as const) {
+      const ids = { b: `b${round}`, c: `c${round}`, v2: `v${round}` };
+      await t.db.insert(books).values([
+        { id: ids.b, slug: ids.b, title: 'b', genre: 'g', status: 'active', meta: sched(daysB, null) },
+        { id: ids.c, slug: ids.c, title: 'c', genre: 'g', status: 'active', meta: sched(daysC, null) },
+        { id: ids.v2, slug: ids.v2, title: 'v2', genre: 'g', status: 'active' },
+      ]);
+      const later = new Date(Date.now() + 15_000).toISOString();
+      for (const [id, bookId, kind] of [[`wb${round}`, ids.b, 'book.write'], [`wc${round}`, ids.c, 'book.write'], [`cw${round}`, ids.v2, 'chapter.write']] as const) {
+        await addTask(t.db, id, { bookId, lane: 'write', kind });
+        await t.db.update(tasks).set({ state: 'waiting', waitReason: '路由等待：账号 acct-a 并发已满', notBefore: later }).where(eq(tasks.id, id));
+      }
+      // 还没到点：谁都认领不到
+      expect(await claimNext(t.db, { owner: 'o', leaseMs: 60_000 })).toBeNull();
+      const now = new Date();
+      expect(await wakeRouteWaiters({ db: t.db, nowFn: () => now })).toBe(2);
+      const first = await claimNext(t.db, { owner: 'o', leaseMs: 60_000, now: new Date(now.getTime() + 1) });
+      expect(first?.id).toBe(daysB < daysC ? `wb${round}` : `wc${round}`);
+      // 旧流程的任务保留自己的计时器
+      expect(Date.parse((await t.db.select().from(tasks).where(eq(tasks.id, `cw${round}`)))[0]?.notBefore ?? '')).toBe(Date.parse(later));
+      await t.db.update(tasks).set({ state: 'done' }).where(inArray(tasks.id, [`wb${round}`, `wc${round}`, `cw${round}`]));
+    }
   });
 });

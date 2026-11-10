@@ -36,12 +36,15 @@ describe('checkNewChapter', () => {
       mapInput({
         files: [file('manuscript/c00006.md', full), ...notesFor(6, 6)],
         baseChapters: new Map([[5, bodyOf(chapterText(5))]]),
-        draftsAtBase: ['drafts/c00006.md'],
+        draftsAtBase: new Map([['drafts/c00006.md', '旧残稿']]),
         meta: { hints: [{ kind: 'unfinished', chapter: 6, sticky: true, text: 'x', at: '2026-11-01T00:00:00.000Z' }] },
       }),
     );
     expect(p.newChapters.map((c) => c.no)).toEqual([6]);
-    expect(p.newChapters[0]?.extra).toEqual([{ path: 'drafts/c00006.md', content: null }]);
+    expect(p.newChapters[0]?.extra).toEqual([
+      { path: 'drafts/c00006.md', content: null },
+      { path: 'drafts/discarded/c00006.md', content: '旧残稿' },
+    ]);
     expect(p.hints.filter((h) => h.kind === 'unfinished')).toEqual([]);
   });
   it('rewrite: shorter than 70% or truncated is rejected', () => {
@@ -49,6 +52,16 @@ describe('checkNewChapter', () => {
     expect(checkRewrite(old, prose(2600, 2))).toMatchObject({ ok: false, reason: 'shorter' });
     expect(checkRewrite(old, truncate(prose(4200, 2)))).toMatchObject({ ok: false, reason: 'truncated' });
     expect(checkRewrite(old, prose(3000, 2))).toEqual({ ok: true });
+  });
+  it('owner rewrite (allowShorter): may be shorter, but keeps at least min(floor, half the old text); truncation still fails', () => {
+    const old = prose(4000, 1);
+    const opts = { allowShorter: true, minChars: 3000 };
+    expect(checkRewrite(old, prose(2100, 2), opts)).toEqual({ ok: true });
+    expect(checkRewrite(old, prose(1900, 2), opts)).toMatchObject({ ok: false, reason: 'shorter' });
+    // 每章下限低于旧版一半时按下限
+    expect(checkRewrite(old, prose(900, 2), { allowShorter: true, minChars: 800 })).toEqual({ ok: true });
+    expect(checkRewrite(old, prose(60, 2), { allowShorter: true, minChars: 50 })).toMatchObject({ ok: false, reason: 'shorter' });
+    expect(checkRewrite(old, truncate(prose(2500, 2)), opts)).toMatchObject({ ok: false, reason: 'truncated' });
   });
 });
 

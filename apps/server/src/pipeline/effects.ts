@@ -223,20 +223,74 @@ const REGISTRY: Record<string, Handler> = {
     const old = readV3Meta(b.meta);
     const rawMeta = (b.meta ?? {}) as Record<string, unknown>;
     const oldV3 = (rawMeta.v3 && typeof rawMeta.v3 === 'object' ? rawMeta.v3 : {}) as Record<string, unknown>;
+    const retro = a.orderKind === 'book.retro';
+    // 批次记录（回退、复盘用）：有新章入库才记一条
+    const batchLog = fresh.length
+      ? [
+          ...old.batchLog,
+          {
+            runId: a.runId,
+            kind: a.orderKind === 'book.open' ? 'open' : completed ? 'finale' : 'write',
+            from: Math.min(...fresh),
+            to: Math.max(...fresh),
+            baseCommit: a.baseCommit ?? '',
+            finalCommit: sha,
+            at: a.nowIso,
+            ...(a.toolSteps ? { toolSteps: a.toolSteps } : {}),
+          },
+        ]
+      : old.batchLog;
+    const finaleNoMarker = retro ? old.finaleNoMarker : a.finaleNoMarker;
+    // 主人留言：运行读到的仍是 meta 里等着的那一条、且这一批确实有正文落地（提交时可能被主人改动整批顶掉）→ 记回执、移进历史。
+    // 回执的章号按真正落地的章重算（committer 也只在有章落地时清空并归档 notes/from-owner.md，两边一致）
+    let owner: Record<string, unknown> = {};
+    const read = retro ? undefined : a.ownerMessageRead;
+    const proseLanded = fresh.length > 0 || chs.length > 0 || completed !== false;
+    if (read && proseLanded && old.ownerMessage?.sha === read.sha) {
+      const { sha: _sha, archivedPath, ...readIn } = read;
+      const nos = fresh.length > 0 ? fresh : chs.length > 0 ? chs.map((c) => c.no) : [];
+      if (nos.length > 0) {
+        readIn.from = Math.min(...nos);
+        readIn.to = Math.max(...nos);
+      }
+      owner = { ownerMessage: null, ownerMessages: [{ ...old.ownerMessage, readIn, archivedPath, status: 'read' }, ...old.ownerMessages].slice(0, 20) };
+    }
+    // 主人的改写请求：这一章的改写入库了就是 done（崩溃前落地的也算）；没入库时只有 final（正常结束且有章入库）才记 not_done（只用一次），
+    // 否则继续等：发布暂扣照旧，下一张任务单再带
+    if (!retro && a.ownerRequestResults?.length) {
+      const res = new Map(a.ownerRequestResults.map((r) => [r.id, r]));
+      owner.ownerRequests = old.ownerRequests.map((r) => {
+        const x = res.get(r.id);
+        if (!x || r.status !== 'waiting') return r;
+        if (chs.some((c) => c.rewrite && c.no === r.chapter)) return { ...r, status: 'done', runId: a.runId };
+        return x.final === false ? r : { ...r, status: 'not_done', runId: a.runId };
+      });
+    }
     const v3: Record<string, unknown> = {
       ...oldV3,
-      hints: [...a.hints, ...(extra?.dropped ?? []).map((p) => ownerEditHint(p, a.nowIso))],
-      noChapterStreak: a.noChapterStreak,
-      finaleNoMarker: a.finaleNoMarker,
-      emptyStreak: 0,
+      // 复盘不动提示和各种连击（只追加主人改动的提示）
+      hints: [...(retro ? old.hints : a.hints), ...(extra?.dropped ?? []).map((p) => ownerEditHint(p, a.nowIso))],
+      noChapterStreak: retro ? old.noChapterStreak : a.noChapterStreak,
+      finaleNoMarker,
+      emptyStreak: retro ? old.emptyStreak : 0,
       lastBatchFrom: fresh.length ? Math.min(...fresh) : old.lastBatchFrom,
       lastBatchAt: fresh.length ? a.nowIso : old.lastBatchAt,
-      hintedShort: a.hintedShort,
-      ...(completed ? { completedAt: old.completedAt ?? a.nowIso, completedReason: completed } : {}),
+      hintedShort: retro ? old.hintedShort : a.hintedShort,
+      ...(completed ? { completedAt: old.completedAt ?? a.nowIso, completedReason: completed, ...(a.completedNote ? { completedNote: a.completedNote } : {}) } : {}),
+      batchLog,
+      ...(retro ? { retro: { afterBatches: old.batchLog.length, lastAt: a.nowIso, lastRunId: a.runId, lastStatus: 'done' } } : {}),
+      runawayBatches: typeof a.runawayBatches === 'number' ? a.runawayBatches : old.runawayBatches,
+      shortEndUsed: typeof a.shortEndUsed === 'boolean' ? a.shortEndUsed : old.shortEndUsed,
+      plannedFloor: a.plannedFloor !== undefined ? a.plannedFloor : old.plannedFloor,
+      finaleNoMarkerAlerted: a.finaleNoMarkerAlert ? true : finaleNoMarker === 0 ? false : old.finaleNoMarkerAlerted,
+      ...(a.feedback && fresh.length ? { feedback: a.feedback } : {}),
+      ...(a.batchNote ? { batchNote: a.batchNote } : {}),
+      ...owner,
       // 只清自己这次 run 的 pending（别的 run 的不动）；locked 不在这里改
       pending: old.pending && old.pending.runId === a.runId ? null : (old.pending ?? null),
     };
-    const meta = { ...rawMeta, ...(a.blurb !== undefined ? { blurb: a.blurb } : {}), v3 };
+    // 标签（WP-3）：bible.md 第三行的原文，书库摘要按它计数
+    const meta = { ...rawMeta, ...(a.blurb !== undefined ? { blurb: a.blurb } : {}), ...(Array.isArray(a.tags) ? { tags: a.tags } : {}), v3 };
     const maxNew = fresh.length ? Math.max(...fresh) : 0;
     await tx
       .update(books)

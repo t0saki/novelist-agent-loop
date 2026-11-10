@@ -2,10 +2,13 @@
 
 任务：新写第 {{from}}–{{to}} 章（共 {{count}} 章）
 {{rewrite_line}}
+{{owner_line}}
 
 进度：已写 {{accepted}} 章，共 {{total_cjk}} 字；计划共 {{planned}} 章，全书不少于 {{target_cjk}} 字。每章不少于 {{min_chars}} 字，不设上限。
 
+{{ending}}
 {{hints}}
+{{feedback}}
 动笔前把下面这些各读一遍（之后不要重读已经读过或自己刚写的文件）：
 {{must_read}}
 更早的细节确实要核对时，到 notes/chapters.md 里找到章号，再去翻那一章。

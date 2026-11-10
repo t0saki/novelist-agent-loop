@@ -207,14 +207,28 @@ describe('v3 index and manuscripts', () => {
     expect(v2.notes.some((n) => n.includes('账本'))).toBe(true);
   });
 
-  it('rewind / chapter rewrite on v3 → 409 v3_unsupported', async () => {
-    const rewind = await admin('POST', '/api/admin/books/v3-idx/actions', { action: 'rewind', to: 0, confirm: true });
-    expect(rewind.statusCode).toBe(409);
-    expect(rewind.json().code).toBe('v3_unsupported');
-    for (const action of ['rewrite', 'repair', 'reextract']) {
+  it('v3 chapter actions: rewrite needs a note and records a waiting request; repair/reextract still 409; rewind to 0 succeeds', async () => {
+    const bare = await admin('POST', '/api/admin/books/v3-idx/chapters/1/actions', { action: 'rewrite', confirm: true });
+    expect(bare.statusCode).toBe(400);
+    const withNote = await admin('POST', '/api/admin/books/v3-idx/chapters/1/actions', { action: 'rewrite', note: '开头太慢' });
+    expect(withNote.statusCode).toBe(200);
+    const m = (await rowOf('v3-idx')).meta as { v3: { ownerRequests: { chapter: number; note: string; status: string }[]; locked: number[] } };
+    expect(m.v3.ownerRequests).toMatchObject([{ chapter: 1, note: '开头太慢', status: 'waiting' }]);
+    // 主人要求改写的章解锁
+    expect(m.v3.locked).not.toContain(1);
+    for (const action of ['repair', 'reextract']) {
       const res = await admin('POST', '/api/admin/books/v3-idx/chapters/1/actions', { action, confirm: true });
       expect(res.statusCode, action).toBe(409);
       expect(res.json().code, action).toBe('v3_unsupported');
     }
+    const rewind = await admin('POST', '/api/admin/books/v3-idx/actions', { action: 'rewind', to: 0, confirm: true });
+    expect(rewind.statusCode).toBe(200);
+    const row = await rowOf('v3-idx');
+    expect(row.acceptedThrough).toBe(0);
+    const repo = openRepo(bookDir(t.deps, 'v3-idx'));
+    expect(await repo.exists(P.manuscript(1))).toBe(false);
+    expect((await repo.list('drafts', { recursive: true })).filter((p) => /^drafts\/rewound-[^/]+\/c00001\.md$/.test(p))).toHaveLength(1);
+    // 被回退掉的章的请求作废
+    expect((row.meta as { v3: { ownerRequests: { status: string }[] } }).v3.ownerRequests[0]?.status).toBe('dropped');
   });
 });

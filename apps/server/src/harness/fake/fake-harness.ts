@@ -105,6 +105,21 @@ export interface FakeV3Chaos {
   noMarker?: boolean;
   /** 覆盖本批章数 */
   chapters?: number;
+  /** 多发这么多个读文件的 tool_call 事件（工具步数测试） */
+  extraSteps?: number;
+  /** 把这个说法插进每一段（重复统计测试） */
+  repeatPhrase?: string;
+  /** 复盘时改写 manuscript/c{k}.md（不该生效） */
+  retroEditChapter?: number;
+  /** 复盘什么都不写 */
+  retroZero?: boolean;
+  /** 同 endMarkerEarly：普通批也写“（全书完）”（结局测试用的别名） */
+  markerAlways?: boolean;
+  /**
+   * 任务单允许改写的每一章都改（不只补短章）：append = 末尾加一段；shorten = 保留标题和正文前 60%（截在句末）；
+   * shorten-hard = 只留 20%（“主人要求的改写太短 → 保留原版”）
+   */
+  rewriteAllowed?: 'append' | 'shorten' | 'shorten-hard';
   serverFault?: 'finalize' | 'promote' | 'crashAfterHarvest';
 }
 
@@ -769,7 +784,7 @@ function failWith(fake: FakeScenario, sessionId: string): number {
 
 // ───────── v3 目录模式（--v3）：cwd 就是书快照，读 ORDER.md，直接在目录里写书 ─────────
 
-export type FakeOrderMode = 'open-short' | 'open-long' | 'write' | 'finale';
+export type FakeOrderMode = 'open-short' | 'open-long' | 'write' | 'finale' | 'retro';
 export interface FakeOrder {
   mode: FakeOrderMode;
   from: number;
@@ -802,6 +817,13 @@ export function parseOrderText(text: string): FakeOrder | null {
     const count = Math.max(1, Number(m[2]) - from + 1);
     const planned = Number(text.match(/计划共 (\d+) 章/)?.[1] ?? from + count - 1);
     return { mode: 'write', from, count, planned, minChars, allowRewrite };
+  }
+  m = text.match(/^任务：复盘第 (\d+)–(\d+) 章/m);
+  if (m) {
+    const from = Number(m[1]);
+    const to = Number(m[2]);
+    const planned = Number(text.match(/计划共 (\d+) 章/)?.[1] ?? to);
+    return { mode: 'retro', from, count: Math.max(1, to - from + 1), planned, minChars, allowRewrite: [] };
   }
   m = text.match(/^任务：结局批，从第 (\d+) 章写到全书结束（计划还剩约 (\d+) 章/m);
   if (m) {
@@ -900,6 +922,8 @@ export async function dirMain(argv: string[]): Promise<number> {
     return fake.exitCode ?? 0;
   }
 
+  for (let i = 0; i < (chaos.extraSteps ?? 0); i++) readEv(`notes/progress.md`);
+
   let written = 0;
   const write = (rel: string, content: string) => {
     const abs = path.join(cwd, rel);
@@ -920,6 +944,37 @@ export async function dirMain(argv: string[]): Promise<number> {
     }
   };
   const seed = createHash('sha256').update(`${sessionId}:${cwd}`).digest('hex');
+  if (order.mode === 'retro') {
+    // 复盘：读笔记和这几章，重写 notes/retro.md，大纲记一笔，线索标上去处；不写正文
+    const to = order.from + order.count - 1;
+    for (const rel of ['notes/progress.md', 'outline.md', 'bible.md', 'notes/cast.md', 'notes/threads.md', 'notes/retro.md', 'notes/chapters.md']) if (readRel(rel) !== null) readEv(rel);
+    for (let k = order.from; k <= to; k++) if (readRel(`manuscript/c${pad5(k)}.md`) !== null) readEv(`manuscript/c${pad5(k)}.md`);
+    if (!chaos.retroZero && !chaos.zeroOutput) {
+      write('notes/retro.md', `# 复盘意见（第 ${order.from}–${to} 章）\n\n1. 师姐的戏份偏少，接下来几章让她多出场。\n2. 渡口的描写重复了几次，换个角度写。\n3. 旧信的线索快被忘了，近期要推进一次。\n`);
+      const outline = readRel('outline.md');
+      if (outline !== null) write('outline.md', `${outline.replace(/\n*$/, '\n')}\n（复盘：第 ${order.from}–${to} 章已对照）\n`);
+      const threads = readRel('notes/threads.md');
+      if (threads !== null) {
+        write(
+          'notes/threads.md',
+          threads
+            .split('\n')
+            .map((l) => (/^\s*[-*]\s/.test(l) && !l.includes('计划第') ? `${l} → 计划第 ${to + 3} 章前后收` : l))
+            .join('\n'),
+        );
+      }
+      if (chaos.retroEditChapter !== undefined) {
+        const rel = `manuscript/c${pad5(chaos.retroEditChapter)}.md`;
+        const old = readRel(rel);
+        if (old !== null) write(rel, `${old.trimEnd()}\n\n${fakeProse(300, `${seed}:retro${chaos.retroEditChapter}`)}\n`);
+      }
+    }
+    emit({ t: 'text', channel: 'assistant', delta: `复盘完成，改了 ${written} 个文件。` });
+    if (fake.fail) return failWith(fake, sessionId);
+    emit({ t: 'usage', input: Math.ceil(orderText.length / 2) + 2000, cachedInput: 0, output: written * 400 + 50, reasoning: 0, costUsd: 0, costSource: 'harness', scope: 'total' });
+    emit({ t: 'result', status: 'success', stopReason: 'end_turn', sessionId, turns: 1 });
+    return fake.exitCode ?? 0;
+  }
   const isOpen = order.mode === 'open-short' || order.mode === 'open-long';
   const isFinale = order.mode === 'finale' || order.mode === 'open-short';
   const count = chaos.chapters ?? order.count;
@@ -946,6 +1001,15 @@ export async function dirMain(argv: string[]): Promise<number> {
       }
     }
 
+    // 1b. 收尾阶段的写作批：任务单要求先写结局章节清单
+    if (!isOpen && orderText.includes('加一节"## 结局章节清单"')) {
+      const outline = readRel('outline.md') ?? '# 大纲\n';
+      if (!/^#{1,6}\s*结局(?:章节)?清单/m.test(outline)) {
+        const items = Array.from({ length: Math.max(1, order.planned - order.from + 1) }, (_, i) => `- 第${order.from + i}章：……`).join('\n');
+        write('outline.md', `${outline.replace(/\n*$/, '\n')}\n## 结局章节清单\n${items}\n`);
+      }
+    }
+
     // 2. 正文
     const batchParts: string[] = [];
     if (chaos.killAfter === 0) process.kill(process.pid, 'SIGKILL');
@@ -955,9 +1019,10 @@ export async function dirMain(argv: string[]): Promise<number> {
       let chars = Math.ceil(Math.max(order.minChars + 200, 1.2 * order.minChars));
       if (chaos.shortChapter === i + 1) chars = Math.max(Math.min(150, order.minChars - 1), Math.floor(order.minChars / 2));
       let body = fakeProse(chars, `${seed}:c${k}`);
+      if (chaos.repeatPhrase) body = body.split('\n').map((l) => (l.trim() ? `${chaos.repeatPhrase}，${l}` : l)).join('\n');
       const isLast = k === last;
       if (isLast && chaos.truncateLast) body = `${body.replace(/[。！？”]+$/u, '')}，他刚要开口，门外却`;
-      const marker = isLast && !chaos.truncateLast && ((isFinale && !chaos.noMarker) || (!isFinale && chaos.endMarkerEarly));
+      const marker = isLast && !chaos.truncateLast && ((isFinale && !chaos.noMarker) || (!isFinale && (chaos.endMarkerEarly || chaos.markerAlways)));
       const text = `# 第${k}章 ${title}\n\n${body}\n${marker ? `\n${FAKE_END_MARKER}\n` : ''}`;
       if (chaos.oneFile) {
         batchParts.push(text);
@@ -973,6 +1038,19 @@ export async function dirMain(argv: string[]): Promise<number> {
       const rel = `manuscript/c${pad5(k)}.md`;
       const old = readRel(rel);
       if (old === null) continue;
+      if (chaos.rewriteAllowed === 'append') {
+        write(rel, `${old.trimEnd()}\n\n${fakeProse(400, `${seed}:rwa${k}`)}\n`);
+        continue;
+      }
+      if (chaos.rewriteAllowed === 'shorten' || chaos.rewriteAllowed === 'shorten-hard') {
+        const nl = old.indexOf('\n');
+        const head = nl >= 0 ? old.slice(0, nl) : '';
+        const body = (nl >= 0 ? old.slice(nl + 1) : old).trim();
+        const cut = body.slice(0, Math.floor(body.length * (chaos.rewriteAllowed === 'shorten' ? 0.6 : 0.2)));
+        const end = cut.lastIndexOf('。');
+        write(rel, `${head}\n\n${end >= 0 ? cut.slice(0, end + 1) : cut}\n`);
+        continue;
+      }
       const have = fakeCount(old);
       if (have >= order.minChars) continue;
       write(rel, `${old.trimEnd()}\n\n${fakeProse(order.minChars - have + 200, `${seed}:rw${k}`)}\n`);

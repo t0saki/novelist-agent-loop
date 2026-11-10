@@ -288,3 +288,68 @@ describe('fake harness v3 混沌开关', () => {
     expect(r.events.find((e) => e.t === 'error')).toMatchObject({ cls: 'config' });
   });
 });
+
+describe('fake harness v3: phase-2 modes and switches', () => {
+  const RETRO = '# 任务单\n\n任务：复盘第 3–5 章（这次不写新章）\n\n进度：已写 5 章，共 2000 字；计划共 15 章。\n';
+  const pre = (): Record<string, string> => ({
+    'outline.md': '# 大纲\n\n计划：共 15 章\n',
+    'notes/threads.md': '# 线索\n\n- 旧信的来历：第1章埋。\n- 渡口的灯：第2章埋，计划第9章前后收。\n',
+    'notes/progress.md': '写到第 5 章。\n',
+    ...Object.fromEntries([1, 2, 3, 4, 5].map((k) => [c5(k), `# 第${k}章 旧章\n\n旧正文${k}。\n`])),
+  });
+
+  it('parseOrderText: retro line', () => {
+    expect(parseOrderText(RETRO)).toMatchObject({ mode: 'retro', from: 3, count: 3, planned: 15, allowRewrite: [] });
+  });
+  it('retro mode writes notes/retro.md, outline, threads; no prose', () => {
+    const r = run(RETRO, undefined, pre());
+    expect(r.status).toBe(0);
+    expect(r.read('notes/retro.md')?.split('\n').filter((l) => /^\d+\. /.test(l))).toHaveLength(3);
+    expect(r.read('outline.md')).toContain('（复盘：第 3–5 章已对照）');
+    const threads = r.read('notes/threads.md')!.split('\n');
+    expect(threads).toContain('- 旧信的来历：第1章埋。 → 计划第 8 章前后收');
+    expect(threads).toContain('- 渡口的灯：第2章埋，计划第9章前后收。');
+    for (const k of [1, 2, 3, 4, 5]) expect(r.read(c5(k))).toBe(`# 第${k}章 旧章\n\n旧正文${k}。\n`);
+    expect(r.read(c5(6))).toBeNull();
+    const reads = r.events.filter((e) => e.t === 'tool_call' && e.kind === 'read').map((e) => path.basename((e.paths as string[])[0] ?? ''));
+    expect(reads).toEqual(expect.arrayContaining(['c00003.md', 'c00004.md', 'c00005.md', 'progress.md', 'outline.md', 'threads.md']));
+    expect(resultOf(r)).toMatchObject({ status: 'success' });
+  });
+  it('retroEditChapter edits manuscript; retroZero writes nothing', () => {
+    const e = run(RETRO, { v3: { retroEditChapter: 4 } }, pre());
+    expect(e.read(c5(4))?.startsWith('# 第4章 旧章\n\n旧正文4。\n\n')).toBe(true);
+    expect(e.read(c5(4))!.length).toBeGreaterThan(30);
+    const z = run(RETRO, { v3: { retroZero: true } }, pre());
+    expect(z.read('notes/retro.md')).toBeNull();
+    expect(z.read('outline.md')).toBe('# 大纲\n\n计划：共 15 章\n');
+    expect(resultOf(z)).toMatchObject({ status: 'success' });
+  });
+  it('extraSteps emits N extra tool_call events', () => {
+    const base = run(ORDER.write()).events.filter((e) => e.t === 'tool_call').length;
+    const more = run(ORDER.write(), { v3: { extraSteps: 25 } }).events.filter((e) => e.t === 'tool_call').length;
+    expect(more - base).toBe(25);
+  });
+  it('repeatPhrase inserted into every paragraph', () => {
+    const r = run(ORDER.write(), { v3: { repeatPhrase: '月光洒在青石板上' } });
+    for (const k of [6, 7, 8]) {
+      const paras = bodyOf(r.read(c5(k))!)
+        .split('\n')
+        .filter((l) => l.trim() !== '');
+      expect(paras.length).toBeGreaterThan(0);
+      expect(paras.every((l) => l.startsWith('月光洒在青石板上，'))).toBe(true);
+    }
+  });
+  it('write order asking for the ending list → outline gets "## 结局章节清单" (once)', () => {
+    const order = `${ORDER.write()}\n## 收尾阶段\n全书计划共 15 章，还剩约 10 章。动笔前先在 outline.md 里加一节"## 结局章节清单"：从第 6 章到全书结束。\n`;
+    const r = run(order, undefined, { 'outline.md': '# 大纲\n\n计划：共 15 章\n' });
+    const outline = r.read('outline.md')!;
+    expect(outline).toMatch(/^## 结局章节清单$/m);
+    expect(outline).toContain('- 第15章：……');
+    const again = run(order, undefined, { 'outline.md': outline });
+    expect(again.read('outline.md')).toBe(outline);
+  });
+  it('markerAlways: a write order also gets the end marker', () => {
+    const r = run(ORDER.write(), { v3: { markerAlways: true } });
+    expectChapter(r, 8, { marker: true });
+  });
+});

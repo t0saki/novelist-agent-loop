@@ -63,6 +63,8 @@ export interface BookRepo {
   /** 工作树是否干净（忽略 gitignored） */
   isClean(): Promise<boolean>;
   tag(name: string, rev?: string): Promise<void>;
+  /** git tag -d；标签不存在时什么都不做 */
+  deleteTag(name: string): Promise<void>;
   tags(pattern?: string): Promise<string[]>;
   fsck(): Promise<{ ok: boolean; detail: string }>;
   /** 批量读取（rev 给出时用一次 cat-file --batch）。lane B 扩展，可选实现 */
@@ -389,6 +391,10 @@ class GitBookRepo implements BookRepo {
 
   async tag(name: string, rev = 'HEAD'): Promise<void> {
     await git(this.dir, ['tag', '-f', name, rev]);
+  }
+
+  async deleteTag(name: string): Promise<void> {
+    await gitRaw(this.dir, ['tag', '-d', name]);
   }
 
   async tags(pattern?: string): Promise<string[]> {

@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, gt, inArray, like, sql } from 'drizzle-orm';
 import type { Capabilities, ErrorClass, HarnessInstall, NEvent, Outcome, QualityTier, RoleId, RunState, TaskKind, WorkOrderFrontmatter } from '@novelist/shared';
 import { toJsonSchema, zAccount, zCapabilities, zReceipt } from '@novelist/shared';
 import type { AppConfig, DataPaths } from '../config/index.js';
@@ -24,10 +24,11 @@ import { collectRunChanges } from '../book/harvest.js';
 import { V3_AGENTS_SOFT_LIMIT } from '../instructions/v3.js';
 import { BOOK_LADDER_MS, classifyV3Run } from '../flow/judge.js';
 import { ZERO_DIFF_PAUSE_MS, bumpZeroDiff, readZeroDiff, zeroDiffAccountKey, zeroDiffInbox } from '../flow/accounts.js';
-import { isInstructionFile } from '../flow/contract.js';
-import { bumpBookEmpty, clearPending, patchPending, readPending, readV3Meta, setPending } from '../flow/state.js';
+import { BUDGET_WAIT_PREFIX, NO_PROSE_WAIT, isInstructionFile } from '../flow/contract.js';
+import { bumpBookEmpty, clearPending, markRetro, patchPending, readPending, readV3Meta, setAgentsSize, setPending } from '../flow/state.js';
 import { isV3Kind, serverFault } from '../flow/handlers.js';
-import type { V3CommitPlan, V3Pending } from '../flow/types.js';
+import { v3InboxAllowed } from '../flow/inbox-v3.js';
+import type { V3AgentsSize, V3CommitPlan, V3Pending } from '../flow/types.js';
 import { buildViews } from '../state/index.js';
 import { RunPrepareError, defaultCapabilities, getAdapter, probeIsolation, reattachRun, resolveAccount, startRun, syncBackCredentials, type HarnessAdapter, type ResolvedAccount, type RunEventSink, type RunHandle, type RunResult, type RunSpec } from '../harness/index.js';
 import type { EventBus } from './bus.js';
@@ -35,7 +36,7 @@ import { planFailure, INFRA_CLASSES, type FailurePlan } from './actions.js';
 import { defaultPipeline, type PipelineBinding } from './binding.js';
 import { applyCanaryResult, recordRun } from './circuit.js';
 import { promote, promoteV3, withRepoLock, type PromoteMeta, type PromoteOutcome } from './committer.js';
-import { createInboxItem } from './inbox.js';
+import { createInboxItem, upsertOpenInbox } from './inbox.js';
 import { chapterNoOf, orchOf, taskTrailerValue, withOrch, type OrchTaskState } from './orch-state.js';
 import { ACTIVE_STATES, completeTask, enqueue, renewLease, setTaskState } from './queue.js';
 import { accountUsdCapReached, checkBookBudget, expectedChapterCost, expectedTaskCost, markAuthBad, recordRateLimit, releaseReservations, reserve, settle, sleepAccount, utilSnapshot } from './quota.js';
@@ -328,7 +329,7 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
     const staleReason = await preRunStale(book, task);
     if (staleReason) return staleResult(staleReason);
     const budget = await checkBookBudget(env.db, book, task.kind as TaskKind, now);
-    if (!budget.ok) return { status: 'waiting', retryAfter: budget.waitUntil ?? new Date(now.getTime() + 1800_000).toISOString(), message: budget.reason ?? 'budget' };
+    if (!budget.ok) return { status: 'waiting', retryAfter: budget.waitUntil ?? new Date(now.getTime() + 1800_000).toISOString(), message: handler.contract === 'v3' ? `${BUDGET_WAIT_PREFIX}${budget.reason ?? '本书预算已到上限'}` : (budget.reason ?? 'budget') };
   }
 
   // 1. 路由
@@ -494,14 +495,21 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
     if (plan.v3) {
       // v3：指令在快照根 AGENTS.md（cc 经 CLAUDE.md 引用），任务在 ORDER.md；启动语是一句话；没有回执、schema、nonce
       const v3 = plan.v3;
+      // 大小（WP-3）：不进待办，记在 meta.v3.agentsSize（书页列各层字节数，超过硬上限时状态句是“等你处理”）；渲染回 16 KB 以下的运行清掉
       if (caps.maxInstructionBytes !== undefined && v3.agentsBytes > caps.maxInstructionBytes) {
         await cleanupRun('finalized', 'config');
-        if (book) await createInboxItem(env.db, env.bus, agentsSizeInbox(book.id, v3, `超过 ${route.harness} 的上限 ${caps.maxInstructionBytes} 字节，本次没有启动`));
+        if (book) {
+          env.log.warn({ bookId: book.id, bytes: v3.agentsBytes, limit: caps.maxInstructionBytes, harness: route.harness }, 'v3 AGENTS.md 超过 harness 的硬上限，没有启动');
+          await setAgentsSize(env.db, book.id, agentsSizeOf(v3, true, caps.maxInstructionBytes, route.harness as string, now));
+        }
         return { status: 'waiting', retryAfter: new Date(now.getTime() + 3600_000).toISOString(), message: `AGENTS.md ${v3.agentsBytes} 字节，超过 ${route.harness} 的上限 ${caps.maxInstructionBytes}` };
       }
-      if (v3.agentsBytes > V3_AGENTS_SOFT_LIMIT && book) {
+      if (book && v3.agentsBytes > V3_AGENTS_SOFT_LIMIT) {
         env.log.warn({ bookId: book.id, bytes: v3.agentsBytes }, 'v3 AGENTS.md 超过 16KB（不截断）');
-        await createInboxItem(env.db, env.bus, agentsSizeInbox(book.id, v3, '超过建议的 16KB，没有截断；请精简全局、题材或本书指令'));
+        await setAgentsSize(env.db, book.id, agentsSizeOf(v3, false, V3_AGENTS_SOFT_LIMIT, route.harness as string, now));
+      } else if (book) {
+        const cur = (await env.db.select({ meta: books.meta }).from(books).where(eq(books.id, book.id)).limit(1))[0];
+        if (readV3Meta(cur?.meta).agentsSize) await setAgentsSize(env.db, book.id, null);
       }
       // 早先入库的 AGENTS.override.md / GEMINI.md / manuscript/CLAUDE.md 一类：会顶替或叠加服务器的指令，快照里先删掉
       await removeStrayInstructionFiles(snapshotDir);
@@ -722,8 +730,10 @@ async function finishRunInner(
   const finalState: RunState = result.outcome.status === 'cancelled' ? 'killed' : 'exited';
   await env.db
     .update(runs)
-    .set({ state: finalState, endedAt: new Date().toISOString(), exitCode: result.exit.code, errorClass: result.outcome.errorClass ?? null, outcome: { status: result.outcome.status, message: result.outcome.message, ...(session.contract === 'v3' && result.outcome.retryAfter ? { retryAfter: result.outcome.retryAfter } : {}) }, usage: result.outcome.usage as unknown as Record<string, unknown>, denials: result.outcome.denials.length, sessionId: result.outcome.sessionId ?? null, modelReported: result.outcome.model ?? null })
+    .set({ state: finalState, endedAt: new Date().toISOString(), exitCode: result.exit.code, errorClass: result.outcome.errorClass ?? null, outcome: { status: result.outcome.status, message: result.outcome.message, toolSteps: result.toolSteps, ...(session.contract === 'v3' && result.outcome.retryAfter ? { retryAfter: result.outcome.retryAfter } : {}) }, usage: result.outcome.usage as unknown as Record<string, unknown>, denials: result.outcome.denials.length, sessionId: result.outcome.sessionId ?? null, modelReported: result.outcome.model ?? null })
     .where(eq(runs.id, session.spec.runId));
+  // 账号的在跑数刚降下来：叫醒停在“路由等待”的 v3 任务，由 claimNext 的排序决定谁先写
+  await wakeRouteWaiters(env).catch((err: Error) => env.log.warn({ err: err.message }, 'wakeRouteWaiters failed'));
 
   // 8. 收割
   let stagedOutDir = '';
@@ -769,7 +779,7 @@ async function finishRunInner(
   if (v3Book) {
     // 主人取消的是任务（cancelTask）；单纯 killRun 时任务还活着
     const taskState = (await env.db.select({ state: tasks.state }).from(tasks).where(eq(tasks.id, task.id)).limit(1))[0]?.state;
-    harvested.v3 = { manifestFile: v3Manifest, lost: false, stderrTail: result.stderrTail, trailerKey: session.trailerKey ?? `${task.id}@${session.spec.runId}`, ownerCancelled: taskState === 'cancelled' };
+    harvested.v3 = { manifestFile: v3Manifest, lost: false, stderrTail: result.stderrTail, trailerKey: session.trailerKey ?? `${task.id}@${session.spec.runId}`, ownerCancelled: taskState === 'cancelled', toolSteps: result.toolSteps };
   }
 
   // 10. 结算配额、熔断
@@ -948,15 +958,22 @@ export function emptyCompiled(stackHash: string): CompiledInstructions {
   return { systemMd: '', mirrorMd: '', layers: [], nonces: {}, stackHash, bytes: 0, lastAuthorLayerId: 'L3' };
 }
 
-function agentsSizeInbox(bookId: string, v3: NonNullable<AgentPlan['v3']>, detail: string): Parameters<typeof createInboxItem>[2] {
-  return {
-    kind: 'notice',
-    bookId,
-    title: `本书的 AGENTS.md 有 ${v3.agentsBytes} 字节：${detail}`,
-    body: { bytes: v3.agentsBytes, softLimit: V3_AGENTS_SOFT_LIMIT, layers: v3.layers ?? [] },
-    actions: [{ id: 'dismiss', label: '知道了' }],
-    dedupeKey: `v3_agents_size:${bookId}`,
-  };
+function agentsSizeOf(v3: NonNullable<AgentPlan['v3']>, hard: boolean, limit: number, harness: string, now: Date): V3AgentsSize {
+  return { bytes: v3.agentsBytes, hard, limit, harness, at: now.toISOString(), layers: (v3.layers ?? []).map((l) => ({ layer: l.label || l.id, bytes: l.bytes })) };
+}
+
+/**
+ * 一个 run 结束、账号空出来了（WP-3，DESIGN §8.2“多本书抢一个账号”）：把所有停在“路由等待”的 v3 任务叫醒到同一时刻，
+ * 让 claimNext 的排序（存稿天数最少、最久没写）决定谁先跑。输的会再停 15 秒；attempts 不动。旧流程的任务不叫（各自的计时器照旧）。
+ */
+export async function wakeRouteWaiters(env: Pick<ExecEnv, 'db' | 'nowFn'>): Promise<number> {
+  const nowIso = env.nowFn().toISOString();
+  const rows = await env.db
+    .update(tasks)
+    .set({ notBefore: nowIso, updatedAt: nowIso })
+    .where(and(eq(tasks.state, 'waiting'), like(tasks.waitReason, '路由等待%'), gt(tasks.notBefore, nowIso), inArray(tasks.kind, ['book.open', 'book.write', 'book.retro'])))
+    .returning({ id: tasks.id });
+  return rows.length;
 }
 
 /** pending 对应的 run 行 → Outcome（丢失的 run 记为 harness_crash） */
@@ -969,7 +986,7 @@ function outcomeOfRunRow(row: typeof runs.$inferSelect | null): Outcome {
 
 /**
  * 服务器侧失败（收稿 / finalize / 提交）：pending 留着，failures+1；按书的阶梯等待，下次只收稿不开 run。
- * 第 2 次发待办 v3_pending:<book>；第 3 次任务 blocked，待办带“重试 / 放弃”（确定性的服务器问题，等主人，不打转）。
+ * 第 3 次任务 blocked（确定性的服务器问题，等主人，不打转）。不发待办（WP-3）：书页和状态句显示，重试 / 放弃走 v3/pending 接口。
  */
 async function pendingFailure(env: ExecEnv, task: TaskRow, bookId: string, runId: string, err: unknown): Promise<TaskResult> {
   const msg = (err as Error)?.message ?? String(err);
@@ -978,20 +995,9 @@ async function pendingFailure(env: ExecEnv, task: TaskRow, bookId: string, runId
   const p = await patchPending(env.db, bookId, runId, { lastError: msg.slice(0, 1000) }, { incFailures: true });
   if (!p) return { status: 'waiting', retryAfter: new Date(now.getTime() + 60_000).toISOString(), message: `v3：${msg}` };
   const failures = p.failures;
-  const dedupeKey = `v3_pending:${bookId}`;
   const title = `收稿失败 ${failures} 次：${msg.slice(0, 200)}`;
-  const body = { runId, taskId: task.id, manifestFile: p.manifestFile, snapshotDir: p.snapshotDir, lastError: msg, on: { retry: { task: 'ready' }, discard: { task: 'ready' } } };
   const summary = { v3: { pendingKept: true, failures } };
-  if (failures >= 3) {
-    const actions = [
-      { id: 'retry', label: '重试收稿' },
-      { id: 'discard', label: '放弃这次的稿（已提交的章撤回到 drafts/，改动留在 work/ 下）', danger: true },
-    ];
-    const updated = await env.db.update(inbox).set({ title, body, actions, relatedTaskId: task.id }).where(and(eq(inbox.dedupeKey, dedupeKey), eq(inbox.state, 'open'))).returning({ id: inbox.id });
-    if (updated.length === 0) await createInboxItem(env.db, env.bus, { kind: 'block', bookId, title, body, actions, dedupeKey, relatedTaskId: task.id });
-    return { status: 'blocked', errorClass: 'unknown', message: title, summary };
-  }
-  if (failures >= 2) await createInboxItem(env.db, env.bus, { kind: 'notice', bookId, title, body, actions: [{ id: 'dismiss', label: '知道了' }], dedupeKey, relatedTaskId: task.id });
+  if (failures >= 3) return { status: 'blocked', errorClass: 'unknown', message: title, summary };
   const wait = BOOK_LADDER_MS[Math.min(Math.max(failures - 1, 0), BOOK_LADDER_MS.length - 1)] as number;
   return { status: 'waiting', retryAfter: new Date(now.getTime() + wait).toISOString(), message: `v3：${msg}`, summary };
 }
@@ -1039,7 +1045,7 @@ async function consumePending(env: ExecEnv, ctx: PipelineContext, handler: TaskH
     artifacts: [],
     nonce: OK_NONCE,
     audit: { ok: true, extraFiles: [], tamperedConfig: [] },
-    v3: { manifestFile, lost, stderrTail: '', trailerKey: pending.trailerKey, ownerCancelled: false },
+    v3: { manifestFile, lost, stderrTail: '', trailerKey: pending.trailerKey, ownerCancelled: false, ...(typeof runRow?.outcome?.toolSteps === 'number' ? { toolSteps: runRow.outcome.toolSteps } : {}) },
   };
   const res = await judgeRunV3(env, ctx, handler, task, harvested, { profile: pending.route.profile, account: pending.route.account, harness: pending.route.harness }, outcome);
   return attachMeta(res, { harness: pending.route.harness, ...(pending.route.model ? { model: pending.route.model } : {}), isolation: pending.route.isolation, instructionsHash: pending.route.stackHash }, harvested);
@@ -1082,8 +1088,11 @@ async function judgeRunV3(env: ExecEnv, ctx: PipelineContext, handler: TaskHandl
   const sum = (fin.summary?.v3 ?? {}) as { accepted?: number; changed?: number; noChapterStreak?: number; completed?: unknown };
   const accountKey = zeroDiffAccountKey(route.account, route.profile);
   const accountStreak = await readZeroDiff(env.db, accountKey);
-  const bookRow = (await env.db.select({ meta: books.meta }).from(books).where(eq(books.id, book.id)).limit(1))[0];
+  const bookRow = (await env.db.select({ meta: books.meta, title: books.title }).from(books).where(eq(books.id, book.id)).limit(1))[0];
+  // 复盘看任务行（不看 summary）：从不重试，不记账号和书的空跑，不进书的待办
+  const retro = task.kind === 'book.retro';
   const verdict = classifyV3Run({
+    retro,
     outcome,
     ownerCancelled: v3.ownerCancelled,
     lost: v3.lost,
@@ -1102,31 +1111,37 @@ async function judgeRunV3(env: ExecEnv, ctx: PipelineContext, handler: TaskHandl
     const pend = await readPending(env.db, book.id);
     const applied = pend?.runId === runId && pend.infraApplied === true;
     if (!applied) {
-      await applyFailurePlan(env, task, fp);
+      // v3 的待办只放行 DESIGN §8.3 那几类（WP-3）：单次睡眠超过 12 小时的 quota: 项不在这里发（清扫按累计时长发），refusal / budget 之类也不发
+      await applyFailurePlan(env, task, { ...fp, inbox: (fp.inbox ?? []).filter((i) => v3InboxAllowed(i)) });
       await patchPending(env.db, book.id, runId, { infraApplied: true });
     }
   }
 
   // 账号空跑连击：有新章 / 有改动 → 归零；空跑 → +1；其余（取消、基础设施、lost、正常结束却没写）不动
   let streak = accountStreak;
-  if (verdict.zeroDiff) streak = await bumpZeroDiff(env.db, accountKey, true, now);
-  else if (verdict.bookEmpty === 'reset') streak = await bumpZeroDiff(env.db, accountKey, false, now);
-  // 书的空跑连击：+1 在这里；有改动时由 v3.batch 效果归零
-  if (verdict.bookEmpty === 'inc') await bumpBookEmpty(env.db, book.id, 'inc');
-  else if (verdict.bookEmpty === 'reset' && !fin.promote) await bumpBookEmpty(env.db, book.id, 'reset');
+  if (!retro) {
+    if (verdict.zeroDiff) streak = await bumpZeroDiff(env.db, accountKey, true, now);
+    else if (verdict.bookEmpty === 'reset') streak = await bumpZeroDiff(env.db, accountKey, false, now);
+    // 书的空跑连击：+1 在这里；有改动时由 v3.batch 效果归零
+    if (verdict.bookEmpty === 'inc') await bumpBookEmpty(env.db, book.id, 'inc');
+    else if (verdict.bookEmpty === 'reset' && !fin.promote) await bumpBookEmpty(env.db, book.id, 'reset');
+  }
   if (verdict.pauseAccount) {
     if (route.account) await sleepAccount(env.db, route.account, new Date(now.getTime() + ZERO_DIFF_PAUSE_MS).toISOString(), 'v3 连续空跑');
     await createInboxItem(env.db, env.bus, zeroDiffInbox(route.account ?? accountKey, streak, v3.stderrTail));
   }
-  if (verdict.bookInbox) {
+  if (verdict.bookInbox && !retro) {
+    // 同一本书只有一条（种类 + 书合并，WP-3）：没写出合格的新章、什么都没写、任务失败都并进 v3_no_prose:<book>；条件消失由清扫关闭
     const noProse = verdict.bookInbox === 'no_prose';
-    await createInboxItem(env.db, env.bus, {
+    const title = bookRow?.title ?? book.slug;
+    const n = noProse ? (sum.noChapterStreak ?? 0) : readV3Meta(bookRow?.meta).emptyStreak + 1;
+    await upsertOpenInbox(env.db, env.bus, {
       kind: 'notice',
       bookId: book.id,
-      title: noProse ? '连续 5 次运行有改动却没有合格的新章' : '连续 5 次运行什么都没写',
-      body: { taskId: task.id, runId, detail: noProse ? '作者在改笔记或写的章节没通过检查（被截断、太短、重复）。看一下 drafts/ 和最近的系统提示。' : '运行没有在书房里留下任何文件。检查账号、模型和 harness。' },
+      title: noProse ? `《${title}》连续 ${n} 次运行没写出合格的新章` : `《${title}》连续 ${n} 次运行什么都没写`,
+      body: { taskId: task.id, runId, detail: noProse ? '作者在改笔记，或者写的章节没通过检查（被截断、太短、重复）。看一下草稿和下一次任务单的系统提示。' : '运行没有在书房里留下任何文件。检查账号、模型和 harness。' },
       actions: [{ id: 'dismiss', label: '知道了' }],
-      dedupeKey: `v3_${noProse ? 'no_prose' : 'empty'}:${book.id}`,
+      dedupeKey: `v3_no_prose:${book.id}`,
     });
   }
   const keep = verdict.status === 'keep_cancelled';
@@ -1138,6 +1153,8 @@ async function judgeRunV3(env: ExecEnv, ctx: PipelineContext, handler: TaskHandl
     ...(status === 'waiting' && verdict.retryAfter ? { retryAfter: verdict.retryAfter } : {}),
     ...(verdict.avoidProfile ? { avoidProfile: verdict.avoidProfile } : {}),
     ...(status !== 'done' && infraClass ? { errorClass: infraClass, message: outcome.message ?? infraClass } : {}),
+    // judge 的没出章 / 空批阶梯：固定的等待原因，状态句只对它说“上一次没写出合格的新章”
+    ...(status === 'waiting' && !infraClass ? { message: NO_PROSE_WAIT } : {}),
     summary,
   };
 }
@@ -1163,6 +1180,7 @@ async function routeFailure(env: ExecEnv, task: TaskRow, route: ResolvedRoute, b
   await maybeFailover(env, task, route, book, now);
   if (route.waitUntil) return { status: 'waiting', retryAfter: route.waitUntil, message: `路由等待：${route.reason ?? ''}` };
   const cause = route.cause ?? 'no_route';
+  if (isV3Kind(task.kind) && task.bookId) return routeFailureV3(env, task, route, cause, now);
   if (cause === 'avoided' || cause === 'constraint' || cause === 'vendor') {
     await createInboxItem(env.db, env.bus, {
       kind: 'block',
@@ -1189,6 +1207,28 @@ async function routeFailure(env: ExecEnv, task: TaskRow, route: ResolvedRoute, b
   return { status: 'waiting', retryAfter: new Date(now.getTime() + 10 * 60_000).toISOString(), message: `无可用路由（${cause}）：${route.reason ?? ''}` };
 }
 
+/**
+ * v3 任务没有可用路由（WP-3，DESIGN §8.3“harness 不可用”）：按书合并成一条 no_route:<book>。
+ * 任务被拦（block）时带“重试”；只是等（waiting）时只有“知道了”，并且不覆盖这本书已经在的“被拦”那一条。
+ */
+async function routeFailureV3(env: ExecEnv, task: TaskRow, route: ResolvedRoute, cause: string, now: Date): Promise<TaskResult> {
+  const bookId = task.bookId as string;
+  const title = (await env.db.select({ title: books.title }).from(books).where(eq(books.id, bookId)).limit(1))[0]?.title ?? bookId;
+  const dedupeKey = `no_route:${bookId}`;
+  const blocked = cause === 'avoided' || cause === 'constraint' || cause === 'vendor';
+  // 复盘不是主人的事：路由不到也不发待办（被拦的复盘由 finishTaskV3 记成 failed，算作做过了）
+  if (task.kind === 'book.retro') return blocked ? { status: 'blocked', errorClass: 'config', message: route.reason ?? 'no route' } : { status: 'waiting', retryAfter: new Date(now.getTime() + 10 * 60_000).toISOString(), message: `无可用路由（${cause}）：${route.reason ?? ''}` };
+  const base ={ kind: 'block' as const, bookId, title: `《${title}》没有可用的写作账号`, body: { taskId: task.id, reason: route.reason ?? '', cause, detail: route.reason ?? '' }, dedupeKey, relatedTaskId: task.id };
+  if (blocked) {
+    await upsertOpenInbox(env.db, env.bus, { ...base, actions: [{ id: 'retry', label: '重试' }, { id: 'dismiss', label: '知道了' }] });
+    return { status: 'blocked', errorClass: 'config', message: route.reason ?? 'no route' };
+  }
+  const open = (await env.db.select({ relatedTaskId: inbox.relatedTaskId }).from(inbox).where(and(eq(inbox.dedupeKey, dedupeKey), eq(inbox.state, 'open'))).limit(1))[0];
+  const rel = open?.relatedTaskId ? (await env.db.select({ state: tasks.state }).from(tasks).where(eq(tasks.id, open.relatedTaskId)).limit(1))[0] : undefined;
+  if (rel?.state !== 'blocked') await upsertOpenInbox(env.db, env.bus, { ...base, actions: [{ id: 'dismiss', label: '知道了' }] });
+  return { status: 'waiting', retryAfter: new Date(now.getTime() + 10 * 60_000).toISOString(), message: `无可用路由（${cause}）：${route.reason ?? ''}` };
+}
+
 /** 写手不可用（auth/熔断/模型下架）持续超过 failover_after → 发 failover 提案（额度窗口不触发） */
 async function maybeFailover(env: ExecEnv, task: TaskRow, route: ResolvedRoute, book: BookHandle | null, now: Date): Promise<void> {
   if (!book || task.role !== 'writer') return;
@@ -1211,6 +1251,8 @@ async function maybeFailover(env: ExecEnv, task: TaskRow, route: ResolvedRoute, 
     await env.db.update(books).set({ writerProfile: to, meta: sql`${books.meta} || ${JSON.stringify({ writerUnavailableSince: null })}::jsonb`, updatedAt: now.toISOString() }).where(eq(books.id, book.id));
     return;
   }
+  // v3：需要审批的切换不发待办（WP-3）；书停在 no_route:<book> / circuit: 上，状态句会说明。不需要审批的自动切换照常
+  if (isV3Kind(task.kind)) return;
   await createInboxItem(env.db, env.bus, {
     kind: 'approval',
     bookId: book.id,
@@ -1396,8 +1438,15 @@ export async function finishTask(deps: ExecutorDeps, task: TaskRow, result: Task
  * v3 的 finishTask（p1-plan §3 executor 11）：逐章提交（promoteV3，出错不抛给 dispatchOne）、清 pending、每章一个 chapter_accepted。
  * 主人取消的任务照样收稿提交，任务保持 cancelled。
  */
-async function finishTaskV3(env: ExecEnv, task: TaskRow, latest: TaskRow, result: TaskResult): Promise<void> {
-  if (result.summary?.detached) return; // 进程退出 / 模拟崩溃：lease 过期后由下一次执行消化 pending
+async function finishTaskV3(env: ExecEnv, task: TaskRow, latest: TaskRow, result0: TaskResult): Promise<void> {
+  if (result0.summary?.detached) return; // 进程退出 / 模拟崩溃：lease 过期后由下一次执行消化 pending
+  // 复盘从不重试、从不 blocked（任务行说了算，不看 summary）：retry / blocked 一律记成 failed；waiting（路由、额度）照常等
+  const retroTask = task.kind === 'book.retro';
+  const result: TaskResult = retroTask && (result0.status === 'retry' || result0.status === 'blocked') ? { ...result0, status: 'failed' } : result0;
+  if (result !== result0) {
+    const meta0 = RESULT_META.get(result0);
+    if (meta0) RESULT_META.set(result, meta0);
+  }
   const bookId = task.bookId;
   const attached = RESULT_META.get(result);
   const runId = attached?.harvested?.run.runId ?? result.promote?.runId ?? null;
@@ -1421,16 +1470,18 @@ async function finishTaskV3(env: ExecEnv, task: TaskRow, latest: TaskRow, result
     try {
       const inDir = attached?.harvested?.run.inDir;
       if (inDir && (await serverFault({ deps: env.pdeps, book }, inDir, 'promote'))) throw new Error('serverFault: promote');
-      const promoted = await promoteV3(env.db, book.repo, latest, plan, attached?.meta ?? {});
-      for (const n of promoted.notices) await createInboxItem(env.db, env.bus, n);
+      const promoted = await promoteV3(env.db, book.repo, latest, plan, attached?.meta ?? {}, env.log);
+      for (const n of promoted.notices) if (v3InboxAllowed(n)) await createInboxItem(env.db, env.bus, n);
       const fresh = new Set(plan.v3.parts.filter((p) => !p.rewrite).map((p) => p.no));
       landedNew = promoted.landed.filter((n) => fresh.has(n));
     } catch (err) {
       // 提交失败不交给 dispatchOne（那里会每 30 秒 repromote 一次）：pending 留着，按书的阶梯等
-      const failed = await pendingFailure(env, latest, bookId, runId ?? plan.runId ?? '', err);
+      const failed0 = await pendingFailure(env, latest, bookId, runId ?? plan.runId ?? '', err);
+      const failed: TaskResult = retroTask && (failed0.status === 'retry' || failed0.status === 'blocked') ? { ...failed0, status: 'failed' } : failed0;
       if (!cancelled) {
         const state = await completeTask(env.db, task.id, failed, completeOpts(env));
         env.bus.publish({ type: 'task_changed', taskId: task.id, book: bookId, state });
+        if (retroTask) await retroConsumed(env, task, bookId, runId, state, 'failed');
       }
       return;
     }
@@ -1439,29 +1490,46 @@ async function finishTaskV3(env: ExecEnv, task: TaskRow, latest: TaskRow, result
     await clearPending(env.db, bookId, runId);
   }
 
+  // 复盘的结果：有提交 done；run 正常结束却什么都没改 empty；其余（run 失败、开跑前就失败）failed
+  const retroStatus: 'done' | 'empty' | 'failed' = plan ? 'done' : (result.summary?.v3 as { zeroDiff?: boolean } | undefined)?.zeroDiff && attached?.harvested?.outcome.status === 'completed' ? 'empty' : 'failed';
   if (keepCancelled) {
-    for (const i of result.inbox ?? []) await createInboxItem(env.db, env.bus, { ...i, bookId: i.bookId ?? bookId, relatedTaskId: i.relatedTaskId ?? task.id });
+    for (const i of (result.inbox ?? []).filter((x) => v3InboxAllowed(x))) await createInboxItem(env.db, env.bus, { ...i, bookId: i.bookId ?? bookId, relatedTaskId: i.relatedTaskId ?? task.id });
+    if (retroTask && bookId) await retroConsumed(env, task, bookId, runId, 'cancelled', retroStatus);
   } else {
     const { promote: _p, ...persisted } = result;
     const state = await completeTask(env.db, task.id, persisted as TaskResult, completeOpts(env));
     env.bus.publish({ type: 'task_changed', taskId: task.id, book: bookId, state });
-    if (state === 'failed') {
-      await createInboxItem(env.db, env.bus, {
+    // 只在这次真有过 run 时叫醒（账号空出来了）；路由等待自己的结果不叫，否则刚停下的任务会被自己叫醒
+    if (runId) await wakeRouteWaiters(env).catch((err: Error) => env.log.warn({ err: err.message }, 'wakeRouteWaiters failed'));
+    if (retroTask && bookId) await retroConsumed(env, task, bookId, runId, state, retroStatus);
+    // 复盘失败不是主人的事：不发待办。开书 / 写作失败并进这本书的 v3_no_prose（WP-3）
+    if (state === 'failed' && !retroTask && bookId) {
+      const title = (await env.db.select({ title: books.title }).from(books).where(eq(books.id, bookId)).limit(1))[0]?.title ?? bookId;
+      await upsertOpenInbox(env.db, env.bus, {
         kind: 'block',
         bookId,
-        title: `任务失败：${task.kind}（${task.target}）`,
-        body: { taskId: task.id, errorClass: result.errorClass ?? latest.lastErrorClass, message: result.message },
+        title: `《${title}》的写作任务失败了`,
+        body: { taskId: task.id, errorClass: result.errorClass ?? latest.lastErrorClass, message: result.message, detail: result.message ?? '' },
         actions: [
           { id: 'retry', label: '重试' },
-          { id: 'dismiss', label: '忽略' },
+          { id: 'dismiss', label: '知道了' },
         ],
-        dedupeKey: `failed:${task.id}`,
+        dedupeKey: `v3_no_prose:${bookId}`,
         relatedTaskId: task.id,
       });
     }
     await drainOutbox(env, task.id);
   }
   if (bookId) for (const no of landedNew) await publishAccepted(env, bookId, no);
+}
+
+/** 复盘结束（任何终态，包括开跑之前就失败）：v3.batch 效果没记下这次时补记，下一次复盘再过 RETRO_EVERY 批 */
+async function retroConsumed(env: ExecEnv, task: TaskRow, bookId: string, runId: string | null, state: string, status: 'done' | 'empty' | 'failed'): Promise<void> {
+  if (!['done', 'failed', 'cancelled', 'stale', 'blocked'].includes(state)) return;
+  const row = (await env.db.select({ meta: books.meta }).from(books).where(eq(books.id, bookId)).limit(1))[0];
+  const id = runId ?? task.id;
+  if (readV3Meta(row?.meta).retro.lastRunId === id) return;
+  await markRetro(env.db, bookId, { status: state === 'done' ? status : 'failed', runId: id, at: env.nowFn().toISOString() });
 }
 
 function completeOpts(env: ExecEnv): { now?: Date; backoffBaseMs?: number } {
@@ -1513,7 +1581,11 @@ export async function drainOutbox(env: ExecEnv, taskId: string): Promise<boolean
     const followups: TaskSpec[] = [...(res.followups ?? [])];
     if (res.status === 'done') followups.push(...(await env.pipe.onTaskDone(ctx, task, { status: 'done', ...(res.summary ? { summary: res.summary } : {}), ...(res.followups ? { followups: res.followups } : {}), ...(res.chapter ? { chapter: res.chapter } : {}) })));
     for (const f of followups) await enqueueSpec(env, ctx, { ...f, parentTaskId: f.parentTaskId ?? task.id });
-    for (const i of res.inbox ?? []) await createInboxItem(env.db, env.bus, { ...i, bookId: i.bookId ?? task.bookId, relatedTaskId: i.relatedTaskId ?? task.id });
+    for (const i of res.inbox ?? []) {
+      // v3 任务只放行 DESIGN §8.3 的几类（WP-3）
+      if (isV3Kind(task.kind) && !v3InboxAllowed(i)) continue;
+      await createInboxItem(env.db, env.bus, { ...i, bookId: i.bookId ?? task.bookId, relatedTaskId: i.relatedTaskId ?? task.id });
+    }
     if (task.kind === 'harness.canary' && ['done', 'failed', 'blocked'].includes(task.state)) await finishCanary(env, task, task.state === 'done');
     if (task.kind === 'publish' && res.status === 'done') await publishChapterEvents(env, task);
     await env.db.update(tasks).set({ params: withOrch(task.params, { outbox: undefined }), updatedAt: new Date().toISOString() }).where(eq(tasks.id, taskId));

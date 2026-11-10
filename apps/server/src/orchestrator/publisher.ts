@@ -25,8 +25,8 @@ function effectiveLag(cfg: PublishConfig, arcLength: number): number {
   return cfg.lag === 'auto' ? Math.max(arcLength, cfg.min_lag) : Math.max(cfg.lag, cfg.min_lag);
 }
 
-/** 按 cadence 估算每天发多少章（per_slot × 每日槽位数） */
-function slotsPerDay(cfg: PublishConfig, from: Date): number {
+/** 按 cadence 估算每天有几个发布槽位（未来 7 天的平均；乘 per_slot 才是章数） */
+export function slotsPerDay(cfg: PublishConfig, from: Date): number {
   if (cfg.mode !== 'scheduled') return 0;
   try {
     const cron = new Cron(cfg.cadence, { timezone: cfg.timezone });

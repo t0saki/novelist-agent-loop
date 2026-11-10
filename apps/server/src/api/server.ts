@@ -34,6 +34,7 @@ import { register as registerSchedule } from './routes/admin/schedule.js';
 import { register as registerReaders } from './routes/admin/readers.js';
 import { register as registerSettings } from './routes/admin/settings.js';
 import { register as registerImport } from './routes/admin/import.js';
+import { register as registerV3 } from './routes/admin/v3.js';
 
 const PROBLEM_TYPE = 'application/problem+json';
 
@@ -95,7 +96,7 @@ export async function buildServer(deps: AppDeps): Promise<FastifyInstance> {
 
   await app.register(async (scope) => {
     scope.addHook('preHandler', requireRole('admin'));
-    for (const reg of [registerBooks, registerChapters, registerTasks, registerRuns, registerInbox, registerInstructions, registerGenres, registerHarness, registerAccounts, registerRouting, registerSchedule, registerReaders, registerSettings, registerImport]) {
+    for (const reg of [registerBooks, registerV3, registerChapters, registerTasks, registerRuns, registerInbox, registerInstructions, registerGenres, registerHarness, registerAccounts, registerRouting, registerSchedule, registerReaders, registerSettings, registerImport]) {
       await reg(scope, deps);
     }
   });

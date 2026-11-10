@@ -56,6 +56,8 @@ export interface RunResult {
   outcome: Outcome;
   exit: ExitInfo;
   eventCount: number;
+  /** 归一化事件里 t === 'tool_call' 的个数（整个 stdout，reattach 时也从头数） */
+  toolSteps: number;
   /** run 后审计结果（isolation.postRunAudit） */
   audit: { ok: boolean; extraFiles: string[]; tamperedConfig: string[] };
   /** 原始 stdout 文件（zstd 归档由清理任务负责） */
@@ -342,6 +344,7 @@ function createHandle(ctx: HandleCtx): RunHandle {
   const decoder = new StringDecoder('utf8');
   const kept: NEvent[] = [];
   let seq = 0;
+  let toolSteps = 0;
   let offset = 0;
   let lastBeatMtime = 0;
   let lastErrSize = 0;
@@ -352,6 +355,7 @@ function createHandle(ctx: HandleCtx): RunHandle {
     const evs = stamp(spec.runId, seq + 1, bodies);
     seq += bodies.length;
     for (const e of evs) {
+      if (e.t === 'tool_call') toolSteps += 1;
       if (KEEP_FOR_CLASSIFY(e)) kept.push(e);
       if (e.seq > ctx.fromSeq) {
         try {
@@ -491,7 +495,7 @@ function createHandle(ctx: HandleCtx): RunHandle {
     if (audit.tamperedConfig.length && outcome.status === 'completed') {
       outcome = { ...outcome, status: 'failed', errorClass: 'sandbox', message: `home 配置文件被改动：${audit.tamperedConfig.join(', ')}` };
     }
-    return { outcome, exit, eventCount: seq, audit, stdoutFile: lf.stdout, stderrTail };
+    return { outcome, exit, eventCount: seq, toolSteps, audit, stdoutFile: lf.stdout, stderrTail };
   })();
 
   return {

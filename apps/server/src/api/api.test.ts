@@ -435,6 +435,32 @@ describe('routing and settings', () => {
     expect((await admin('GET', '/api/admin/system')).json().settings.maxConcurrentRuns).toBe(7);
   });
 
+  it('autoStart (WP-3): defaults keep it off with maxUnfinishedBooks 3 and the 40/35/20/5 mix; a lengthMix that does not sum to 100 → 400, nothing stored', async () => {
+    const cur = (await admin('GET', '/api/admin/settings')).json();
+    expect(cur.autoStart).toMatchObject({ enabled: false, maxUnfinishedBooks: 3, genreWeights: {}, lengthMix: { short: 40, medium: 35, long: 20, epic: 5 } });
+    const bad = await admin('PUT', '/api/admin/settings', { autoStart: { ...cur.autoStart, lengthMix: { short: 50, medium: 35, long: 20, epic: 5 } } });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().code).toBe('invalid_length_mix');
+    expect((await admin('GET', '/api/admin/settings')).json().autoStart.lengthMix.short).toBe(40);
+    const ok = await admin('PUT', '/api/admin/settings', { autoStart: { ...cur.autoStart, lengthMix: { short: 25, medium: 25, long: 25, epic: 25 }, genreWeights: { xianxia: 2 } } });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().autoStart).toMatchObject({ enabled: false, lengthMix: { short: 25, medium: 25, long: 25, epic: 25 }, genreWeights: { xianxia: 2 } });
+  });
+
+  it('v3.runawayFactor: 0 (off) or ≥ 2; 0.5–1.5 → 400 invalid_runaway_factor; an old stored 1.5 reads back as 2', async () => {
+    for (const bad of [0.5, 1, 1.5]) {
+      const r = await admin('PUT', '/api/admin/settings', { v3: { runawayFactor: bad } });
+      expect(r.statusCode, String(bad)).toBe(400);
+      expect(r.json().code).toBe('invalid_runaway_factor');
+    }
+    expect((await admin('PUT', '/api/admin/settings', { v3: { runawayFactor: 0 } })).json().v3.runawayFactor).toBe(0);
+    expect((await admin('PUT', '/api/admin/settings', { v3: { runawayFactor: 2.5 } })).json().v3.runawayFactor).toBe(2.5);
+    const { zSystemSettings } = await import('@novelist/shared');
+    expect(zSystemSettings.parse({ v3: { runawayFactor: 1.5 } }).v3.runawayFactor).toBe(2);
+    expect(zSystemSettings.parse({}).v3.runawayFactor).toBe(2);
+    await admin('PUT', '/api/admin/settings', { v3: { runawayFactor: 2 } });
+  });
+
   it('instruction files: layers, writes commit to git, builtin read-only', async () => {
     const builtin = (await admin('GET', '/api/admin/instructions/files?scope=builtin')).json();
     expect(builtin.some((f: { path: string; layer: string }) => f.path === 'contract.md' && f.layer === 'S0')).toBe(true);

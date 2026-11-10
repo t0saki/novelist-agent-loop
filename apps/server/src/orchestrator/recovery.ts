@@ -8,6 +8,7 @@ import { books, runs, tasks } from '../db/schema.js';
 import { openRepo } from '../book/repo.js';
 import { clearStaleGitLocks, recoverBook, withRepoLock } from './committer.js';
 import { markRunLost, reattach, ACTIVE_RUN_STATES, type ExecEnv } from './executor.js';
+import { recoverRewinds } from './rewind-v3.js';
 
 /** 把 lease 已过期的 run 接管或判 lost；也用于启动时（lease 一定过期或属于上个进程） */
 export async function reconcileRuns(env: ExecEnv, reattached: Set<Promise<void>>, opts?: { all?: boolean; excludeTasks?: string[] }): Promise<{ reattached: string[]; lost: string[] }> {
@@ -42,6 +43,8 @@ export async function recoverOnStartup(env: ExecEnv, reattached: Set<Promise<voi
   const runsRes = await reconcileRuns(env, reattached, { all: true });
   const { replayed, resetBooks } = await recoverStuckPromotes(env, { foreignOwner: true });
   await sweepDirtyBooks(env);
+  // v3 回退做到一半（提交了、DB 没写）：补做；git 没做完的只清认领
+  await recoverRewinds(env).catch((err: Error) => env.log.warn({ err: err.message }, 'recoverRewinds failed'));
   return { ...runsRes, replayed, resetBooks };
 }
 

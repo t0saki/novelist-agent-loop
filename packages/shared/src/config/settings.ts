@@ -13,6 +13,11 @@ export const AUTO_LENGTH_DEFAULTS = {
   epic: { targetCjk: 500_000, chaptersMin: 30, chaptersMax: 80 },
 };
 
+/** 自动开书的篇幅目标分布（按本数的百分比，和为 100；PUT 设置时检查） */
+export const AUTO_LENGTH_MIX_DEFAULT = { short: 40, medium: 35, long: 20, epic: 5 };
+const zLengthMix = z.object({ short: z.number().min(0).max(100), medium: z.number().min(0).max(100), long: z.number().min(0).max(100), epic: z.number().min(0).max(100) });
+export type LengthMix = z.infer<typeof zLengthMix>;
+
 export const zSystemSettings = z.object({
   /** 当前生效的路由 preset（D2 修订默认：agy-argon） */
   activePreset: z.string().default('agy-argon'),
@@ -40,19 +45,38 @@ export const zSystemSettings = z.object({
     .default({ writerMs: 1_200_000, otherMs: 600_000, dshMs: 900_000 }),
   wallTimeoutMs: z.number().int().default(60 * 60_000),
   workOrderMaxCjk: z.number().int().default(65_000),
+  /** v3 流程的全站设置 */
+  v3: z
+    .object({
+      /** 失控兜底（基准 = 主人一侧的计划章数 max(planned_chapters_initial, plannedFloor)）：写作批开写时已写到基准的 0.75×factor 章，任务单要求三批内收尾；达到 factor× 后再写两批仍未完结，下一批强制收尾，之后按完结处理。0 = 关闭 */
+      // 开着时至少 2：作者合法的计划最多到基准的两倍，低于 2 的倍数会把按计划写的书提前截断。库里旧存的 (0, 2) 读出来按 2（PUT 路由直接拒收）
+      runawayFactor: z
+        .number()
+        .min(0)
+        .max(10)
+        .transform((v) => (v > 0 && v < 2 ? 2 : v))
+        .default(2),
+    })
+    .default({ runawayFactor: 2 }),
   /** 自动开书（v1 的 auto_generate）：默认关闭 */
   autoStart: z
     .object({
       enabled: z.boolean().default(false),
-      /** 同时在写的书达到这个数就不再开新书 */
+      /** 旧键：保持原样、不再读取（phase 3 删除）。生产库里存的是首装时写入的 1 */
       maxActiveBooks: z.number().int().positive().default(1),
+      /** 未完结的自有书（planning / active / paused，不含导入的书）达到这个数就不再开新书 */
+      maxUnfinishedBooks: z.number().int().positive().default(3),
       /** 24 小时内最多自动开几本，0 表示不限 */
       maxPerDay: z.number().int().min(0).default(2),
       /** 参与的题材包；null 表示 pack.yaml 里 auto.enabled 为 true 的包 */
       genres: z.array(z.string()).nullable().default(null),
-      /** 各篇幅档的规模；题材包的 auto.length_hint 决定用哪一档 */
+      /** 题材权重覆盖；缺省用 pack.yaml 的 auto.weight，再缺省 1；0 = 不参与 */
+      genreWeights: z.record(z.string(), z.number().min(0)).default({}),
+      /** 各篇幅档的目标字数 */
       lengths: z.object({ short: zAutoLength, medium: zAutoLength, long: zAutoLength, epic: zAutoLength }).default(AUTO_LENGTH_DEFAULTS),
+      /** 篇幅目标分布（按本数的百分比，和为 100） */
+      lengthMix: zLengthMix.default(AUTO_LENGTH_MIX_DEFAULT),
     })
-    .default({ enabled: false, maxActiveBooks: 1, maxPerDay: 2, genres: null, lengths: AUTO_LENGTH_DEFAULTS }),
+    .default({ enabled: false, maxActiveBooks: 1, maxUnfinishedBooks: 3, maxPerDay: 2, genres: null, genreWeights: {}, lengths: AUTO_LENGTH_DEFAULTS, lengthMix: AUTO_LENGTH_MIX_DEFAULT }),
 });
 export type SystemSettings = z.infer<typeof zSystemSettings>;

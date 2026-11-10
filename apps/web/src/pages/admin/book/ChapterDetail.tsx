@@ -1,7 +1,8 @@
 /** 章节详情：正文、草稿、卡片、delta、评审、gate、债务、run 与章节操作。Owner: lane H。 */
 import { useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
-import type { ChapterAdminDetail, ImpactEstimate, Ok, PublishOverview, RepoFile } from '@novelist/shared';
+import type { BookOverview, ChapterAdminDetail, ImpactEstimate, Ok, PublishOverview, RepoFile } from '@novelist/shared';
+import { ChapterActionModal } from './V3Book';
 import { enc, get, post, put, qs } from '../../../api/client';
 import { useApi, useInvalidate } from '../../../api/hooks';
 import { CodeEditor } from '../../../components/CodeEditor';
@@ -42,6 +43,10 @@ export function ChapterDetailPage({ slug, no }: { slug: string; no: number }) {
   const [pending, setPending] = useState<(typeof ACTIONS)[number] | null>(null);
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
+  const book = useApi<BookOverview>(base);
+  const v3 = book.data?.config.flow === 'v3';
+  const v3Finished = book.data?.status === 'completed' || book.data?.status === 'archived';
+  const [v3Act, setV3Act] = useState<{ kind: 'rewrite' | 'rewrite_from'; no: number } | null>(null);
 
   async function run(a: (typeof ACTIONS)[number], n?: string) {
     setBusy(true);
@@ -102,6 +107,23 @@ export function ChapterDetailPage({ slug, no }: { slug: string; no: number }) {
                 </>
               }
             />
+            {v3 ? (
+              <div className="flex flex-wrap gap-2 mb-4">
+                {/* 新流程：只有直接改（正文页的“手动修改”）、带意见重写、从这里起重写；后两项只对未发布章节 */}
+                {c.publishedAt === null && !v3Finished && (
+                  <Button size="sm" onClick={() => setV3Act({ kind: 'rewrite', no: c.no })}>
+                    带意见重写
+                  </Button>
+                )}
+                {c.publishedAt === null && book.data?.status !== 'archived' && (
+                  <Button size="sm" variant="danger" onClick={() => setV3Act({ kind: 'rewrite_from', no: c.no })}>
+                    从这里起重写
+                  </Button>
+                )}
+                {c.publishedAt !== null && <span className="text-xs text-sub self-center">已发布的章节只能直接改这一章。</span>}
+                <ChapterPublishNow slug={slug} no={no} />
+              </div>
+            ) : (
             <div className="flex flex-wrap gap-2 mb-4">
               {ACTIONS.map((a) => (
                 <Button
@@ -120,6 +142,7 @@ export function ChapterDetailPage({ slug, no }: { slug: string; no: number }) {
               ))}
               <ChapterPublishNow slug={slug} no={no} />
             </div>
+            )}
             <Tabs
               value={sub}
               onChange={setSub}
@@ -196,6 +219,7 @@ export function ChapterDetailPage({ slug, no }: { slug: string; no: number }) {
           </>
         )}
       </Q>
+      {v3Act && <ChapterActionModal slug={slug} act={v3Act} onClose={() => setV3Act(null)} />}
       {pending && (
         <Modal
           title={pending.label}

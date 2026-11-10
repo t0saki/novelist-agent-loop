@@ -92,7 +92,11 @@ export async function claimNext(db: Db, f: ClaimFilter): Promise<TaskRow | null>
       or(eq(tasks.state, 'ready'), and(eq(tasks.state, 'waiting'), isNotNull(tasks.notBefore))),
       or(isNull(tasks.notBefore), lte(tasks.notBefore, now)),
       sql`(${books.id} is null or ${books.status} in ('active','planning','completed') or ${tasks.kind} = 'publish')`,
-      sql`not (coalesce(${books.pausedReason}, '') = 'max_buffer' and ${tasks.kind} in ('chapter.write','book.write'))`,
+      // v3：有主人改写请求在等的书，max_buffer 暂停也放行一批 book.write（改写要在这一批里做）；
+      // 结局批也放行（不受存稿上限限制；prepare 里 buildOrderSpec 按 DB 重算，参数过时最多白跑一次 prepare）
+      sql`not (coalesce(${books.pausedReason}, '') = 'max_buffer' and ${tasks.kind} in ('chapter.write','book.write')
+        and not (${tasks.kind} = 'book.write' and (coalesce(${tasks.params}->>'mode', '') = 'finale'
+          or jsonb_path_exists(coalesce(${books.meta}->'v3'->'ownerRequests', '[]'::jsonb), '$[*] ? (@.status == "waiting")'))))`,
     ];
     if (f.lanes && f.lanes.length > 0) conds.push(inArray(tasks.lane, f.lanes));
     if (f.roles) {
@@ -110,7 +114,16 @@ export async function claimNext(db: Db, f: ClaimFilter): Promise<TaskRow | null>
       .from(tasks)
       .leftJoin(books, eq(tasks.bookId, books.id))
       .where(and(...conds))
-      .orderBy(desc(tasks.priority), desc(sql`coalesce(${books.priority}, 0)`), asc(sql`coalesce(${books.acceptedThrough} - ${books.publishedThrough}, 0)`), asc(tasks.createdAt))
+      // v3（DESIGN §8.2）：存稿还能撑的天数最少的先写，平手时最久没写的先写；旧流程的任务仍按存稿章数
+      .orderBy(
+        desc(tasks.priority),
+        desc(sql`coalesce(${books.priority}, 0)`),
+        asc(
+          sql`case when ${tasks.kind} in ('book.open','book.write','book.retro') then coalesce((${books.meta}->'v3'->'sched'->>'bufferDays')::float8, 999) else coalesce(${books.acceptedThrough} - ${books.publishedThrough}, 0) end`,
+        ),
+        asc(sql`case when ${tasks.kind} in ('book.open','book.write','book.retro') then coalesce(${books.meta}->'v3'->>'lastBatchAt', '') else '' end`),
+        asc(tasks.createdAt),
+      )
       .limit(1)
       .for('update', { of: tasks, skipLocked: true });
     const first = picked[0];

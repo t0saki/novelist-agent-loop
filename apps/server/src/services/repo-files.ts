@@ -10,8 +10,10 @@ import { bookFiles, gitBlobSha, openRepo, P, pathOwner, type BookRepo } from '..
 import { books, chapters, tasks, usageLedger } from '../db/schema.js';
 import { commitOwnerEdit } from '../orchestrator/index.js';
 import { lockChapter } from '../flow/state.js';
+import { syncBibleMeta } from '../flow/library.js';
 import { HttpProblem, badRequest, notFound } from '../api/problem.js';
 import { assertPublishConfig } from './publish-config.js';
+import { setOwnerMessage } from './v3-book.js';
 import { bookDir, requireRel, type BookRow } from '../api/helpers.js';
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
@@ -146,12 +148,19 @@ export async function saveRepoFile(deps: AppDeps, row: BookRow, input: SaveFileI
     await saveBookConfig(deps, row, repo, input.content, input.baseSha);
     return { kind: 'saved', file: await readRepoFile(repo, rel) };
   }
+  // v3：给作者的话不管从哪个编辑器改，都按一次性留言处理（归档旧留言、记 meta）
+  if (rel === 'notes/from-owner.md' && isV3(await bookFiles(repo).config().then((c) => c.config).catch(() => null))) {
+    await setOwnerMessage(deps, row, input.content);
+    return { kind: 'saved', file: await readRepoFile(repo, rel) };
+  }
   const impact = await estimateImpact(deps, row, repo, rel);
   if (impact.needsConfirm && !input.confirm) return { kind: 'needs_confirm', impact };
   await commitOwnerEdit(deps.db, repo, row.id, { files: [{ path: rel, content: input.content }], message: input.message ?? `owner: edit ${rel}`, baseSha: input.baseSha });
   // v3：主人改过的已验收章节锁定，之后的运行不能再改写它
   const ms = /^manuscript\/c(\d{5})\.md$/.exec(rel);
   if (ms && Number(ms[1]) <= row.acceptedThrough && isV3(await bookFiles(repo).config().then((c) => c.config).catch(() => null))) await lockChapter(deps.db, row.id, Number(ms[1]));
+  // v3：主人改了 bible.md → 标签（和还没有的简介）跟着更新，书库摘要按它计数
+  if (rel === 'bible.md' && isV3(await bookFiles(repo).config().then((c) => c.config).catch(() => null))) await syncBibleMeta(deps.db, row.id, input.content);
   return { kind: 'saved', file: await readRepoFile(repo, rel) };
 }
 

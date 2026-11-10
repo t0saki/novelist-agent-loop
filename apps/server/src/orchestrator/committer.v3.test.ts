@@ -53,7 +53,10 @@ function part(no: number, o: { rewrite?: boolean; title?: string; seed?: number;
   };
 }
 
-function plan(s: Setup, o: { parts?: V3CommitPart[]; tail?: V3CommitPlan['tail']; bookYaml?: V3CommitPlan['bookYaml']; key?: string; runId?: string; completed?: V3BatchEffectArgs['completed']; completedOn?: number; hints?: V3Hint[]; baseCommit?: string } = {}): PromotePlan & { v3: V3CommitPlan } {
+function plan(
+  s: Setup,
+  o: { parts?: V3CommitPart[]; tail?: V3CommitPlan['tail']; bookYaml?: V3CommitPlan['bookYaml']; key?: string; runId?: string; completed?: V3BatchEffectArgs['completed']; completedOn?: number; hints?: V3Hint[]; baseCommit?: string; args?: Partial<V3BatchEffectArgs> } = {},
+): PromotePlan & { v3: V3CommitPlan } {
   const parts = o.parts ?? [part(6), part(7), part(8)];
   const runId = o.runId ?? 'run-a';
   const fresh = parts.filter((p) => !p.rewrite);
@@ -69,6 +72,12 @@ function plan(s: Setup, o: { parts?: V3CommitPart[]; tail?: V3CommitPlan['tail']
     noChapterStreak: 0,
     finaleNoMarker: 0,
     hintedShort: [],
+    orderKind: 'book.write',
+    baseCommit: o.baseCommit ?? s.head,
+    runawayBatches: 0,
+    shortEndUsed: false,
+    plannedFloor: null,
+    ...(o.args ?? {}),
   };
   const base = o.baseCommit ?? s.head;
   const tailMessage = `notes: book.write 6–8 run ${runId.slice(0, 8)}`;
@@ -232,12 +241,12 @@ describe('promoteV3', () => {
     expect(row4.cjk).toBe(countCjk(chapterText(4)));
   });
 
-  it('HEAD missing c(from-1) → batch still lands, v3_gap inbox', async () => {
+  it('HEAD missing c(from-1) → batch still lands, no notice', async () => {
     const s = await setup();
     await commitOwnerEdit(t.db, s.repo, s.id, { files: [{ path: 'manuscript/c00005.md', content: null }], message: 'owner: rm c5', baseSha: null });
     const out = await promoteV3(t.db, s.repo, s.task, plan(s), meta);
     expect(out.landed).toEqual([6, 7, 8]);
-    expect(out.notices.map((n) => n.dedupeKey)).toEqual([`v3_gap:${s.id}`]);
+    expect(out.notices).toEqual([]);
     expect(await s.repo.exists('manuscript/c00008.md')).toBe(true);
   });
 
@@ -344,5 +353,207 @@ describe('revertPartialV3 (discarding a pending after a partial promote)', () =>
     expect(await s.repo.isClean()).toBe(true);
     // 没有分章提交时什么都不做
     expect(await revertPartialV3(t.db, s.repo, s.id, { trailerKey: 'tk1@other', baseCommit: s.head })).toEqual([]);
+  });
+
+  it('with runId: refused under the lock when the pending is no longer this run or the batch has its final commit (replayed); otherwise clears the pending', async () => {
+    const pending = { taskId: 'tk1', runId: 'run-a', attempt: 1, stage: 'harvested', runDir: '/x', inDir: '/x/in', snapshotDir: '/x/book', baseCommit: '', manifestFile: null, trailerKey: KEY, route: { profile: 'p', account: null, harness: 'fake', model: null, isolation: 'none', stackHash: 'h' }, failures: 3, createdAt: NOW };
+    const s = await setup({ chapters: 5, meta: { pending: pending as never } });
+    // 重试抢先把整批提交了（最终提交带 Novelist-Task: KEY）
+    await promoteV3(t.db, s.repo, s.task, plan(s), meta);
+    await t.db.update(books).set({ meta: { v3: { ...readV3Meta((await bookRow(s.id)).meta), pending: { ...pending, baseCommit: s.head } } } }).where(eq(books.id, s.id));
+    await expect(revertPartialV3(t.db, s.repo, s.id, { trailerKey: KEY, baseCommit: s.head, runId: 'run-a' })).rejects.toMatchObject({ code: 'landed' });
+    expect(await s.repo.readFile('manuscript/c00006.md')).not.toBeNull();
+    // pending 已经不是这一次的
+    await expect(revertPartialV3(t.db, s.repo, s.id, { trailerKey: KEY, baseCommit: s.head, runId: 'run-x' })).rejects.toMatchObject({ code: 'gone' });
+    // 另一次没提交过的运行：撤回（没有分章）并清掉 pending
+    await t.db.update(books).set({ meta: { v3: { ...readV3Meta((await bookRow(s.id)).meta), pending: { ...pending, runId: 'run-b', trailerKey: 'tk1@run-b' } } } }).where(eq(books.id, s.id));
+    expect(await revertPartialV3(t.db, s.repo, s.id, { trailerKey: 'tk1@run-b', baseCommit: s.head, runId: 'run-b' })).toEqual([]);
+    expect(readV3Meta((await bookRow(s.id)).meta).pending).toBeNull();
+  });
+});
+
+describe('v3.batch effect (phase 2 fields)', () => {
+  it('appends batchLog with baseCommit/finalCommit (only when new chapters land)', async () => {
+    const s = await setup();
+    await promoteV3(t.db, s.repo, s.task, plan(s, { args: { toolSteps: 42 } }), meta);
+    let m = readV3Meta((await bookRow(s.id)).meta);
+    const head1 = await s.repo.head();
+    expect(m.batchLog).toEqual([{ runId: 'run-a', kind: 'write', from: 6, to: 8, baseCommit: s.head, finalCommit: head1, at: NOW, toolSteps: 42 }]);
+    // notes-only commit: no entry
+    await promoteV3(t.db, s.repo, s.task, plan(s, { parts: [], key: 'tk1@run-n', runId: 'run-n', baseCommit: head1 }), meta);
+    m = readV3Meta((await bookRow(s.id)).meta);
+    expect(m.batchLog).toHaveLength(1);
+    // the open batch and a completing batch get their own kinds
+    const head2 = await s.repo.head();
+    await promoteV3(t.db, s.repo, s.task, plan(s, { parts: [part(9)], key: 'tk1@run-f', runId: 'run-f', baseCommit: head2, completed: 'marker' }), meta);
+    m = readV3Meta((await bookRow(s.id)).meta);
+    expect(m.batchLog.map((e) => [e.kind, e.from, e.to, e.baseCommit])).toEqual([
+      ['write', 6, 8, s.head],
+      ['finale', 9, 9, head2],
+    ]);
+  });
+  it('retro effect keeps streaks and hints, sets retro.afterBatches', async () => {
+    const hints: V3Hint[] = [{ kind: 'short', text: '旧提示', chapter: 4, rewrite: 4, at: NOW }];
+    const batchLog = [1, 2, 3, 4].map((i) => ({ runId: `r${i}`, kind: 'write' as const, from: i, to: i, baseCommit: 'b', finalCommit: 'f', at: NOW }));
+    const s = await setup({ chapters: 5, meta: { hints, noChapterStreak: 2, emptyStreak: 1, finaleNoMarker: 1, hintedShort: [4], batchLog } });
+    await promoteV3(
+      t.db,
+      s.repo,
+      s.task,
+      plan(s, { parts: [], tail: [{ path: 'notes/retro.md', content: '1. 少写景。\n' }], key: 'tk1@run-r', runId: 'run-r', hints: [], args: { orderKind: 'book.retro', noChapterStreak: 0, finaleNoMarker: 0, hintedShort: [] } }),
+      meta,
+    );
+    const b = await bookRow(s.id);
+    const m = readV3Meta(b.meta);
+    expect(m.hints).toEqual(hints);
+    expect(m).toMatchObject({ noChapterStreak: 2, emptyStreak: 1, finaleNoMarker: 1, hintedShort: [4] });
+    expect(m.retro).toEqual({ afterBatches: 4, lastAt: NOW, lastRunId: 'run-r', lastStatus: 'done' });
+    expect(m.batchLog).toHaveLength(4);
+    expect(b.acceptedThrough).toBe(5);
+    expect(await s.repo.readFile('notes/retro.md')).toBe('1. 少写景。\n');
+  });
+  it('completed backstop stored; completedNote short stored', async () => {
+    const s = await setup();
+    await promoteV3(t.db, s.repo, s.task, plan(s, { completed: 'backstop', args: { completedNote: 'short' } }), meta);
+    const b = await bookRow(s.id);
+    expect(b.status).toBe('completed');
+    expect(readV3Meta(b.meta)).toMatchObject({ completedReason: 'backstop', completedNote: 'short' });
+  });
+  it('runawayBatches, shortEndUsed, plannedFloor and feedback written', async () => {
+    const s = await setup();
+    await promoteV3(t.db, s.repo, s.task, plan(s, { args: { runawayBatches: 2, shortEndUsed: true, plannedFloor: 33, feedback: { from: 6, to: 8, phrases: ['甲乙丙丁'] } } }), meta);
+    expect(readV3Meta((await bookRow(s.id)).meta)).toMatchObject({ runawayBatches: 2, shortEndUsed: true, plannedFloor: 33, feedback: { from: 6, to: 8, phrases: ['甲乙丙丁'] } });
+  });
+  it('batchNote + book.yaml batch patch applied', async () => {
+    const s = await setup({ chapters: 5, batch: 5 });
+    const note = { from: 5, to: 4, steps: 230, runId: 'run-a', at: NOW };
+    await promoteV3(t.db, s.repo, s.task, plan(s, { bookYaml: [{ path: ['v3', 'batch'], value: 4 }], args: { batchNote: note } }), meta);
+    expect(readV3Meta((await bookRow(s.id)).meta).batchNote).toEqual(note);
+    expect((await s.repo.readFile('book.yaml')) as string).toMatch(/\bbatch: 4\b/);
+  });
+  it('finaleNoMarkerAlerted set by the alert, cleared when finaleNoMarker is 0', async () => {
+    const s = await setup();
+    await promoteV3(t.db, s.repo, s.task, plan(s, { args: { finaleNoMarker: 2, finaleNoMarkerAlert: true } }), meta);
+    expect(readV3Meta((await bookRow(s.id)).meta).finaleNoMarkerAlerted).toBe(true);
+    const h1 = await s.repo.head();
+    await promoteV3(t.db, s.repo, s.task, plan(s, { parts: [part(9)], key: 'tk1@run-b', runId: 'run-b', baseCommit: h1, args: { finaleNoMarker: 3 } }), meta);
+    expect(readV3Meta((await bookRow(s.id)).meta)).toMatchObject({ finaleNoMarker: 3, finaleNoMarkerAlerted: true });
+    const h2 = await s.repo.head();
+    await promoteV3(t.db, s.repo, s.task, plan(s, { parts: [part(10)], key: 'tk1@run-c', runId: 'run-c', baseCommit: h2, args: { finaleNoMarker: 0 } }), meta);
+    expect(readV3Meta((await bookRow(s.id)).meta)).toMatchObject({ finaleNoMarker: 0, finaleNoMarkerAlerted: false });
+  });
+});
+
+describe('WP-2: serverTail, owner message receipt, owner request results', () => {
+  const msg = (sha: string) => ({ id: 'm1', text: '多写对话。', sha, setAt: NOW, readIn: null, archivedPath: null, status: 'waiting' as const });
+  it('serverTail lands in the final commit when HEAD still has the expected blob; the effect records the receipt', async () => {
+    const s0 = await setup();
+    await commitOwnerEdit(t.db, s0.repo, s0.id, { files: [{ path: 'notes/from-owner.md', content: '多写对话。\n' }], message: 'owner: msg', baseSha: null });
+    const sha = (await s0.repo.blobShas(['notes/from-owner.md']))['notes/from-owner.md']!;
+    await t.db.update(books).set({ meta: { v3: { ...readV3Meta((await bookRow(s0.id)).meta), ownerMessage: msg(sha) } } }).where(eq(books.id, s0.id));
+    const base = await s0.repo.head();
+    const p = plan(s0, { baseCommit: base, args: { ownerMessageRead: { sha, kind: 'write', from: 6, to: 8, at: NOW, runId: 'run-a', archivedPath: 'notes/archive/from-owner/20261110-0000.md' } } });
+    p.v3.serverTail = [
+      { path: 'notes/from-owner.md', content: '', expectSha: sha },
+      { path: 'notes/archive/from-owner/20261110-0000.md', content: '多写对话。\n', expectSha: null },
+    ];
+    await promoteV3(t.db, s0.repo, s0.task, p, meta);
+    expect(await s0.repo.readFile('notes/from-owner.md')).toBe('');
+    expect(await s0.repo.readFile('notes/archive/from-owner/20261110-0000.md')).toBe('多写对话。\n');
+    const last = (await commitsSince(s0.repo, base)).at(-1)!;
+    expect(await filesOf(s0.repo, last.sha)).toContain('notes/from-owner.md');
+    const m = readV3Meta((await bookRow(s0.id)).meta);
+    expect(m.ownerMessage).toBeNull();
+    expect(m.ownerMessages[0]).toMatchObject({ id: 'm1', status: 'read', archivedPath: 'notes/archive/from-owner/20261110-0000.md', readIn: { kind: 'write', from: 6, to: 8, runId: 'run-a' } });
+  });
+
+  it('owner replaced the message during the run → serverTail skipped as a group, new message kept and still waiting', async () => {
+    const s0 = await setup();
+    await commitOwnerEdit(t.db, s0.repo, s0.id, { files: [{ path: 'notes/from-owner.md', content: '旧话。\n' }], message: 'owner: msg', baseSha: null });
+    const oldSha = (await s0.repo.blobShas(['notes/from-owner.md']))['notes/from-owner.md']!;
+    const base = await s0.repo.head();
+    await commitOwnerEdit(t.db, s0.repo, s0.id, { files: [{ path: 'notes/from-owner.md', content: '新话。\n' }], message: 'owner: msg2', baseSha: null });
+    const newSha = (await s0.repo.blobShas(['notes/from-owner.md']))['notes/from-owner.md']!;
+    await t.db.update(books).set({ meta: { v3: { ...readV3Meta((await bookRow(s0.id)).meta), ownerMessage: msg(newSha) } } }).where(eq(books.id, s0.id));
+    const p = plan(s0, { baseCommit: base, args: { ownerMessageRead: { sha: oldSha, kind: 'write', from: 6, to: 8, at: NOW, runId: 'run-a', archivedPath: 'notes/archive/from-owner/x.md' } } });
+    p.v3.serverTail = [
+      { path: 'notes/from-owner.md', content: '', expectSha: oldSha },
+      { path: 'notes/archive/from-owner/x.md', content: '旧话。\n', expectSha: null },
+    ];
+    const out = await promoteV3(t.db, s0.repo, s0.task, p, meta);
+    expect(out.landed).toEqual([6, 7, 8]);
+    expect(await s0.repo.readFile('notes/from-owner.md')).toBe('新话。\n');
+    expect(await s0.repo.exists('notes/archive/from-owner/x.md')).toBe(false);
+    expect(await s0.repo.exists('drafts/owner-conflicts/notes/from-owner.md')).toBe(false);
+    expect(readV3Meta((await bookRow(s0.id)).meta).ownerMessage).toMatchObject({ sha: newSha, status: 'waiting' });
+  });
+
+  it('owner request results: landed rewrite → done, otherwise not_done; replaced text extra committed with the rewrite', async () => {
+    const reqs = [
+      { id: 'q4', kind: 'rewrite' as const, chapter: 4, note: '改', at: NOW, status: 'waiting' as const },
+      { id: 'q3', kind: 'rewrite' as const, chapter: 3, note: '也改', at: NOW, status: 'waiting' as const },
+    ];
+    const s0 = await setup({ chapters: 5, meta: { ownerRequests: reqs } });
+    const rw = { ...part(4, { rewrite: true, chars: 2000 }), extra: [{ path: 'drafts/replaced/20261110T000000/c00004.md', content: chapterText(4) }] };
+    await promoteV3(t.db, s0.repo, s0.task, plan(s0, { parts: [rw, part(6)], args: { ownerRequestResults: [{ id: 'q4', chapter: 4 }, { id: 'q3', chapter: 3 }] } }), meta);
+    const m = readV3Meta((await bookRow(s0.id)).meta);
+    expect(m.ownerRequests.map((r) => [r.id, r.status, r.runId])).toEqual([
+      ['q4', 'done', 'run-a'],
+      ['q3', 'not_done', 'run-a'],
+    ]);
+    expect(await s0.repo.readFile('drafts/replaced/20261110T000000/c00004.md')).toBe(chapterText(4));
+  });
+
+  it('owner request results when the run was not final (crash / timeout / nothing landed): a landed rewrite is still done, the rest stays waiting', async () => {
+    const reqs = [
+      { id: 'q4', kind: 'rewrite' as const, chapter: 4, note: '改', at: NOW, status: 'waiting' as const },
+      { id: 'q3', kind: 'rewrite' as const, chapter: 3, note: '也改', at: NOW, status: 'waiting' as const },
+    ];
+    const s0 = await setup({ chapters: 5, meta: { ownerRequests: reqs } });
+    const rw = part(4, { rewrite: true, chars: 2000 });
+    await promoteV3(t.db, s0.repo, s0.task, plan(s0, { parts: [rw], args: { ownerRequestResults: [{ id: 'q4', chapter: 4, final: false }, { id: 'q3', chapter: 3, final: false }] } }), meta);
+    const m = readV3Meta((await bookRow(s0.id)).meta);
+    expect(m.ownerRequests.map((r) => [r.id, r.status])).toEqual([
+      ['q4', 'done'],
+      ['q3', 'waiting'],
+    ]);
+    expect(m.ownerRequests[1]?.runId).toBeUndefined();
+  });
+
+  it('every planned chapter pushed out by owner edits → serverTail not applied, message stays waiting (no false receipt)', async () => {
+    const s0 = await setup();
+    await commitOwnerEdit(t.db, s0.repo, s0.id, { files: [{ path: 'notes/from-owner.md', content: '多写对话。\n' }], message: 'owner: msg', baseSha: null });
+    const sha = (await s0.repo.blobShas(['notes/from-owner.md']))['notes/from-owner.md']!;
+    await t.db.update(books).set({ meta: { v3: { ...readV3Meta((await bookRow(s0.id)).meta), ownerMessage: msg(sha) } } }).where(eq(books.id, s0.id));
+    const base = await s0.repo.head();
+    // 运行期间主人自己写了第 6 章：本批唯一的新章被顶掉
+    await commitOwnerEdit(t.db, s0.repo, s0.id, { files: [{ path: 'manuscript/c00006.md', content: chapterText(6) }], message: 'owner: c6', baseSha: null });
+    const p = plan(s0, { parts: [part(6)], baseCommit: base, args: { ownerMessageRead: { sha, kind: 'write', from: 6, to: 6, at: NOW, runId: 'run-a', archivedPath: 'notes/archive/from-owner/y.md' } } });
+    p.v3.serverTail = [
+      { path: 'notes/from-owner.md', content: '', expectSha: sha },
+      { path: 'notes/archive/from-owner/y.md', content: '多写对话。\n', expectSha: null },
+    ];
+    const out = await promoteV3(t.db, s0.repo, s0.task, p, meta);
+    expect(out.landed).toEqual([]);
+    expect(await s0.repo.readFile('notes/from-owner.md')).toBe('多写对话。\n');
+    expect(await s0.repo.exists('notes/archive/from-owner/y.md')).toBe(false);
+    expect(readV3Meta((await bookRow(s0.id)).meta).ownerMessage).toMatchObject({ sha, status: 'waiting' });
+  });
+
+  it('receipt range is recomputed from what actually landed', async () => {
+    const s0 = await setup();
+    await commitOwnerEdit(t.db, s0.repo, s0.id, { files: [{ path: 'notes/from-owner.md', content: '多写对话。\n' }], message: 'owner: msg', baseSha: null });
+    const sha = (await s0.repo.blobShas(['notes/from-owner.md']))['notes/from-owner.md']!;
+    await t.db.update(books).set({ meta: { v3: { ...readV3Meta((await bookRow(s0.id)).meta), ownerMessage: msg(sha) } } }).where(eq(books.id, s0.id));
+    const base = await s0.repo.head();
+    // 主人写了第 8 章：6、7 落地
+    await commitOwnerEdit(t.db, s0.repo, s0.id, { files: [{ path: 'manuscript/c00008.md', content: chapterText(8) }], message: 'owner: c8', baseSha: null });
+    const p = plan(s0, { baseCommit: base, args: { ownerMessageRead: { sha, kind: 'write', from: 6, to: 8, at: NOW, runId: 'run-a', archivedPath: 'notes/archive/from-owner/z.md' } } });
+    p.v3.serverTail = [
+      { path: 'notes/from-owner.md', content: '', expectSha: sha },
+      { path: 'notes/archive/from-owner/z.md', content: '多写对话。\n', expectSha: null },
+    ];
+    expect((await promoteV3(t.db, s0.repo, s0.task, p, meta)).landed).toEqual([6, 7]);
+    expect(readV3Meta((await bookRow(s0.id)).meta).ownerMessages[0]?.readIn).toMatchObject({ from: 6, to: 7 });
   });
 });

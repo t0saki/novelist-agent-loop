@@ -1,4 +1,4 @@
-import type { AuthMode, BookStatus, ChapterWorkflowState, InboxItem, QualityTier, RoleId, RunState, TaskState } from '@novelist/shared';
+import type { AuthMode, BookStatus, ChapterWorkflowState, InboxItem, QualityTier, RoleId, RunState, TaskState, V3DraftRow, V3Length, V3OwnerRequestView, V3StatusKind } from '@novelist/shared';
 
 export type Tone = 'neutral' | 'ok' | 'warn' | 'danger' | 'info' | 'accent';
 
@@ -133,3 +133,47 @@ export const CIRCUIT_LABEL: Record<string, { label: string; tone: Tone }> = {
 export const WINDOW_LABEL: Record<string, string> = { five_hour: '5 小时', '5h': '5 小时', seven_day: '7 天', '7d': '7 天', daily: '每日', minute: '每分钟' };
 
 export const INSTALL_TIER_LABEL: Record<string, string> = { blessed: '官方认证', probed: '已探测', unknown: '未验证' };
+
+// ───────── 新流程（v3）的书 ─────────
+export const V3_LENGTH_LABEL: Record<V3Length, string> = { short: '短篇', medium: '中篇', long: '长篇', epic: '超长篇' };
+
+export const V3_STATUS_TONE: Record<V3StatusKind, Tone> = {
+  draft: 'neutral',
+  opening: 'accent',
+  writing: 'accent',
+  finale: 'accent',
+  retro: 'info',
+  harvesting: 'info',
+  queued: 'info',
+  waiting_quota: 'warn',
+  waiting_account: 'warn',
+  waiting_retry: 'warn',
+  needs_owner: 'danger',
+  buffer_full: 'ok',
+  paused: 'warn',
+  completed: 'accent',
+  archived: 'neutral',
+  idle: 'neutral',
+  rewinding: 'info',
+};
+
+export const V3_RUN_KIND_LABEL: Record<string, string> = { 'book.open': '开书', 'book.write': '写作', 'book.retro': '复盘', finale: '结局' };
+
+export const V3_DRAFT_KIND_LABEL: Record<V3DraftRow['kind'], string> = {
+  unfinished: '没写完的残稿',
+  rewrite: '擅自改写的旧章',
+  dup: '重复的稿',
+  pre: '旧残稿',
+  retro: '复盘时改的正文',
+  owner_conflict: '和主人冲突的版本',
+  rewound: '回退时移走的',
+  replaced: '被替换的旧版',
+  other: '其他',
+};
+
+export const V3_REQUEST_STATUS_LABEL: Record<V3OwnerRequestView['status'], { label: string; tone: Tone }> = {
+  waiting: { label: '等待', tone: 'warn' },
+  done: { label: '已改写', tone: 'ok' },
+  not_done: { label: '没有改', tone: 'neutral' },
+  dropped: { label: '已作废', tone: 'neutral' },
+};

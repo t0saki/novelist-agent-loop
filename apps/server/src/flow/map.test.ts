@@ -27,8 +27,14 @@ describe('path and heading helpers', () => {
     expect(parsePlannedChapters('一些话\n计划：共 18 章\n')).toBe(18);
     expect(parsePlannedChapters('计划共12章')).toBe(12);
     expect(parsePlannedChapters('没有计划')).toBeNull();
-    expect(parseBibleHead('# 《长夜》\n一句话：一个人在长夜里等天亮。\n标签：悬疑')).toEqual({ title: '长夜', blurb: '一个人在长夜里等天亮。' });
-    expect(parseBibleHead('# 长夜\n一句话：x')).toEqual({ title: null, blurb: 'x' });
+    expect(parseBibleHead('# 《长夜》\n一句话：一个人在长夜里等天亮。\n标签：悬疑')).toEqual({ title: '长夜', blurb: '一个人在长夜里等天亮。', tags: ['悬疑'] });
+    expect(parseBibleHead('# 长夜\n一句话：x')).toEqual({ title: null, blurb: 'x', tags: null });
+  });
+  it('parseBibleHead returns tags from line 3 (verbatim, separators 、，, / ；, first 8)', () => {
+    expect(parseBibleHead('# 《长夜》\n一句话：等天亮。\n标签：悬疑、成长，江湖 / 慢热；群像\n').tags).toEqual(['悬疑', '成长', '江湖', '慢热', '群像']);
+    expect(parseBibleHead('# 《长夜》\n- 标签: a,b\n').tags).toEqual(['a', 'b']);
+    expect(parseBibleHead('# 《长夜》\n标签：1、2、3、4、5、6、7、8、9、10\n').tags).toHaveLength(8);
+    expect(parseBibleHead('# 《长夜》\n一句话：x\n甲\n乙\n丙\n标签：太远了\n').tags).toBeNull();
   });
 });
 
@@ -151,6 +157,21 @@ describe('planHarvest: rewrites and frozen chapters', () => {
     expect(tailPaths(p)).toContain('drafts/c00004.rewrite.md');
     expect(p.hints.find((h) => h.kind === 'rewrite_rejected')?.text).toBe('第 4 章的改写比原版短了三成以上，保留了原版，改写稿在 drafts/c00004.rewrite.md。');
   });
+  it('owner rewrite: a shorter text passes the looser floor and the old version goes to drafts/replaced/<ts>/; a stub is rejected', () => {
+    const base = chapterText(4, 4000);
+    const input = (chars: number) =>
+      mapInput({ order: orderSpec({ allowRewrite: [4], ownerRequests: [{ id: 'q', chapter: 4, note: '改' }] }), files: [edited(4, chars, 44), ...notesFor(6, 6)], baseChapters: new Map([[4, bodyOf(base)]]), ownerRewrites: [4], ownerRewriteBase: new Map([[4, base]]) });
+    const ok = planHarvest(input(2200));
+    expect(ok.rewrites.map((r) => r.no)).toEqual([4]);
+    expect(ok.rewrites[0]?.extra).toEqual([{ path: 'drafts/replaced/20261110T000000/c00004.md', content: base }]);
+    const stub = planHarvest(input(1200));
+    expect(stub.rewrites).toEqual([]);
+    expect(tailPaths(stub)).toContain('drafts/c00004.rewrite.md');
+    expect(stub.hints.find((h) => h.kind === 'rewrite_rejected')?.text).toBe('第 4 章的改写太短了，不到原版的一半，保留了原版，改写稿在 drafts/c00004.rewrite.md。');
+    // 不是主人要求的改写：同样的 2200 字照旧按“短三成”拒收
+    const plain = planHarvest(mapInput({ order: orderSpec({ allowRewrite: [4] }), files: [edited(4, 2200, 44), ...notesFor(6, 6)], baseChapters: new Map([[4, bodyOf(base)]]) }));
+    expect(plain.rewrites).toEqual([]);
+  });
   it('authorised rewrite truncated rejected', () => {
     const f = edited(4, 4200, 44);
     f.text = f.text.replace(/。\s*$/u, '，然后');
@@ -158,10 +179,20 @@ describe('planHarvest: rewrites and frozen chapters', () => {
     expect(p.rewrites).toEqual([]);
     expect(p.hints.find((h) => h.kind === 'rewrite_rejected')?.text).toContain('结尾停在半句话');
   });
-  it('accepted chapter deletes stale drafts/cNNNNN.md', () => {
-    const p = planHarvest(mapInput({ files: [file('manuscript/c00006.md', chapterText(6)), file('drafts/c00006.md', '旧残稿', { isNew: false, baseText: '更旧' }), ...notesFor(6, 6)], draftsAtBase: ['drafts/c00006.md', 'drafts/c00009.md'] }));
-    expect(p.newChapters[0]?.extra).toEqual([{ path: 'drafts/c00006.md', content: null }]);
+  it('accepted chapter moves stale drafts/cNNNNN.md to drafts/discarded/ (the run version when it edited it)', () => {
+    const p = planHarvest(mapInput({ files: [file('manuscript/c00006.md', chapterText(6)), file('drafts/c00006.md', '旧残稿', { isNew: false, baseText: '更旧' }), ...notesFor(6, 6)], draftsAtBase: new Map([['drafts/c00006.md', '更旧'], ['drafts/c00009.md', '九']]) }));
+    expect(p.newChapters[0]?.extra).toEqual([
+      { path: 'drafts/c00006.md', content: null },
+      { path: 'drafts/discarded/c00006.md', content: '旧残稿' },
+    ]);
     expect(tailPaths(p)).not.toContain('drafts/c00006.md');
+  });
+  it('stale drafts/cNNNNN.md moved to drafts/discarded/ when the chapter lands (base text; name taken → -2)', () => {
+    const p = planHarvest(mapInput({ files: [file('manuscript/c00006.md', chapterText(6)), ...notesFor(6, 6)], draftsAtBase: new Map([['drafts/c00006.md', '旧残稿'], ['drafts/discarded/c00006.md', '']]) }));
+    expect(p.newChapters[0]?.extra).toEqual([
+      { path: 'drafts/c00006.md', content: null },
+      { path: 'drafts/discarded/c00006-2.md', content: '旧残稿' },
+    ]);
   });
 });
 
@@ -342,5 +373,67 @@ describe('planHarvest: robustness of splitting and numbering (review fixes)', ()
     const fresh = planHarvest(mapInput({ order: orderSpec({ allowRewrite: [4] }), files: [1, 2, 3, 4, 5].map((n) => file(`chapters/00${n}.md`, chapterText(n, 3200, `新${n}`, 500 + n))).concat(notesFor(6, 10)), baseChapters: new Map([[4, bodyOf(c4)]]) }));
     expect(nos(fresh)).toEqual([6, 7, 8, 9, 10]);
     expect(fresh.rewrites).toEqual([]);
+  });
+});
+
+describe('planHarvest: retro runs (no prose lands)', () => {
+  const retro = orderSpec({ mode: 'retro', kind: 'book.retro', from: 21, count: 0, accepted: 20, planned: 50, retro: { from: 1, to: 20 } });
+  const longNote = (n: number) => Array.from({ length: n }, (_, i) => `- 人物${i}：在场，${prose(30, i + 300)}`).join('\n');
+
+  it('retro: manuscript edit → drafts/cNNNNN.retro.md, no chapters', () => {
+    const c3 = chapterText(3);
+    const p = planHarvest(
+      mapInput({
+        order: retro,
+        length: 'long',
+        files: [
+          file('manuscript/c00003.md', `${c3.trimEnd()}\n\n${prose(300, 33)}\n`, { isNew: false, baseText: c3 }),
+          file('manuscript/c00021.md', chapterText(21)),
+          file('scratch/第二十二章.md', chapterText(22)),
+          file('manuscript/notes.txt', '随手记'),
+          file('notes/retro.md', '1. 少写景。\n'),
+          file('outline.md', '计划：共 50 章\n（复盘：已对照）\n', { isNew: false, baseText: '计划：共 50 章\n' }),
+        ],
+      }),
+    );
+    expect(p.newChapters).toEqual([]);
+    expect(p.rewrites).toEqual([]);
+    expect(tailPaths(p)).toEqual(['drafts/c00003.retro.md', 'drafts/c00021.retro.md', 'drafts/c00022.retro.md', 'drafts/retro/manuscript/notes.txt', 'notes/retro.md', 'outline.md']);
+    expect(p.completed).toBe(false);
+    expect(p.zeroDiff).toBe(false);
+  });
+  it('retro clean exit: notes shrink archived without hint', () => {
+    const base = longNote(40);
+    const p = planHarvest(mapInput({ order: retro, length: 'long', cleanExit: true, files: [file('notes/cast.md', '- 人物0：在场。\n', { isNew: false, baseText: base })] }));
+    expect(tailPaths(p)).toEqual(['notes/archive/cast-c00020.md', 'notes/cast.md']);
+    expect(kinds(p)).toEqual([]);
+  });
+  it('retro killed/timed out: notes shrink → notes_shrunk hint', () => {
+    const base = longNote(40);
+    const p = planHarvest(mapInput({ order: retro, length: 'long', cleanExit: false, files: [file('notes/cast.md', '- 人物0：在场。\n', { isNew: false, baseText: base })] }));
+    expect(tailPaths(p)).toContain('notes/archive/cast-c00020.md');
+    expect(kinds(p)).toEqual(['notes_shrunk']);
+    expect(p.hints[0]?.at).toBe('2026-11-10T00:00:00.000Z');
+  });
+  it('retro keeps previous hints (with their at), hintedShort, streak-ish fields', () => {
+    const hints = [
+      { kind: 'short' as const, chapter: 19, rewrite: 19, text: '第 19 章补一补', at: AT },
+      { kind: 'unfinished' as const, chapter: 21, sticky: true, text: '第 21 章没写完', at: AT },
+    ];
+    const p = planHarvest(mapInput({ order: retro, length: 'long', meta: { hints, hintedShort: [19], finaleNoMarker: 1, runawayBatches: 2, shortEndUsed: true, plannedFloor: 44 }, files: [file('notes/retro.md', '1. x\n')] }));
+    expect(p.hints).toEqual([
+      { kind: 'unfinished', chapter: 21, sticky: true, text: '第 21 章没写完', at: AT },
+      { kind: 'short', chapter: 19, rewrite: 19, text: '第 19 章补一补', at: AT },
+    ]);
+    expect(p).toMatchObject({ hintedShort: [19], finaleNoMarker: 1, runawayBatches: 2, shortEndUsed: true, plannedFloor: 44, completed: false });
+  });
+  it('retro outline plan change → plannedChapters (clamped like a write)', () => {
+    const p = planHarvest(mapInput({ order: retro, length: 'long', plannedInitial: 50, files: [file('outline.md', '计划：共 56 章\n', { isNew: false, baseText: '计划：共 50 章\n' })] }));
+    expect(p.plannedChapters).toBe(56);
+    const big = planHarvest(mapInput({ order: retro, length: 'long', plannedInitial: 50, files: [file('outline.md', '计划：共 500 章\n', { isNew: false, baseText: '计划：共 50 章\n' })] }));
+    expect(big.plannedChapters).toBe(100);
+  });
+  it('retro with no changes → zeroDiff', () => {
+    expect(planHarvest(mapInput({ order: retro, length: 'long', files: [] }))).toMatchObject({ zeroDiff: true, changed: 0, newChapters: [], tail: [] });
   });
 });

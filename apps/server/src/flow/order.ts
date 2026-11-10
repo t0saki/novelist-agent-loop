@@ -5,16 +5,19 @@
  */
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { desc, eq, ne } from 'drizzle-orm';
+import { and, desc, eq, lte } from 'drizzle-orm';
 import { V3_TITLE_PLACEHOLDER, chapterId } from '@novelist/shared';
-import { books } from '../db/schema.js';
+import { books, chapters } from '../db/schema.js';
+import { loadSystemSettings } from '../orchestrator/routing.js';
 import type { BookHandle, PipelineContext, TaskResult, TaskRow } from '../pipeline/types.js';
-import { NOTE_BUDGETS, isFrozenChapter, noteSize } from './contract.js';
+import { BUFFER_FULL_WAIT, ENDING_LIST_RE, NOTE_BUDGETS, isFrozenChapter, noteSize } from './contract.js';
 
 export { noteSize };
-import { effortFor, type FlowStep } from './decide.js';
+import { effortFor, endingPhase, finaleBypassesBuffer, finaleCount, plannedUpper, runawayBaseOf, type FlowStep } from './decide.js';
+import { shortRecent } from './feedback.js';
+import { loadLibrary, renderLibraryV3 } from './library.js';
 import { readV3Meta } from './state.js';
-import type { OrderMode, OrderSpec, V3Hint } from './types.js';
+import type { OrderMode, OrderSpec, V3BookMeta, V3Hint, V3OwnerRequest } from './types.js';
 
 export const ORDER_TEMPLATES_DIR: string = new URL('./templates/', import.meta.url).pathname;
 
@@ -85,20 +88,81 @@ export function selectHints(hints: V3Hint[], frozen: { publishedThrough: number;
 }
 
 export interface OrderExtra {
-  /** renderLibrary 的结果（只有开书任务单用） */
+  /** renderLibraryV3 的结果（只有开书任务单用） */
   library: string;
-  /** 必读清单（"- …" 行，换行分隔；不含主人的话那一行） */
+  /** 必读清单（"- …" 行，换行分隔） */
   mustRead: string;
   /** noteBudgetLines 的结果，换行分隔 */
   budgets: string;
-  /** notes/from-owner.md 在 HEAD 非空：必读清单末尾加一行 */
+  /** notes/from-owner.md 在 HEAD 非空：开书 / 写作 / 结局批的任务单加一行 owner_line（复盘从不加） */
   ownerNote: boolean;
+}
+
+/** §5.1：主人的话（只读） */
+export const OWNER_LINE = '主人给你留了话：notes/from-owner.md（只读）。动笔前先读一遍，照着做。';
+
+/**
+ * 写作批 / 结局批的“结局”一节（p2-plan §5.6）：收尾阶段、失控提醒、强制收尾。都不适用时 ''。
+ * 不给作者任何要自己核对的字数。
+ */
+export function renderEnding(spec: Pick<OrderSpec, 'from' | 'planned' | 'accepted' | 'phase' | 'forced' | 'runawayWarn' | 'runawayBase' | 'endingListExists'>): string {
+  const lines: string[] = [];
+  const remaining = Math.max(spec.planned - spec.accepted, 0);
+  if (spec.phase === 'closing') {
+    lines.push(
+      spec.endingListExists
+        ? `全书计划共 ${spec.planned} 章，还剩约 ${remaining} 章。照 outline.md 的"结局章节清单"往下写；清单要调整就直接改，未收线索的去处同步改在 notes/threads.md。`
+        : `全书计划共 ${spec.planned} 章，还剩约 ${remaining} 章。动笔前先在 outline.md 里加一节"## 结局章节清单"：从第 ${spec.from} 章到全书结束，每章一行写要发生什么；再给 notes/threads.md 里每一条未收线索标上去处——在第几章回收，或者明确放弃。然后照清单写这一批。`,
+    );
+  }
+  if (spec.runawayWarn) lines.push(`这本书已经写了 ${spec.accepted} 章，比当初计划的 ${spec.runawayBase ?? spec.planned} 章多出很多。按大纲在三批之内收尾，不再开新的支线。`);
+  if (spec.forced) lines.push('这是最后一批：把剩下的情节在这一批里收束，写完全书，最后一章末尾单独一行写"（全书完）"。');
+  if (lines.length === 0) return '';
+  const heading = spec.forced ? '## 这是最后一批' : spec.phase === 'closing' ? '## 收尾阶段' : '## 提醒';
+  return `${heading}\n${lines.join('\n')}\n`;
+}
+
+/** “上一批的统计”（p2-plan §5.6）：重复的说法（不带次数）、近期偏短。都没有时 '' */
+export function renderFeedback(f: OrderSpec['feedback'] | undefined): string {
+  if (!f) return '';
+  const lines: string[] = [];
+  if (f.phrases.length > 0) {
+    const range = f.range ? `（第 ${f.range[0]}–${f.range[1]} 章）` : '';
+    lines.push(`- 上一批${range}里重复较多的说法：${f.phrases.map((p) => `「${p}」`).join('')}。这一批换着写。`);
+  }
+  if (f.shortRecent) lines.push('- 近期的章节偏短，这一批每章写足。');
+  if (lines.length === 0) return '';
+  return `## 上一批的统计（服务器数的，仅供参考）\n${lines.join('\n')}\n`;
+}
+
+/** 结局批第 1 条：结局章节清单还没有 / 已经有 */
+function endingListLine(exists: boolean | undefined): string {
+  return exists
+    ? '照 outline.md 的"结局章节清单"写；清单要调整就直接改，notes/threads.md 里每一条未收线索都要有去处。'
+    : '动笔前先在 outline.md 里加一节"## 结局章节清单"（从这一章到全书结束，每章一行），给 notes/threads.md 里每一条未收线索安排去处：在哪一章回收，或者明确放弃。';
 }
 
 export async function renderOrder(spec: OrderSpec, extra: OrderExtra): Promise<string> {
   const budgets = extra.budgets.split('\n').filter((l) => l.trim() !== '');
   const hints = renderHints(spec.hintsShown, budgets);
-  const mustRead = [...extra.mustRead.split('\n').filter((l) => l.trim() !== ''), ...(extra.ownerNote ? ['- 主人给你的话：notes/from-owner.md（只读）。'] : [])].join('\n');
+  const mustRead = extra.mustRead
+    .split('\n')
+    .filter((l) => l.trim() !== '')
+    .join('\n');
+  if (spec.mode === 'retro') {
+    const r = spec.retro ?? { from: Math.max(1, spec.accepted), to: spec.accepted };
+    const vars: Record<string, string> = {
+      from: String(r.from),
+      to: String(r.to),
+      from5: pad5(r.from),
+      to5: pad5(r.to),
+      must_read: mustRead,
+      accepted: String(spec.accepted),
+      total_cjk: String(spec.totalCjk),
+      planned: String(spec.planned),
+    };
+    return fillTemplate(await readOrderTemplate(spec.mode), vars, `order.${spec.mode}`);
+  }
   const common: Record<string, string> = {
     planned: String(spec.planned),
     planned_max: String(spec.plannedMax),
@@ -111,86 +175,141 @@ export async function renderOrder(spec: OrderSpec, extra: OrderExtra): Promise<s
     accepted: String(spec.accepted),
     total_cjk: String(spec.totalCjk),
     hints,
+    owner_line: extra.ownerNote ? OWNER_LINE : '',
   };
   let vars: Record<string, string>;
   if (spec.mode === 'open-short' || spec.mode === 'open-long') {
     const resume = spec.bibleExisted ? '设定已定（bible.md、outline.md 已在目录里），不要重新构思，直接从第 1 章写起；需要时可以补充大纲。' : '';
     vars = { ...common, resume, library: extra.library };
   } else {
-    vars = { ...common, rewrite_line: rewriteLine(spec.allowRewrite), must_read: mustRead };
+    vars = { ...common, rewrite_line: rewriteLine(spec.allowRewrite), must_read: mustRead, ending: renderEnding(spec), feedback: renderFeedback(spec.feedback), ending_list: endingListLine(spec.endingListExists) };
   }
   return fillTemplate(await readOrderTemplate(spec.mode), vars, `order.${spec.mode}`);
 }
 
-// ───────────────────────── buildOrderSpec（读 DB 与 HEAD） ─────────────────────────
+// ───────────────────────── 主人的改写请求（WP-2） ─────────────────────────
 
-function stepOf(mode: OrderMode, from: number, count: number): FlowStep {
-  if (mode === 'open-short' || mode === 'open-long') return { kind: 'open', mode, count };
-  return { kind: 'write', mode, from, count };
+/** 等着处理的改写请求：章已入库、还没发布（锁定不算冻结：请求本身就解了锁），按章号排 */
+export function waitingOwnerRequests(meta: V3BookMeta, publishedThrough: number, accepted: number): V3OwnerRequest[] {
+  // 请求本身会解锁那一章；之后又被锁定（主人直接改了、采用了草稿）的不算（lockChapter / adoptDraft 也会把它作废）
+  return meta.ownerRequests.filter((r) => r.status === 'waiting' && !isFrozenChapter(r.chapter, { publishedThrough, locked: [] }) && !meta.locked.includes(r.chapter) && r.chapter <= accepted).sort((a, b) => a.chapter - b.chapter);
 }
 
-const MODES: readonly OrderMode[] = ['open-short', 'open-long', 'write', 'finale'];
+/** p2-plan §5.6 owner_rewrite */
+export function ownerRewriteHint(r: Pick<V3OwnerRequest, 'chapter' | 'note'>, at: string): V3Hint {
+  const note = r.note.trim();
+  const text = note
+    ? `主人要求改写第 ${r.chapter} 章：${note}。直接改 manuscript/c${pad5(r.chapter)}.md（整章重写或局部修改都行），改完再写这一批的新章。`
+    : `主人要求重写第 ${r.chapter} 章。直接改 manuscript/c${pad5(r.chapter)}.md，改完再写这一批的新章。`;
+  return { kind: 'owner_rewrite', chapter: r.chapter, rewrite: r.chapter, text, at };
+}
+
+// ───────────────────────── buildOrderSpec（读 DB 与 HEAD） ─────────────────────────
+
 
 /** Builds OrderSpec from DB/HEAD (books row, meta.v3, HEAD files bible.md/outline.md/notes sizes, publishedThrough, locked) */
 export async function buildOrderSpec(ctx: PipelineContext, book: BookHandle, task: TaskRow): Promise<{ spec: OrderSpec; extra: OrderExtra } | { skip: TaskResult }> {
   const db = ctx.deps.db;
   const now = ctx.deps.now();
-  const row = (await db.select().from(books).where(eq(books.id, book.id)).limit(1))[0];
+  // for share：回退正在认领（持有书行锁）时等它提交，下面才看得到 rewinding
+  const row = (await db.select().from(books).where(eq(books.id, book.id)).limit(1).for('share'))[0];
   if (!row) return { skip: { status: 'failed', errorClass: 'config', message: `书不存在：${book.id}` } };
   const params = (task.params ?? {}) as Record<string, unknown>;
   const cfg = book.config.v3;
-  const kind = task.kind as 'book.open' | 'book.write';
+  const kind = task.kind as OrderSpec['kind'];
+  const retro = kind === 'book.retro';
 
-  // skip rules（p1-plan §2.13 prepareV3 1）
+  // skip rules（p1-plan §2.13 prepareV3 1；复盘：p2-plan §3.1，没有存稿检查）
   if (row.status === 'completed' || row.status === 'archived') return { skip: { status: 'done', summary: { stale: 'completed' } } };
-  if (kind === 'book.open' && row.acceptedThrough > 0) return { skip: { status: 'done', summary: { stale: 'opened' } } };
-  if (kind === 'book.write' && params.from !== row.acceptedThrough + 1) return { skip: { status: 'done', summary: { stale: 'moved' } } };
-  const maxBuffer = book.config.publish.max_buffer;
-  if (row.acceptedThrough - row.publishedThrough >= maxBuffer || row.pausedReason === 'max_buffer') {
-    return { skip: { status: 'waiting', retryAfter: new Date(now.getTime() + 30 * 60_000).toISOString(), summary: { stale: 'buffer_full' } } };
+  const meta = readV3Meta(row.meta);
+  // 回退进行中（WP-2）：这个任务是在回退认领前排下的，按旧的进度写没有意义；回退完 decideNext 会重新排
+  if (meta.rewinding) return { skip: { status: 'done', summary: { stale: 'rewinding' } } };
+  // 主人的改写请求（WP-2）：还没发布、已入库的章；复盘不带
+  const ownerReqs = retro ? [] : waitingOwnerRequests(meta, row.publishedThrough, row.acceptedThrough);
+  if (retro) {
+    if (cfg.length !== 'long' && cfg.length !== 'epic') return { skip: { status: 'done', summary: { stale: 'not_long' } } };
+    if (params.to !== row.acceptedThrough) return { skip: { status: 'done', summary: { stale: 'moved' } } };
+  } else {
+    if (kind === 'book.open' && row.acceptedThrough > 0) return { skip: { status: 'done', summary: { stale: 'opened' } } };
+    if (kind === 'book.write' && params.from !== row.acceptedThrough + 1) return { skip: { status: 'done', summary: { stale: 'moved' } } };
   }
 
-  const meta = readV3Meta(row.meta);
   const n0 = cfg.planned_chapters_initial ?? cfg.planned_chapters ?? Math.max(1, Math.ceil(cfg.target_cjk / 4000));
   const planned = cfg.planned_chapters ?? n0;
-  const fallbackMode: OrderMode = kind === 'book.open' ? (cfg.length === 'short' ? 'open-short' : 'open-long') : planned - row.acceptedThrough <= cfg.batch || cfg.length === 'short' ? 'finale' : 'write';
-  const mode = MODES.includes(params.mode as OrderMode) ? (params.mode as OrderMode) : fallbackMode;
-  const from = kind === 'book.open' ? 1 : row.acceptedThrough + 1;
-  const count = typeof params.count === 'number' && params.count > 0 ? params.count : mode === 'open-short' ? planned : mode === 'finale' ? Math.max(planned - row.acceptedThrough, 1) : cfg.batch;
+  const runawayBase = runawayBaseOf(n0, meta.plannedFloor);
+  const settings = await loadSystemSettings(db);
+  const factor = settings.v3.runawayFactor;
+  // 写作批 / 结局批：结局控制按现在的 DB 重算（任务参数里的 mode 只是提示）
+  const ending = kind === 'book.write' ? endingPhase({ length: cfg.length, accepted: row.acceptedThrough, planned, runawayBase, batch: cfg.batch, factor, runawayBatches: meta.runawayBatches }) : null;
+  if (!retro) {
+    const maxBuffer = book.config.publish.max_buffer;
+    // 有等着的改写请求时存稿满了也写这一批（只多一批：max_buffer ≥ 2 × batch）；结局批不受存稿上限限制（decide.ts finaleBypassesBuffer）
+    const finaleFirst = ending !== null && finaleBypassesBuffer(ending.mode, meta.finaleNoMarker);
+    if (ownerReqs.length === 0 && !finaleFirst && (row.acceptedThrough - row.publishedThrough >= maxBuffer || row.pausedReason === 'max_buffer')) {
+      return { skip: { status: 'waiting', message: BUFFER_FULL_WAIT, retryAfter: new Date(now.getTime() + 30 * 60_000).toISOString(), summary: { stale: 'buffer_full' } } };
+    }
+  }
   const frozen = { publishedThrough: row.publishedThrough, locked: meta.locked };
-  const { hintsShown, allowRewrite } = selectHints(meta.hints, frozen);
+  const selected = retro ? { hintsShown: [], allowRewrite: [] } : selectHints(meta.hints, frozen);
+  // 主人的改写请求排在所有提示前面，并授权改写那一章
+  const hintsShown: V3Hint[] = [...ownerReqs.map((r) => ownerRewriteHint(r, now.toISOString())), ...selected.hintsShown];
+  const allowRewrite = [...new Set([...selected.allowRewrite, ...ownerReqs.map((r) => r.chapter)])].sort((a, b) => a - b);
+
+  let step: FlowStep;
+  let mode: OrderMode;
+  let from: number;
+  let count: number;
+  let runawayWarn = false;
+  if (retro) {
+    const rf = typeof params.from === 'number' ? params.from : 1;
+    const rt = typeof params.to === 'number' ? params.to : row.acceptedThrough;
+    step = { kind: 'retro', from: rf, to: rt };
+    mode = 'retro';
+    from = row.acceptedThrough + 1;
+    count = 0;
+  } else if (kind === 'book.open') {
+    mode = cfg.length === 'short' ? 'open-short' : 'open-long';
+    from = 1;
+    count = typeof params.count === 'number' && params.count > 0 ? params.count : mode === 'open-short' ? planned : cfg.batch;
+    step = { kind: 'open', mode, count };
+  } else {
+    const e = ending ?? endingPhase({ length: cfg.length, accepted: row.acceptedThrough, planned, runawayBase, batch: cfg.batch, factor, runawayBatches: meta.runawayBatches });
+    mode = e.mode;
+    from = row.acceptedThrough + 1;
+    count = e.mode === 'finale' ? finaleCount(cfg.length, e.remaining, cfg.batch) : cfg.batch;
+    runawayWarn = e.runawayWarn;
+    step = { kind: 'write', mode: e.mode, phase: e.phase, forced: e.forced, from, count };
+  }
 
   // HEAD 上的文件
   const head = book.headCommit;
-  const listed = ['notes/progress.md', 'outline.md', 'bible.md', 'notes/cast.md', 'notes/threads.md'];
-  const prev = from > 1 ? `manuscript/${chapterId(from - 1)}.md` : null;
+  const listed = ['notes/progress.md', 'outline.md', 'bible.md', 'notes/cast.md', 'notes/threads.md', 'notes/retro.md'];
+  const prev = !retro && from > 1 ? `manuscript/${chapterId(from - 1)}.md` : null;
   const probe = [...new Set([...listed, 'notes/chapters.md', 'notes/from-owner.md', ...Object.keys(NOTE_BUDGETS), ...(prev ? [prev] : [])])];
   const shas = await book.repo.blobShas(probe, head);
   const has = (p: string) => (shas[p] ?? '') !== '';
   const budgetFiles = Object.keys(NOTE_BUDGETS).filter(has);
-  const texts = await readMany(book, [...budgetFiles, ...(has('notes/from-owner.md') ? ['notes/from-owner.md'] : [])], head);
+  const texts = await readMany(book, [...budgetFiles, ...(!retro && has('notes/from-owner.md') ? ['notes/from-owner.md'] : [])], head);
   const sizes: Record<string, number> = {};
   for (const f of budgetFiles) sizes[f] = noteSize(texts.get(f) ?? '');
-  const ownerNote = (texts.get('notes/from-owner.md') ?? '').trim() !== '';
+  // 主人留言：非空时任务单带 owner_line，sha 记进 order.json（收稿时只在文件还是这一版时清空并归档）
+  const ownerNote = !retro && (texts.get('notes/from-owner.md') ?? '').trim() !== '';
+  const ownerMessageSha = ownerNote ? shas['notes/from-owner.md'] || null : null;
 
   const mustLines: string[] = [];
   const present = listed.filter(has);
   if (present.length) mustLines.push(`- ${present.join('、')}；`);
-  if (has('notes/chapters.md')) mustLines.push('- notes/chapters.md 的最后 30 行；');
+  // 复盘要核对区间里每一章的记录（每章一行）：列出的行数盖住整个区间，再多几行给标题和空行
+  const tailLines = step.kind === 'retro' ? Math.max(30, step.to - step.from + 1 + 5) : 30;
+  if (has('notes/chapters.md')) mustLines.push(`- notes/chapters.md 的最后 ${tailLines} 行；`);
   if (prev && has(prev)) mustLines.push(`- 上一章全文：${prev}。`);
 
+  // 书库摘要（WP-3，p2-plan §5.3）：同题材全部 + 全站最近 20 本 + 近期最常用的标签
   let library = '';
   if (mode === 'open-short' || mode === 'open-long') {
-    const rows = await db
-      .select({ id: books.id, title: books.title, meta: books.meta })
-      .from(books)
-      .where(ne(books.id, book.id))
-      .orderBy(desc(books.updatedAt))
-      .limit(LIBRARY_MAX * 3);
-    library = renderLibrary(
-      rows.map((r) => ({ id: r.id, title: r.title, blurb: typeof (r.meta as { blurb?: unknown }).blurb === 'string' ? ((r.meta as { blurb: string }).blurb || null) : null })),
-      { selfId: book.id },
-    );
+    const genreId = book.config.genre ?? row.genre;
+    const genreName = (book.genre?.pack as { name?: string } | undefined)?.name || genreId;
+    library = renderLibraryV3(await loadLibrary(db, book.id, genreId), genreName);
   }
 
   const spec: OrderSpec = {
@@ -203,7 +322,7 @@ export async function buildOrderSpec(ctx: PipelineContext, book: BookHandle, tas
     minChars: cfg.min_chapter_cjk,
     targetCjk: cfg.target_cjk,
     planned,
-    plannedMax: 2 * n0,
+    plannedMax: plannedUpper(n0, meta.plannedFloor, factor, cfg.batch),
     batch: cfg.batch,
     accepted: row.acceptedThrough,
     totalCjk: row.totalCjk,
@@ -212,9 +331,37 @@ export async function buildOrderSpec(ctx: PipelineContext, book: BookHandle, tas
     allowRewrite,
     bibleExisted: has('bible.md'),
     hintsShown,
-    effort: effortFor(stepOf(mode, from, count), cfg),
+    effort: effortFor(step, cfg),
+    runawayBase,
+    ownerMessageSha,
+    ownerRequests: ownerReqs.map((r) => ({ id: r.id, chapter: r.chapter, note: r.note })),
   };
-  return { spec, extra: { library, mustRead: mustLines.join('\n'), budgets: noteBudgetLines(sizes).join('\n'), ownerNote } };
+  if (step.kind === 'retro') spec.retro = { from: step.from, to: step.to };
+  if (step.kind === 'write') {
+    spec.phase = step.phase;
+    spec.forced = step.forced;
+    spec.runawayWarn = runawayWarn;
+    spec.endingListExists = ENDING_LIST_RE.test(texts.get('outline.md') ?? '');
+    spec.feedback = {
+      phrases: meta.feedback?.phrases ?? [],
+      range: meta.feedback ? [meta.feedback.from, meta.feedback.to] : null,
+      shortRecent: shortRecent(await recentAverage(ctx, book.id, row.acceptedThrough), cfg.min_chapter_cjk),
+    };
+  }
+  return { spec, extra: { library, mustRead: mustLines.join('\n'), budgets: retro ? '' : noteBudgetLines(sizes).join('\n'), ownerNote } };
+}
+
+/** 最近 10 个入库章（no ≤ accepted）的平均字数；没有章节时 null */
+async function recentAverage(ctx: PipelineContext, bookId: string, accepted: number): Promise<number | null> {
+  if (accepted <= 0) return null;
+  const rows = await ctx.deps.db
+    .select({ cjk: chapters.cjk })
+    .from(chapters)
+    .where(and(eq(chapters.bookId, bookId), lte(chapters.no, accepted)))
+    .orderBy(desc(chapters.no))
+    .limit(10);
+  if (rows.length === 0) return null;
+  return rows.reduce((s, r) => s + (r.cjk ?? 0), 0) / rows.length;
 }
 
 async function readMany(book: BookHandle, rels: string[], rev: string): Promise<Map<string, string>> {

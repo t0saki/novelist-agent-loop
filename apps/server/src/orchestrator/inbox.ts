@@ -82,6 +82,30 @@ export async function createInboxItem(db: Db, bus: EventBus, input: InboxInput):
   return toDto(existing[0], slug);
 }
 
+/**
+ * 同类按“种类 + 书”合并（v3，DESIGN §8.3）：已有同 dedupeKey 的 open 项 → 只更新标题、正文、动作和相关任务（不再发通知）；没有 → createInboxItem。
+ * 没有 dedupeKey 时等同 createInboxItem。
+ */
+export async function upsertOpenInbox(db: Db, bus: EventBus, input: InboxInput): Promise<InboxItem> {
+  if (!input.dedupeKey) return createInboxItem(db, bus, input);
+  const updated = await db
+    .update(inbox)
+    .set({ title: input.title, body: input.body, actions: input.actions, ...(input.relatedTaskId !== undefined ? { relatedTaskId: input.relatedTaskId } : {}) })
+    .where(and(eq(inbox.dedupeKey, input.dedupeKey), eq(inbox.state, 'open')))
+    .returning();
+  if (updated[0]) return toDto(updated[0], await slugOf(db, updated[0].bookId));
+  return createInboxItem(db, bus, input);
+}
+
+/** 条件消失，自动关闭：state 'resolved'，resolution { auto: true, reason } */
+export async function resolveInboxAuto(db: Db, id: string, reason: string): Promise<void> {
+  const nowIso = new Date().toISOString();
+  await db
+    .update(inbox)
+    .set({ state: 'resolved', resolution: { auto: true, reason, ts: nowIso }, resolvedAt: nowIso })
+    .where(and(eq(inbox.id, id), eq(inbox.state, 'open')));
+}
+
 export interface ActionEffect {
   task?: 'done' | 'ready' | 'cancelled' | 'none';
   followups?: TaskSpec[];
