@@ -78,7 +78,7 @@ async function accountForProbe(deps: AppDeps, harness: HarnessId, accountId: str
 export async function register(app: FastifyInstance, deps: AppDeps): Promise<void> {
   app.get('/api/admin/harness', async (): Promise<HarnessStatus[]> => {
     const settings = await loadSystemSettings(deps.db);
-    const isolation = (await probeIsolation(settings.isolation)).selected;
+    const isolation = (await probeIsolation(settings.isolation !== 'auto' ? settings.isolation : deps.config.isolation)).selected;
     const installs = await detectInstalls(deps.config.harnessDir);
     return Promise.all(
       listAdapters()
@@ -93,7 +93,7 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const inst = (await detectInstalls(deps.config.harnessDir)).find((i) => i.id === harness);
     if (!inst) throw conflict(`${harness} 尚未安装`, 'harness_not_installed');
     const settings = await loadSystemSettings(deps.db);
-    const isolation = (await probeIsolation(settings.isolation)).selected;
+    const isolation = (await probeIsolation(settings.isolation !== 'auto' ? settings.isolation : deps.config.isolation)).selected;
     const acct = await resolveAccount(await accountForProbe(deps, harness, req.query.accountId), deps.paths, deps.secrets);
     const scratchDir = await fs.mkdtemp(path.join(deps.paths.tmp, `probe-${harness}-`));
     try {

@@ -93,7 +93,8 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const inst = (await detectInstalls(deps.config.harnessDir)).find((i) => i.id === harness);
     if (!inst) throw conflict(`${harness} 尚未安装`, 'harness_not_installed');
     const settingsNow = await loadSystemSettings(deps.db);
-    const isolation = (await probeIsolation(settingsNow.isolation)).selected;
+    // 和 executor 一样：设置是 auto 时听进程配置（NOVELIST_ISOLATION），探测和真实运行用同一档隔离
+    const isolation = (await probeIsolation(settingsNow.isolation !== 'auto' ? settingsNow.isolation : deps.config.isolation)).selected;
     const account = route.accountObj ?? zAccount.parse({ id: 'fake-default', harness, authMode: 'none' });
     const acct = await resolveAccount(account, deps.paths, deps.secrets);
     const capRows = await deps.db.select().from(capabilities).where(and(eq(capabilities.harness, harness), eq(capabilities.version, inst.version), eq(capabilities.isolation, isolation))).limit(1);
