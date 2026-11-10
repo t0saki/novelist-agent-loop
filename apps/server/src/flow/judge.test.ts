@@ -81,10 +81,15 @@ describe('classifyV3Run (§2.10 table)', () => {
     expect(classifyV3Run(facts({ outcome: crash, accountStreak: 3, emptyStreak: 9 }))).toMatchObject({ pauseAccount: true, retryAfter: plus(24 * 3600_000) });
   });
   it('timeout with zero changes → zeroDiff', () => {
-    for (const errorClass of ['timeout_wall', 'timeout_idle', 'harness_crash', 'refusal'] as const) {
+    for (const errorClass of ['timeout_wall', 'timeout_idle', 'harness_crash'] as const) {
       expect(classifyV3Run(facts({ outcome: { status: errorClass.startsWith('timeout') ? 'timeout' : 'failed', errorClass } }))).toMatchObject({ zeroDiff: true, bookEmpty: 'inc', status: 'waiting' });
     }
   });
+  it('model refusal with zero changes counts against the book only, even when the run ended with an error status', () => {
+    const v = classifyV3Run(facts({ outcome: { status: 'failed', errorClass: 'refusal' }, accountStreak: 1 }));
+    expect(v).toMatchObject({ status: 'waiting', zeroDiff: false, pauseAccount: false, bookEmpty: 'inc', infraClass: null });
+  });
+
   it('empty streak 5 → v3_empty inbox', () => {
     expect(classifyV3Run(facts({ emptyStreak: 4 })).bookInbox).toBe('empty');
     expect(classifyV3Run(facts({ emptyStreak: 4, outcome: { status: 'failed', errorClass: 'harness_crash' } })).bookInbox).toBe('empty');

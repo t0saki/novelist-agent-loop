@@ -91,11 +91,11 @@ export function classifyV3Run(f: V3RunFacts): V3Verdict {
     const ms = f.emptyStreak === 0 ? LOST_FIRST_MS : ladder(EMPTY_LADDER_MS, f.emptyStreak);
     return { ...base, status: 'waiting', retryAfter: at(f.now, ms), bookEmpty: 'inc', bookInbox: emptyInbox };
   }
-  // 6b. 正常结束却什么都没写（模型拒绝，或只回了话没动笔）：是这本书的事，不算账号故障
-  if (f.outcome.status === 'completed') {
+  // 6b. 正常结束却什么都没写，或者模型明确拒绝（errorClass refusal）：是这本书的事，不算账号故障
+  if (f.outcome.status === 'completed' || cls === 'refusal') {
     return { ...base, status: 'waiting', retryAfter: at(f.now, ladder(EMPTY_LADDER_MS, f.emptyStreak)), bookEmpty: 'inc', bookInbox: emptyInbox };
   }
-  // 7. 空跑（没正常结束：崩溃、超时、出错、拒绝类错误……）：账号和书都记一次
+  // 7. 空跑（没正常结束：崩溃、超时、出错……）：账号和书都记一次
   return {
     ...base,
     status: 'waiting',
