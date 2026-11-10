@@ -3,7 +3,11 @@ import { Cron } from 'croner';
 import type { PublishConfig } from '@novelist/shared';
 import { HttpProblem } from '../api/problem.js';
 
-export function assertPublishConfig(cfg: PublishConfig): void {
+/**
+ * v3 书另传 { batch }：存稿上限必须 ≥ 2 × 每批章数（docs/v3/DESIGN.md §3.4），否则存稿上限和批次边界互等，一批要等上一天才能发。
+ * 旧流程不传，校验和原来一样。
+ */
+export function assertPublishConfig(cfg: PublishConfig, v3?: { batch: number }): void {
   try {
     new Cron(cfg.cadence, { timezone: cfg.timezone }).nextRun();
   } catch (e) {
@@ -12,4 +16,5 @@ export function assertPublishConfig(cfg: PublishConfig): void {
   if (cfg.resume_buffer >= cfg.max_buffer) throw new HttpProblem(400, 'invalid_publish', 'resume_buffer 必须小于 max_buffer');
   const lag = cfg.lag === 'auto' ? cfg.min_lag : Math.max(cfg.lag, cfg.min_lag);
   if (cfg.mode === 'scheduled' && lag >= cfg.max_buffer) throw new HttpProblem(400, 'invalid_publish', `发布滞后（lag=${lag}）必须小于 max_buffer（${cfg.max_buffer}），否则存稿永远到不了可发布的量`);
+  if (v3 && cfg.max_buffer < 2 * v3.batch) throw new HttpProblem(400, 'invalid_publish', `存稿上限（max_buffer=${cfg.max_buffer}）必须 ≥ 2 × 每批章数（v3.batch=${v3.batch}）`);
 }

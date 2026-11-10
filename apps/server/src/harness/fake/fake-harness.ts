@@ -2,6 +2,8 @@
 /**
  * fake harness 可执行入口（见 adapters/fake.ts 的行为说明）。Owner: lane A。
  * 用法：node fake-harness.js --workorder <file> --system <file> [--scenario <json file>] [--model <m>] [--session <id>]
+ *       node fake-harness.js --v3 --launch <file> [--scenario <json file>] [--model <m>] [--session <id>]
+ *                                               （v3 目录模式：cwd = 书快照，读 ORDER.md，见 dirMain）
  *       node fake-harness.js --login            （交互登录演示：打印 URL + 验证码，读一行输入后写 $HOME/.fake/auth.json）
  *
  * 单文件、只依赖 node 内置模块与 `yaml`；只用可擦除 TS 语法（开发/测试时 node 直接 type-strip 运行 .ts）。
@@ -71,6 +73,39 @@ export interface FakeScenario {
   chapters?: [string, string];
   genre?: string;
   title?: string;
+  /** v3 目录模式（--v3）的混沌开关；serverFault 只由服务端读取（测试钩子） */
+  v3?: FakeV3Chaos;
+}
+
+/** v3 目录模式的混沌开关（p1-plan §3 Harness） */
+export interface FakeV3Chaos {
+  /** 什么都不写（零改动） */
+  zeroOutput?: boolean;
+  /** 本批第 n 章（1 起）写短：完整但不到下限 */
+  shortChapter?: number;
+  /** 最后一章停在半句话 */
+  truncateLast?: boolean;
+  /** 正文写到 chapters/00k.md，笔记写到根目录 notes.md */
+  wrongDir?: boolean;
+  /** 全部章节写进 manuscript/batch.md */
+  oneFile?: boolean;
+  /** 未经允许改写已入库的第 k 章 */
+  rewriteAccepted?: number;
+  /** 另写一个旧章号 k 的 chapters/00k.md */
+  oldNumberElsewhere?: number;
+  /** 往不入库的目录写 views/scratch.md */
+  ignoredDir?: boolean;
+  /** 不写笔记 */
+  noNotes?: boolean;
+  /** 写完 k 章后 SIGKILL 自己 */
+  killAfter?: number;
+  /** 非结局批也写“（全书完）” */
+  endMarkerEarly?: boolean;
+  /** 结局批不写“（全书完）” */
+  noMarker?: boolean;
+  /** 覆盖本批章数 */
+  chapters?: number;
+  serverFault?: 'finalize' | 'promote' | 'crashAfterHarvest';
 }
 
 // ───────── 计数（与 shared/text.ts 一致） ─────────
@@ -543,6 +578,7 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (argv.includes('--login')) return loginDemo();
+  if (argv.includes('--v3')) return dirMain(argv);
   const woPath = argOf(argv, '--workorder');
   const sysPath = argOf(argv, '--system');
   const model = argOf(argv, '--model') ?? 'fake-model';
@@ -729,6 +765,260 @@ function failWith(fake: FakeScenario, sessionId: string): number {
   const status = cls === 'refusal' ? 'refusal' : cls === 'max_turns' ? 'max_turns' : 'error';
   emit({ t: 'result', status, sessionId, text: message });
   return fake.exitCode ?? 1;
+}
+
+// ───────── v3 目录模式（--v3）：cwd 就是书快照，读 ORDER.md，直接在目录里写书 ─────────
+
+export type FakeOrderMode = 'open-short' | 'open-long' | 'write' | 'finale';
+export interface FakeOrder {
+  mode: FakeOrderMode;
+  from: number;
+  count: number;
+  /** 计划总章数（写进 outline.md 的“计划：共 N 章”） */
+  planned: number;
+  minChars: number;
+  allowRewrite: number[];
+}
+
+/** 解析 ORDER.md 的固定“任务：”行（模板见 flow/templates/order.*.md）；认不出返回 null */
+export function parseOrderText(text: string): FakeOrder | null {
+  const minChars = Number(text.match(/每章不少于 (\d+) 字/)?.[1] ?? 3000);
+  const rewriteLine = text.match(/^允许改写的旧章：(.*)$/m)?.[1] ?? '';
+  const allowRewrite = [...rewriteLine.matchAll(/第 (\d+) 章/g)].map((m) => Number(m[1]));
+  const suggested = Number(text.match(/建议 (\d+) 章/)?.[1] ?? 0);
+  let m = text.match(/^任务：开书，并写完整本（约 (\d+) 章）/m);
+  if (m) {
+    const n = Number(m[1]);
+    return { mode: 'open-short', from: 1, count: n, planned: suggested || n, minChars, allowRewrite };
+  }
+  m = text.match(/^任务：开书，并写第 1–(\d+) 章/m);
+  if (m) {
+    const n = Number(m[1]);
+    return { mode: 'open-long', from: 1, count: n, planned: suggested || n, minChars, allowRewrite };
+  }
+  m = text.match(/^任务：新写第 (\d+)–(\d+) 章/m);
+  if (m) {
+    const from = Number(m[1]);
+    const count = Math.max(1, Number(m[2]) - from + 1);
+    const planned = Number(text.match(/计划共 (\d+) 章/)?.[1] ?? from + count - 1);
+    return { mode: 'write', from, count, planned, minChars, allowRewrite };
+  }
+  m = text.match(/^任务：结局批，从第 (\d+) 章写到全书结束（计划还剩约 (\d+) 章/m);
+  if (m) {
+    const from = Number(m[1]);
+    const count = Math.max(1, Number(m[2]));
+    const planned = Number(text.match(/计划共 (\d+) 章/)?.[1] ?? from + count - 1);
+    return { mode: 'finale', from, count, planned, minChars, allowRewrite };
+  }
+  return null;
+}
+
+const FAKE_CHAPTER_TITLES = ['雨夜', '旧信', '渡口', '山门', '归途', '灯火', '长街', '残局', '故人', '霜降', '孤城', '远行', '暗潮', '回声', '晚钟'];
+export const FAKE_END_MARKER = '（全书完）';
+const pad5 = (n: number) => String(n).padStart(5, '0');
+
+/** 去掉 beat 标记的正文段落（约 chars 个汉字，以句号收尾） */
+export function fakeProse(chars: number, seed: string): string {
+  return generateDraft({ beats: ['b1', 'b2', 'b3'], chars: Math.max(20, chars), seed })
+    .replace(/^<!--\s*beat:b\d+\s*-->\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function readJsonScenario(p: string): FakeScenario {
+  try {
+    const v = JSON.parse(fs.readFileSync(p, 'utf8')) as unknown;
+    const one = Array.isArray(v) ? v[0] : v;
+    return one && typeof one === 'object' ? (one as FakeScenario) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * v3 目录模式：开书写 bible/outline/notes，每章 manuscript/cNNNNN.md（“# 第k章 标题” + 正文，长度 max(min+200, 1.2·min)），
+ * notes/chapters.md 每章一行；结局批 / 短篇开书在最后一章末尾单独一行写“（全书完）”；允许改写的旧章补到下限以上。
+ * fake.v3 的混沌开关见 FakeV3Chaos；fail / failAfterWrite / sleepMs 照旧（sleepMs 在正文写完、笔记写之前）。
+ */
+export async function dirMain(argv: string[]): Promise<number> {
+  const cwd = process.cwd();
+  const model = argOf(argv, '--model') ?? 'fake-model';
+  const sessionId = argOf(argv, '--session') ?? `fake-${Date.now()}`;
+  const launch = argOf(argv, '--launch');
+  const scenarioPath = argOf(argv, '--scenario') ?? (launch ? path.join(path.dirname(launch), 'fake.json') : '');
+  const fake: FakeScenario = scenarioPath ? readJsonScenario(scenarioPath) : {};
+  const chaos: FakeV3Chaos = fake.v3 ?? {};
+  let cancelled = false;
+  if (fake.ignoreSigterm) {
+    process.on('SIGTERM', () => {});
+    process.on('SIGINT', () => {});
+  } else {
+    const onSig = (sig: string) => {
+      if (cancelled) return;
+      cancelled = true;
+      emit({ t: 'result', status: 'cancelled', stopReason: sig, sessionId });
+      process.exit(sig === 'SIGINT' ? 130 : 143);
+    };
+    process.on('SIGTERM', () => onSig('SIGTERM'));
+    process.on('SIGINT', () => onSig('SIGINT'));
+  }
+
+  if (fake.malformedJson) process.stdout.write('this is {not json\n');
+  emit({ t: 'init', sessionId, model, version: 'fake-1.0.0', tools: ['read', 'write', 'edit'] });
+  if (fake.rateLimit) {
+    emit({
+      t: 'rate_limit',
+      window: fake.rateLimit.window ?? '5h',
+      ...(fake.rateLimit.utilization !== undefined ? { utilization: fake.rateLimit.utilization } : {}),
+      ...(fake.rateLimit.resetsAt ? { resetsAt: fake.rateLimit.resetsAt } : {}),
+      status: fake.rateLimit.status ?? 'warning',
+    });
+  }
+  let tid = 0;
+  const readEv = (rel: string) => {
+    const id = `r${++tid}`;
+    emit({ t: 'tool_call', id, name: 'read', kind: 'read', paths: [path.join(cwd, rel)] });
+    emit({ t: 'tool_result', id, ok: true });
+  };
+  readEv('AGENTS.md');
+  readEv('ORDER.md');
+  let orderText = '';
+  try {
+    orderText = fs.readFileSync(path.join(cwd, 'ORDER.md'), 'utf8');
+  } catch {
+    /* 没有 ORDER.md */
+  }
+  const order = parseOrderText(orderText);
+  if (!order) {
+    emit({ t: 'error', cls: 'config', message: 'ORDER.md 缺失或认不出任务行', retryable: false });
+    emit({ t: 'result', status: 'error', sessionId });
+    return 2;
+  }
+  if (fake.fail && !fake.failAfterWrite) return failWith(fake, sessionId);
+  if (fake.noResult && !fake.failAfterWrite) {
+    emit({ t: 'text', channel: 'assistant', delta: '（没有终止事件就退出）' });
+    return fake.exitCode ?? 0;
+  }
+
+  let written = 0;
+  const write = (rel: string, content: string) => {
+    const abs = path.join(cwd, rel);
+    const id = `w${++tid}`;
+    emit({ t: 'tool_call', id, name: 'write', kind: 'write', paths: [abs] });
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const existed = fs.existsSync(abs);
+    fs.writeFileSync(abs, content);
+    emit({ t: 'tool_result', id, ok: true });
+    emit({ t: 'file_change', path: abs, op: existed ? 'update' : 'add', ok: true });
+    written++;
+  };
+  const readRel = (rel: string): string | null => {
+    try {
+      return fs.readFileSync(path.join(cwd, rel), 'utf8');
+    } catch {
+      return null;
+    }
+  };
+  const seed = createHash('sha256').update(`${sessionId}:${cwd}`).digest('hex');
+  const isOpen = order.mode === 'open-short' || order.mode === 'open-long';
+  const isFinale = order.mode === 'finale' || order.mode === 'open-short';
+  const count = chaos.chapters ?? order.count;
+  const last = order.from + count - 1;
+  const noteLines: string[] = [];
+
+  if (!chaos.zeroOutput) {
+    // 1. 开书：设定、大纲、笔记骨架
+    if (isOpen) {
+      if (readRel('bible.md') === null) {
+        write(
+          'bible.md',
+          [`# 《假书名·${seed.slice(0, 6)}》`, '一句话：一个少年在雨夜的渡口收到一封旧信，从此卷进一桩旧案。', '标签：悬疑、成长、江湖', '', '与《X》《Y》的区别：没有系统，没有重生。', '', '## 人物', '', '少年、师姐、渡船人。', '', '## 结局', '', '旧案真相大白，少年留在渡口。', ''].join('\n'),
+        );
+      }
+      if (readRel('outline.md') === null) {
+        const lines = ['# 大纲', '', '骨架：起于雨夜旧信，终于渡口重逢。', `计划：共 ${order.planned} 章`, ''];
+        for (let k = 1; k <= Math.min(order.planned, order.mode === 'open-short' ? order.planned : order.count); k++) lines.push(`- 第${k}章 ${FAKE_CHAPTER_TITLES[(k - 1) % FAKE_CHAPTER_TITLES.length]}：推进主线。`);
+        write('outline.md', `${lines.join('\n')}\n`);
+      }
+      if (!chaos.noNotes && !chaos.wrongDir && order.mode === 'open-long') {
+        write('notes/cast.md', '# 人物\n\n- 少年：在场。\n- 师姐：在场。\n');
+        write('notes/threads.md', '# 线索\n\n- 旧信的来历：第1章埋，计划第10章前后收。\n');
+      }
+    }
+
+    // 2. 正文
+    const batchParts: string[] = [];
+    if (chaos.killAfter === 0) process.kill(process.pid, 'SIGKILL');
+    for (let i = 0; i < count; i++) {
+      const k = order.from + i;
+      const title = FAKE_CHAPTER_TITLES[(k - 1) % FAKE_CHAPTER_TITLES.length]!;
+      let chars = Math.ceil(Math.max(order.minChars + 200, 1.2 * order.minChars));
+      if (chaos.shortChapter === i + 1) chars = Math.max(Math.min(150, order.minChars - 1), Math.floor(order.minChars / 2));
+      let body = fakeProse(chars, `${seed}:c${k}`);
+      const isLast = k === last;
+      if (isLast && chaos.truncateLast) body = `${body.replace(/[。！？”]+$/u, '')}，他刚要开口，门外却`;
+      const marker = isLast && !chaos.truncateLast && ((isFinale && !chaos.noMarker) || (!isFinale && chaos.endMarkerEarly));
+      const text = `# 第${k}章 ${title}\n\n${body}\n${marker ? `\n${FAKE_END_MARKER}\n` : ''}`;
+      if (chaos.oneFile) {
+        batchParts.push(text);
+        write('manuscript/batch.md', batchParts.join('\n'));
+      } else if (chaos.wrongDir) write(`chapters/${String(k).padStart(3, '0')}.md`, text);
+      else write(`manuscript/c${pad5(k)}.md`, text);
+      noteLines.push(`第${k}章 ${title}：少年追查旧信，${i % 2 ? '师姐登场' : '埋下新线索'}。`);
+      if (chaos.killAfter !== undefined && i + 1 === chaos.killAfter) process.kill(process.pid, 'SIGKILL');
+    }
+
+    // 3. 允许改写的旧章：补到下限以上
+    for (const k of order.allowRewrite) {
+      const rel = `manuscript/c${pad5(k)}.md`;
+      const old = readRel(rel);
+      if (old === null) continue;
+      const have = fakeCount(old);
+      if (have >= order.minChars) continue;
+      write(rel, `${old.trimEnd()}\n\n${fakeProse(order.minChars - have + 200, `${seed}:rw${k}`)}\n`);
+    }
+
+    // 4. 混沌：越权改写、旧章号另存、不入库目录
+    if (chaos.rewriteAccepted !== undefined) {
+      const rel = `manuscript/c${pad5(chaos.rewriteAccepted)}.md`;
+      const old = readRel(rel);
+      if (old !== null) write(rel, `${old.trimEnd()}\n\n${fakeProse(300, `${seed}:bad${chaos.rewriteAccepted}`)}\n`);
+    }
+    if (chaos.oldNumberElsewhere !== undefined) {
+      const k = chaos.oldNumberElsewhere;
+      write(`chapters/${String(k).padStart(3, '0')}.md`, `# 第${k}章 重写\n\n${fakeProse(Math.ceil(order.minChars * 1.2), `${seed}:old${k}`)}\n`);
+    }
+    if (chaos.ignoredDir) write('views/scratch.md', '草稿笔记：下一章让师姐先出场。\n');
+
+    if (fake.sleepMs) {
+      const until = Date.now() + fake.sleepMs;
+      while (Date.now() < until) {
+        const step = fake.dripMs ? Math.min(fake.dripMs, until - Date.now()) : until - Date.now();
+        await sleep(Math.max(1, step));
+        if (fake.dripMs) emit({ t: 'heartbeat', source: 'stdout' });
+      }
+    }
+
+    // 5. 笔记：一批写完后一次性更新
+    if (!chaos.noNotes) {
+      const progress = `# 进度\n\n写到第 ${last} 章。\n\n前情提要：少年收到旧信，一路追查到渡口。\n\n下一步打算：接着 outline.md 往下写。\n`;
+      if (chaos.wrongDir) write('notes.md', `${progress}\n${noteLines.join('\n')}\n`);
+      else {
+        if (order.mode !== 'open-short') {
+          const prev = readRel('notes/chapters.md');
+          write('notes/chapters.md', `${prev ? prev.replace(/\n*$/, '\n') : '# 每章一行\n\n'}${noteLines.join('\n')}\n`);
+        }
+        write('notes/progress.md', progress);
+      }
+    }
+  } else if (fake.sleepMs) await sleep(fake.sleepMs);
+
+  emit({ t: 'text', channel: 'assistant', delta: `已写出 ${written} 个文件。` });
+  if (fake.fail) return failWith(fake, sessionId);
+  if (fake.noResult) return fake.exitCode ?? 0;
+  emit({ t: 'usage', input: Math.ceil(orderText.length / 2) + 2000, cachedInput: 0, output: written * 800 + 50, reasoning: 0, costUsd: 0, costSource: 'harness', scope: 'total' });
+  emit({ t: 'result', status: 'success', stopReason: 'end_turn', sessionId, turns: 1 });
+  return fake.exitCode ?? 0;
 }
 
 const self = fileURLToPath(import.meta.url);

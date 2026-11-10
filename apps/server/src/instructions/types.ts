@@ -3,7 +3,7 @@
  * 不变量：编译器从不改写/过滤/摘要/重排用户文本；最后一个作者块永远来自书层（L3）或 owner 本章笔记（L3.9）；
  * nonce 每个 run 随机生成，只出现在 $RUN/in/system.md。
  */
-import type { Capabilities, HarnessId, InstructionLayerReport, RoleId, TaskKind } from '@novelist/shared';
+import type { Capabilities, HarnessId, InstructionLayerReport, RoleId, TaskKind, V3Length } from '@novelist/shared';
 import type { RunSpec } from '../harness/types.js';
 
 /** 层 id：S0 契约、S1 内置角色、L1 全局、L2 题材（每个 extends 链成员一层）、L3 书、L3.9 owner 笔记 */
@@ -68,6 +68,11 @@ export interface ResolveStackInput {
   ownerNotes: { source: string; text: string }[];
   /** 预览用：path → 未保存内容 */
   drafts?: Record<string, string>;
+  /**
+   * v3（docs/v3/DESIGN.md）：S0 = builtin/v3/contract.md，S1 = builtin/v3/length-<len>.md（非角色层），
+   * role 固定为 writer，跳过 L1.task / L3.task，忽略 ownerNotes
+   */
+  v3?: { length: V3Length };
 }
 
 export interface BudgetResult {

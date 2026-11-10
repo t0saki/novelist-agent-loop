@@ -99,10 +99,16 @@ export const fakeAdapter: HarnessAdapter = {
     return { home: acct.home, configFiles: [], stateDirs: [], env: { HOME: acct.home } };
   },
   async materialize(spec, compiled) {
+    // v3：指令只在工作区 AGENTS.md，不传 --system
+    if (spec.contract === 'v3') return { files: [], argv: [], env: {}, budget: { ok: true, bytes: 0, limit: null }, notes: [] };
     return { files: [], argv: ['--system', spec.systemFile], env: {}, budget: { ok: true, bytes: compiled.bytes, limit: null }, notes: [] };
   },
   buildInvocation(spec, _caps, home, mat, acct, inst) {
-    const argv = [inst.binPath, fakeScriptPath(), '--workorder', spec.workOrderFile, ...mat.argv, '--model', spec.model, '--session', spec.session.id || spec.runId];
+    // v3 “目录模式”：读 cwd 下的 ORDER.md，直接在书目录里写文件（fake-harness.ts dirMain）
+    const argv =
+      spec.contract === 'v3'
+        ? [inst.binPath, fakeScriptPath(), '--v3', '--launch', spec.workOrderFile, '--model', spec.model, '--session', spec.session.id || spec.runId]
+        : [inst.binPath, fakeScriptPath(), '--workorder', spec.workOrderFile, ...mat.argv, '--model', spec.model, '--session', spec.session.id || spec.runId];
     const scenario = path.join(spec.inDir, 'fake.json');
     if (existsSync(scenario)) argv.push('--scenario', scenario);
     argv.push(...filterExtraArgs(spec.extraArgs, []));

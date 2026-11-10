@@ -5,5 +5,6 @@ const pairs = [
   ['src/instructions/builtin', 'dist/instructions/builtin'],
   ['src/genres/builtin', 'dist/genres/builtin'],
   ['src/pipeline/templates', 'dist/pipeline/templates'],
+  ['src/flow/templates', 'dist/flow/templates'],
 ];
 for (const [from, to] of pairs) if (existsSync(from)) cpSync(from, to, { recursive: true });

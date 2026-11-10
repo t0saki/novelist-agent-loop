@@ -6,9 +6,10 @@ import * as chapter from './handlers/chapter.js';
 import * as summary from './handlers/summary.js';
 import * as audit from './handlers/audit.js';
 import * as system from './handlers/system.js';
+import * as flowHandlers from '../flow/handlers.js';
 
 const isHandler = (v: unknown): v is TaskHandler => typeof v === 'object' && v !== null && typeof (v as TaskHandler).kind === 'string' && typeof (v as TaskHandler).manifest === 'function';
-const all: TaskHandler[] = [plan, chapter, summary, audit, system].flatMap((m) => Object.values(m as Record<string, unknown>).filter(isHandler));
+const all: TaskHandler[] = [plan, chapter, summary, audit, system, flowHandlers].flatMap((m) => Object.values(m as Record<string, unknown>).filter(isHandler));
 
 export const HANDLERS: Record<TaskKind, TaskHandler> = Object.fromEntries(all.map((h) => [h.kind, h])) as Record<TaskKind, TaskHandler>;
 

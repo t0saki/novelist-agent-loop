@@ -14,7 +14,8 @@ import { openRepo, P } from '../book/index.js';
 import { AUTO_TITLE_PREFIX, autoScale, buildAutoSeed, diversityBrief, lengthClass, premiseDigest, extractAutoTitle, maybeStartBook, nameAutoBooks, pickGenre } from './auto-start.js';
 
 const on = (over: Partial<ReturnType<typeof zSystemSettings.parse>['autoStart']> = {}) => zSystemSettings.parse({ autoStart: { enabled: true, maxActiveBooks: 9, maxPerDay: 0, ...over } });
-const NOW = new Date('2026-11-10T00:00:00Z');
+// book_events.ts 由数据库按真实时钟写入，NOW 必须与之同一时钟，否则每日额度窗口会随日历日期漂移
+const NOW = new Date();
 
 async function addPack(t: TestApp, id: string, auto: Record<string, unknown> | null, meta: Record<string, unknown> = {}) {
   await createGenre(t.deps.paths, { id, name: `包${id}`, extends: [] });

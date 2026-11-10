@@ -124,7 +124,10 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const rows = await deps.db.select().from(chapters).where(and(eq(chapters.bookId, book.id), eq(chapters.no, no))).limit(1);
     const row = rows[0];
     if (!row?.publishedAt) throw notFound(`第 ${no} 章`);
-    const text = (await collectManuscripts(openRepo(bookDir(deps, book.slug)), [no])).get(no);
+    const repo = openRepo(bookDir(deps, book.slug));
+    // v3 书的首行是“# 第N章 标题”（标题另有字段），读者端去掉；v2 和导入的书保持原样
+    const v3 = (await bookFiles(repo).config().catch(() => null))?.config.flow === 'v3';
+    const text = (await collectManuscripts(repo, [no], v3 ? { stripTitle: true } : undefined)).get(no);
     if (text === undefined) throw notFound(`第 ${no} 章正文`);
     const neighbors = await deps.db.select({ no: chapters.no }).from(chapters).where(and(eq(chapters.bookId, book.id), isNotNull(chapters.publishedAt))).orderBy(asc(chapters.no));
     const idx = neighbors.findIndex((n) => n.no === no);

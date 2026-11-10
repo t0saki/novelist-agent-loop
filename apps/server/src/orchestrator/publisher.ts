@@ -73,8 +73,15 @@ export function nextSlots(cfg: PublishConfig, from: Date, count: number): string
   return out;
 }
 
-/** 这一刻（slot 到点时）最多可以发到第几章（返回 ≤ published 表示不发） */
-export function eligibleThrough(state: Pick<BufferState, 'accepted' | 'audited' | 'published' | 'lag'>, cfg: PublishConfig, ignoreAudit = false): number {
+/**
+ * 这一刻（slot 到点时）最多可以发到第几章（返回 ≤ published 表示不发）。
+ * v3Cap 给出时（v3 书，flow/publish.ts）：不看 lag 与审计，只按 v3 规则的上限和 per_slot 节奏。
+ */
+export function eligibleThrough(state: Pick<BufferState, 'accepted' | 'audited' | 'published' | 'lag'>, cfg: PublishConfig, ignoreAudit = false, v3Cap?: number): number {
+  if (v3Cap !== undefined) {
+    const cap = Math.min(v3Cap, state.accepted);
+    return cfg.mode === 'immediate' ? cap : Math.min(cap, state.published + cfg.per_slot);
+  }
   const byBuffer = state.accepted - state.lag + 1;
   let through = cfg.mode === 'immediate' ? state.accepted : Math.min(byBuffer, state.published + cfg.per_slot);
   if (cfg.require_audited && !ignoreAudit && cfg.mode !== 'immediate') through = Math.min(through, state.audited);
@@ -83,7 +90,7 @@ export function eligibleThrough(state: Pick<BufferState, 'accepted' | 'audited' 
 
 export interface PublishIo {
   /** 读书的发布配置与当前弧长（默认：books.meta.publishConfig，弧长 0） */
-  loadConfig?(bookId: string): Promise<{ cfg: PublishConfig; arcLength: number }>;
+  loadConfig?(bookId: string): Promise<{ cfg: PublishConfig; arcLength: number; v3Cap?: number }>;
   /** 入队 publish 任务（publish.execute 打 tag、写前沿）；默认不入队（仅更新水位，测试用） */
   enqueue?(input: { bookId: string; through: number; slot: string | null }): Promise<boolean | void>;
   /** 存稿告警（Inbox） */
@@ -97,9 +104,9 @@ export interface PublishIo {
 const LOW_BUFFER_COOLDOWN_MS = 24 * 3600_000;
 
 /** 现在能否发布出至少一章（不考虑 per_slot 与 cadence）：false 时暂停生产只会和发布互等 */
-function canDrain(state: BufferState, cfg: PublishConfig): boolean {
+function canDrain(state: BufferState, cfg: PublishConfig, v3Cap?: number): boolean {
   if (cfg.mode === 'manual') return true; // 手动模式 owner 随时能发布
-  return eligibleThrough(state, { ...cfg, per_slot: Number.MAX_SAFE_INTEGER }) > state.published;
+  return eligibleThrough(state, { ...cfg, per_slot: Number.MAX_SAFE_INTEGER }, false, v3Cap) > state.published;
 }
 
 interface PublishMeta {
@@ -115,24 +122,27 @@ export async function publishTick(db: Db, now: Date, io: PublishIo = {}): Promis
     const loaded = io.loadConfig ? await io.loadConfig(b.id).catch(() => null) : null;
     const cfg = loaded?.cfg ?? zPublishConfig.parse((b.meta as { publishConfig?: unknown }).publishConfig ?? {});
     const state = await bufferState(db, b.id, cfg, loaded?.arcLength ?? 0, now);
+    const v3Cap = loaded?.v3Cap;
+    // v3：存稿上限由 decideNext / prepareV3 自己拦；“超上限但暂时没有可发布章节”是两批之间的常态，不发这两类待办
+    const v3 = v3Cap !== undefined;
 
-    const drainable = canDrain(state, cfg);
+    const drainable = canDrain(state, cfg, v3Cap);
     if (state.buffer > cfg.max_buffer && b.pausedReason !== 'max_buffer' && b.status === 'active') {
       if (drainable) {
         await db.update(books).set({ pausedReason: 'max_buffer', updatedAt: now.toISOString() }).where(eq(books.id, b.id));
         await io.productionChanged?.({ bookId: b.id, paused: true, buffer: state.buffer });
-      } else {
+      } else if (!v3) {
         await io.bufferBlocked?.({ bookId: b.id, buffer: state.buffer, lag: state.lag, audited: state.audited, published: state.published }).catch(() => {});
       }
     } else if (b.pausedReason === 'max_buffer' && (state.buffer <= cfg.resume_buffer || !drainable)) {
       await db.update(books).set({ pausedReason: null, updatedAt: now.toISOString() }).where(eq(books.id, b.id));
       await io.productionChanged?.({ bookId: b.id, paused: false, buffer: state.buffer });
-      if (!drainable && state.buffer > cfg.resume_buffer) await io.bufferBlocked?.({ bookId: b.id, buffer: state.buffer, lag: state.lag, audited: state.audited, published: state.published }).catch(() => {});
+      if (!drainable && state.buffer > cfg.resume_buffer && !v3) await io.bufferBlocked?.({ bookId: b.id, buffer: state.buffer, lag: state.lag, audited: state.audited, published: state.published }).catch(() => {});
     }
 
     const alertedAt = (b.meta as { lowBufferAlertAt?: string }).lowBufferAlertAt;
     const finished = b.status === 'completed' && state.accepted === state.published;
-    if (state.bufferDays !== null && state.published > 0 && state.bufferDays < cfg.low_buffer_days_alert && !finished && (!alertedAt || now.getTime() - new Date(alertedAt).getTime() >= LOW_BUFFER_COOLDOWN_MS)) {
+    if (!v3 && state.bufferDays !== null && state.published > 0 && state.bufferDays < cfg.low_buffer_days_alert && !finished && (!alertedAt || now.getTime() - new Date(alertedAt).getTime() >= LOW_BUFFER_COOLDOWN_MS)) {
       await io.lowBuffer?.({ bookId: b.id, bufferDays: state.bufferDays }).catch(() => {});
       await mergeMeta(db, b.id, { lowBufferAlertAt: now.toISOString() });
     }
@@ -140,7 +150,7 @@ export async function publishTick(db: Db, now: Date, io: PublishIo = {}): Promis
     if (cfg.mode === 'manual' || b.status === 'paused') continue;
 
     if (cfg.mode === 'immediate') {
-      const through = eligibleThrough(state, cfg);
+      const through = eligibleThrough(state, cfg, false, v3Cap);
       if (through > state.published) {
         const created = await enqueueSafe(io, { bookId: b.id, through, slot: null });
         await markScheduled(db, b.id, state.published + 1, through, null, now);
@@ -171,7 +181,7 @@ export async function publishTick(db: Db, now: Date, io: PublishIo = {}): Promis
     }
     if (!slot) continue;
     await mergeMeta(db, b.id, { publish: { lastSlot: slot.toISOString() } });
-    const through = eligibleThrough(state, cfg);
+    const through = eligibleThrough(state, cfg, false, v3Cap);
     if (through <= state.published) continue;
     const created = await enqueueSafe(io, { bookId: b.id, through, slot: slot.toISOString() });
     await markScheduled(db, b.id, state.published + 1, through, slot.toISOString(), now);

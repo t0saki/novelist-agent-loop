@@ -127,3 +127,6 @@ export const zIsolationProbe = z.object({
   inContainer: z.boolean(),
 });
 export type IsolationProbe = z.infer<typeof zIsolationProbe>;
+
+/** v3 启动语（docs/v3/DESIGN.md）：指令全在工作区根 AGENTS.md / CLAUDE.md，任务在 ORDER.md；adapter 与 flow 共用 */
+export const V3_LAUNCH_PROMPT = '阅读 AGENTS.md 和 ORDER.md 并执行。Read AGENTS.md and ORDER.md and execute.';

@@ -87,6 +87,9 @@ export const TASK_KINDS = [
   'publish',
   'routing.feasibility',
   'harness.canary',
+  // v3 流程（docs/v3/DESIGN.md）：一次运行写一批
+  'book.open',
+  'book.write',
 ] as const;
 export type TaskKind = (typeof TASK_KINDS)[number];
 export const zTaskKind = z.enum(TASK_KINDS);

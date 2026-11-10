@@ -17,6 +17,7 @@ import { expireReservations } from './quota.js';
 import { reconcileRuns, recoverStuckPromotes } from './recovery.js';
 import { gcRetention } from './retention.js';
 import { loadSystemSettings } from './routing.js';
+import { v3PublishCap } from '../flow/publish.js';
 
 export interface Scheduler {
   start(): Promise<void>;
@@ -236,6 +237,14 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
         if (Number(active?.n ?? 0) >= limit) break;
         const task = await claimNext(env.db, { owner: env.owner, leaseMs, excludeBooksWithActiveWrite: true, now });
         if (!task) break;
+        if (running.has(task.id)) {
+          // 同一任务的上一份执行还没结束（取消后被重试等）：放回队列稍后再认领，不并行跑两份
+          await env.db
+            .update(tasks)
+            .set({ state: 'ready', leaseOwner: null, leaseExpiresAt: null, notBefore: new Date(now.getTime() + 30_000).toISOString(), waitReason: '上一份执行还在收尾', updatedAt: new Date().toISOString() })
+            .where(and(eq(tasks.id, task.id), eq(tasks.state, 'leased')));
+          continue;
+        }
         env.bus.publish({ type: 'task_changed', taskId: task.id, book: task.bookId, state: 'leased' });
         dispatchOne(task);
         dispatched += 1;
@@ -317,6 +326,7 @@ function publisherIo(env: ExecEnv): Parameters<typeof publishTick>[2] {
   return {
     loadConfig: async (bookId) => {
       const book = await env.pipe.openBook(env.pdeps, bookId);
+      if (book.config.flow === 'v3') return { cfg: book.config.publish, arcLength: 0, v3Cap: await v3PublishCap(env.db, bookId, env.nowFn(), book.config.v3.publish_after_hours) };
       let arcLength = 0;
       try {
         const rows = await env.db.select({ cursor: books.cursor }).from(books).where(eq(books.id, bookId)).limit(1);

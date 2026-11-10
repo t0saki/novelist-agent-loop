@@ -13,22 +13,30 @@ import type { Capabilities, ErrorClass, HarnessInstall, NEvent, Outcome, Quality
 import { toJsonSchema, zAccount, zCapabilities, zReceipt } from '@novelist/shared';
 import type { AppConfig, DataPaths } from '../config/index.js';
 import type { Db } from '../db/client.js';
-import { accounts, books, capabilities, chapters, profiles, runEvents, runs, tasks } from '../db/schema.js';
+import { accounts, books, capabilities, chapters, inbox, profiles, runEvents, runs, tasks } from '../db/schema.js';
 import { compileInstructions, resolveStack, checkNonces, type CompiledInstructions, type NonceCheckReport } from '../instructions/index.js';
 import type { Logger } from '../log.js';
 import type { SecretStore } from '../services/secrets.js';
-import type { AgentPlan, BookHandle, HarvestedRun, PipelineContext, PipelineDeps, PromotePlan, TaskHandler, TaskRow, TaskResult, TaskSpec } from '../pipeline/types.js';
+import type { AgentPlan, BookHandle, HarvestedRun, PipelineContext, PipelineDeps, PromotePlan, RunContext, TaskHandler, TaskRow, TaskResult, TaskSpec } from '../pipeline/types.js';
 import { P } from '../book/layout.js';
 import { createRunSnapshot, harvestOut, removeRunSnapshot } from '../book/worktree.js';
+import { collectRunChanges } from '../book/harvest.js';
+import { V3_AGENTS_SOFT_LIMIT } from '../instructions/v3.js';
+import { BOOK_LADDER_MS, classifyV3Run } from '../flow/judge.js';
+import { ZERO_DIFF_PAUSE_MS, bumpZeroDiff, readZeroDiff, zeroDiffAccountKey, zeroDiffInbox } from '../flow/accounts.js';
+import { isInstructionFile } from '../flow/contract.js';
+import { bumpBookEmpty, clearPending, patchPending, readPending, readV3Meta, setPending } from '../flow/state.js';
+import { isV3Kind, serverFault } from '../flow/handlers.js';
+import type { V3CommitPlan, V3Pending } from '../flow/types.js';
 import { buildViews } from '../state/index.js';
 import { RunPrepareError, defaultCapabilities, getAdapter, probeIsolation, reattachRun, resolveAccount, startRun, syncBackCredentials, type HarnessAdapter, type ResolvedAccount, type RunEventSink, type RunHandle, type RunResult, type RunSpec } from '../harness/index.js';
 import type { EventBus } from './bus.js';
 import { planFailure, INFRA_CLASSES, type FailurePlan } from './actions.js';
 import { defaultPipeline, type PipelineBinding } from './binding.js';
 import { applyCanaryResult, recordRun } from './circuit.js';
-import { promote, withRepoLock, type PromoteMeta, type PromoteOutcome } from './committer.js';
+import { promote, promoteV3, withRepoLock, type PromoteMeta, type PromoteOutcome } from './committer.js';
 import { createInboxItem } from './inbox.js';
-import { chapterNoOf, orchOf, withOrch, type OrchTaskState } from './orch-state.js';
+import { chapterNoOf, orchOf, taskTrailerValue, withOrch, type OrchTaskState } from './orch-state.js';
 import { ACTIVE_STATES, completeTask, enqueue, renewLease, setTaskState } from './queue.js';
 import { accountUsdCapReached, checkBookBudget, expectedChapterCost, expectedTaskCost, markAuthBad, recordRateLimit, releaseReservations, reserve, settle, sleepAccount, utilSnapshot } from './quota.js';
 import { effectiveRouting, loadSystemSettings, resolveRoute, vendorOf, writerHarnesses, type ResolvedRoute } from './routing.js';
@@ -76,6 +84,21 @@ const staleResult = (reason: string): TaskResult => ({ status: 'failed', message
 
 const ACTIVE_RUN_STATES: RunState[] = ['preparing', 'spawned', 'running'];
 export { ACTIVE_RUN_STATES };
+
+/** 本进程里正在 finishRun（等待 / 收稿 / 判定）的 run：同一任务被重试复活时，第二份执行不能去收同一个快照 */
+const finalizingRuns = new Set<string>();
+
+/**
+ * v3 pending 对应的 run 是否还有人在收尾（p1-plan §2.10）：
+ * 还在 ACTIVE 状态；或本进程正在 finishRun；或已 exited/killed 但 run lease 属于别的进程且未过期（那个进程还在收稿，崩了的话 lease 一分钟内过期）。
+ */
+export function v3RunBusy(row: { id: string; state: string; leaseOwner: string | null; leaseExpiresAt: string | null } | null, ctx: { owner: string; nowMs: number; finalizing: ReadonlySet<string> }): boolean {
+  if (!row) return false;
+  if (ACTIVE_RUN_STATES.includes(row.state as RunState)) return true;
+  if (ctx.finalizing.has(row.id)) return true;
+  if (row.state !== 'exited' && row.state !== 'killed') return false;
+  return !!row.leaseOwner && row.leaseOwner !== ctx.owner && !!row.leaseExpiresAt && Date.parse(row.leaseExpiresAt) > ctx.nowMs;
+}
 
 function runDirFor(paths: DataPaths, runId: string, now: Date): string {
   const yyyy = now.getUTCFullYear();
@@ -228,6 +251,10 @@ export interface RunSession {
   artifacts: AgentPlan['frontmatter']['artifacts'];
   billUsd: boolean;
   accountEnvNames: string[];
+  /** v3 契约的 run（reattach 也要知道）：收稿走 pending，提交走 promoteV3 */
+  contract?: 'v3';
+  /** v3：本次 run 的幂等键（pending.trailerKey） */
+  trailerKey?: string;
 }
 
 export async function loadSession(runDir: string): Promise<RunSession | null> {
@@ -247,6 +274,21 @@ export async function executeTask(deps: ExecutorDeps, task: TaskRow, signal: Abo
   const ctx: PipelineContext = { deps: env.pdeps, book };
 
   const orch = orchOf(task);
+  if (handler.contract === 'v3') {
+    // v3 的恢复只看 pending 记录：VALIDATED.json 与 _orch.recover 都不用
+    if (orch.recover) await patchOrch(env, task, { recover: undefined });
+    if (book) {
+      const pending = await readPending(env.db, book.id);
+      if (pending) {
+        const runRow = (await env.db.select().from(runs).where(eq(runs.id, pending.runId)).limit(1))[0] ?? null;
+        // 接管中的 run 还在收尾：稍后再来
+        if (v3RunBusy(runRow, { owner: env.owner, nowMs: Date.now(), finalizing: finalizingRuns })) return { status: 'waiting', retryAfter: new Date(env.nowFn().getTime() + 60_000).toISOString(), message: 'v3：上一次运行还在收尾' };
+        // 有没收完的稿：这次执行只收稿、不开新 run
+        return consumePending(env, ctx, handler, task, pending, runRow);
+      }
+    }
+    return runAgentTask(env, ctx, handler, task, signal);
+  }
   if (orch.recover) {
     const recovered = await executeRecovery(env, ctx, handler, task, orch.recover);
     if (recovered) return recovered;
@@ -325,7 +367,8 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
     }
   }
   let reservationIds: string[] = [];
-  if (route.account) {
+  // v3 不预留配额（usage_ledger 照常由 settle 记账）
+  if (route.account && handler.contract !== 'v3') {
     const costs =
       task.kind === 'chapter.write' && book
         ? await expectedChapterCost(env.db, { bookId: book.id, tier, book, writer: { profileId: route.profile, accountId: route.account }, allowFakeHarness: env.config.allowFakeHarness })
@@ -354,6 +397,8 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
   const adapter = getAdapter(route.harness as RunSpec['harness']);
   const settings = await loadSystemSettings(env.db);
   let installInfo: HarnessInstall;
+  /** v3：pending 已写、run 已（尝试）启动 */
+  let v3Started = false;
   let snapshot: Awaited<ReturnType<typeof createRunSnapshot>> | null = null;
   let resolved: ResolvedAccount | null = null;
   const cleanupRun = async (state: RunState, errorClass: ErrorClass | null): Promise<void> => {
@@ -399,10 +444,12 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
         snapshot = await createRunSnapshot(book.dir, head, snapshotDir);
         return head;
       });
-      try {
-        await buildViews(snapshotDir);
-      } catch (err) {
-        env.log.warn({ err: (err as Error).message, taskId: task.id }, 'buildViews failed (继续执行)');
+      if (handler.contract !== 'v3') {
+        try {
+          await buildViews(snapshotDir);
+        } catch (err) {
+          env.log.warn({ err: (err as Error).message, taskId: task.id }, 'buildViews failed (继续执行)');
+        }
       }
     } else {
       await fs.mkdir(snapshotDir, { recursive: true });
@@ -435,33 +482,62 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
     const plan = prepared.plan;
 
     // 6. 工作单 + 指令
-    const fm: WorkOrderFrontmatter = { schema: 'nv.workorder/1', task_id: task.id, run_id: runId, out_dir: outDir, ...plan.frontmatter };
-    const workOrderText = env.pipe.renderWorkOrder(fm, plan.body);
-    const workOrderFile = path.join(inDir, 'workorder.md');
-    await fs.writeFile(workOrderFile, workOrderText);
-    const snapWorkOrder = path.join(snapshotDir, P.workOrder(task.id));
-    await fs.mkdir(path.dirname(snapWorkOrder), { recursive: true });
-    await fs.writeFile(snapWorkOrder, workOrderText);
     for (const input of plan.inputs) {
       const dest = path.join(inDir, input.to);
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await fs.copyFile(input.from, dest);
     }
-    const dialect = caps.schemaDialect === 'none' ? 'lenient' : caps.schemaDialect;
-    const receiptSchemaFile = path.join(inDir, `receipt.${dialect}.json`);
-    await fs.writeFile(receiptSchemaFile, JSON.stringify(toJsonSchema(zReceipt, dialect)));
+    let workOrderFile: string;
+    let receiptSchemaFile: string;
+    let systemFile: string;
+    let compiled: CompiledInstructions;
+    if (plan.v3) {
+      // v3：指令在快照根 AGENTS.md（cc 经 CLAUDE.md 引用），任务在 ORDER.md；启动语是一句话；没有回执、schema、nonce
+      const v3 = plan.v3;
+      if (caps.maxInstructionBytes !== undefined && v3.agentsBytes > caps.maxInstructionBytes) {
+        await cleanupRun('finalized', 'config');
+        if (book) await createInboxItem(env.db, env.bus, agentsSizeInbox(book.id, v3, `超过 ${route.harness} 的上限 ${caps.maxInstructionBytes} 字节，本次没有启动`));
+        return { status: 'waiting', retryAfter: new Date(now.getTime() + 3600_000).toISOString(), message: `AGENTS.md ${v3.agentsBytes} 字节，超过 ${route.harness} 的上限 ${caps.maxInstructionBytes}` };
+      }
+      if (v3.agentsBytes > V3_AGENTS_SOFT_LIMIT && book) {
+        env.log.warn({ bookId: book.id, bytes: v3.agentsBytes }, 'v3 AGENTS.md 超过 16KB（不截断）');
+        await createInboxItem(env.db, env.bus, agentsSizeInbox(book.id, v3, '超过建议的 16KB，没有截断；请精简全局、题材或本书指令'));
+      }
+      // 早先入库的 AGENTS.override.md / GEMINI.md / manuscript/CLAUDE.md 一类：会顶替或叠加服务器的指令，快照里先删掉
+      await removeStrayInstructionFiles(snapshotDir);
+      await fs.writeFile(path.join(snapshotDir, 'AGENTS.md'), v3.agentsMd);
+      await fs.writeFile(path.join(snapshotDir, 'CLAUDE.md'), v3.claudeMd);
+      await fs.writeFile(path.join(snapshotDir, 'ORDER.md'), v3.orderMd);
+      workOrderFile = path.join(inDir, 'launch.md');
+      await fs.writeFile(workOrderFile, v3.launchPrompt);
+      systemFile = path.join(inDir, 'system.md');
+      await fs.writeFile(systemFile, '');
+      receiptSchemaFile = path.join(inDir, 'receipt.none.json');
+      compiled = emptyCompiled(v3.stackHash);
+    } else {
+      const fm: WorkOrderFrontmatter = { schema: 'nv.workorder/1', task_id: task.id, run_id: runId, out_dir: outDir, ...plan.frontmatter };
+      const workOrderText = env.pipe.renderWorkOrder(fm, plan.body);
+      workOrderFile = path.join(inDir, 'workorder.md');
+      await fs.writeFile(workOrderFile, workOrderText);
+      const snapWorkOrder = path.join(snapshotDir, P.workOrder(task.id));
+      await fs.mkdir(path.dirname(snapWorkOrder), { recursive: true });
+      await fs.writeFile(snapWorkOrder, workOrderText);
+      const dialect = caps.schemaDialect === 'none' ? 'lenient' : caps.schemaDialect;
+      receiptSchemaFile = path.join(inDir, `receipt.${dialect}.json`);
+      await fs.writeFile(receiptSchemaFile, JSON.stringify(toJsonSchema(zReceipt, dialect)));
 
-    const stack = await resolveStack({
-      globalDir: env.paths.instructionsGlobal,
-      genreDirs: book ? book.genre.chain.map((g) => ({ id: g.id, dir: g.dir })) : [],
-      bookDir: book ? snapshotDir : null,
-      role,
-      taskKind: task.kind as TaskKind,
-      ownerNotes: [...plan.ownerNotes, ...(orch.ownerNotes ?? [])],
-    });
-    const compiled = compileInstructions(stack, { nonces: 'random' });
-    const systemFile = path.join(inDir, 'system.md');
-    await fs.writeFile(systemFile, compiled.systemMd);
+      const stack = await resolveStack({
+        globalDir: env.paths.instructionsGlobal,
+        genreDirs: book ? book.genre.chain.map((g) => ({ id: g.id, dir: g.dir })) : [],
+        bookDir: book ? snapshotDir : null,
+        role,
+        taskKind: task.kind as TaskKind,
+        ownerNotes: [...plan.ownerNotes, ...(orch.ownerNotes ?? [])],
+      });
+      compiled = compileInstructions(stack, { nonces: 'random' });
+      systemFile = path.join(inDir, 'system.md');
+      await fs.writeFile(systemFile, compiled.systemMd);
+    }
 
     // 7. RunSpec + 启动
     const limits = {
@@ -489,7 +565,9 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
       systemFile,
       receiptSchemaFile,
       model: route.model as string,
-      ...(route.profileObj.effort ? { effort: route.profileObj.effort } : {}),
+      ...(plan.contract ? { contract: plan.contract } : {}),
+      // 本次 run 的 effort（v3 按开书 / 写作 / 结局批）压过 profile 的
+      ...((plan.effort ?? route.profileObj.effort) ? { effort: plan.effort ?? route.profileObj.effort } : {}),
       limits,
       session: plan.resume?.sessionId && caps.resume ? { mode: 'resume', id: plan.resume.sessionId } : { mode: 'fresh', id: runId },
       persistSession: false,
@@ -512,34 +590,84 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
       artifacts: plan.frontmatter.artifacts,
       billUsd: route.accountObj ? ['api_key', 'custom_api'].includes(route.accountObj.authMode) : false,
       accountEnvNames: resolved ? Object.keys(resolved.secretEnv) : [],
+      ...(plan.v3 ? { contract: 'v3' as const, trailerKey: `${taskTrailerValue(task.id, orch.generation)}@${runId}` } : {}),
     };
     await fs.writeFile(path.join(inDir, 'session.json'), JSON.stringify(session));
     await env.db.update(runs).set({ baseCommit, stackHash: compiled.stackHash }).where(eq(runs.id, runId));
 
+    // 准备期间主人取消 / killRun：abort 事件不会补发，这里不再启动 harness（pending 还没写，按普通方式清理）
+    if (signal.aborted && signal.reason !== 'detach') {
+      await cleanupRun('killed', null);
+      if (handler.contract === 'v3' && signal.reason !== 'cancel') return { status: 'waiting', retryAfter: new Date(env.nowFn().getTime() + 10 * 60_000).toISOString(), message: 'run killed before start' };
+      return { status: 'failed', message: 'run killed before start' };
+    }
     let handle: RunHandle;
     const log = new EventLog(env, runId, route.account, () => undefined);
+    // v3：从 run 即将启动到收稿提交（或确认为空），books.meta.v3.pending 一直描述它；有 pending 时本书不再开新 run
+    const pendingBook = session.contract === 'v3' && book ? book : null;
+    if (pendingBook) {
+      await setPending(env.db, pendingBook.id, {
+        taskId: task.id,
+        runId,
+        attempt,
+        stage: 'run',
+        runDir,
+        inDir,
+        snapshotDir,
+        baseCommit,
+        manifestFile: null,
+        trailerKey: session.trailerKey as string,
+        route: { profile: route.profile, account: route.account, harness: route.harness as string, model: (route.model as string | null) ?? null, isolation, stackHash: compiled.stackHash },
+        failures: 0,
+        createdAt: now.toISOString(),
+      });
+      v3Started = true;
+    }
     try {
       handle = await startRun({ spec, adapter, account: resolved, install: installInfo, caps, isolation, compiled }, log);
     } catch (err) {
       await log.close();
       const cls: ErrorClass = err instanceof RunPrepareError ? err.errorClass : 'config';
       const code = err instanceof RunPrepareError ? err.code : 'spawn';
+      if (pendingBook) {
+        await clearPending(env.db, pendingBook.id, runId);
+        v3Started = false;
+      }
       await cleanupRun('killed', cls);
       if (code === 'budget' || code === 'not_allowed') return { status: 'retry', errorClass: cls, message: (err as Error).message, retryAfter: now.toISOString(), avoidProfile: route.profile };
       return { status: 'retry', errorClass: cls, message: (err as Error).message };
     }
     await env.db.update(runs).set({ state: 'running', shimPid: handle.shimPid, harnessPid: handle.harnessPid, startedAt: handle.startedAt }).where(eq(runs.id, runId));
 
-    return finishRun(env, ctx, handler, task, { handle, log, session, activeLink, snapshot, route, resolved, signal, adapter, tier });
+    const finishing = finishRun(env, ctx, handler, task, { handle, log, session, activeLink, snapshot, route, resolved, signal, adapter, tier });
+    if (!v3Started) return finishing;
+    return await finishing;
   } catch (err) {
+    if (v3Started) {
+      // v3 的 run 已经启动：快照里可能有稿，绝不删；pending 留着，run 由 reconcileRuns 接管或判 lost 后再收
+      env.log.warn({ err: (err as Error).message, taskId: task.id, runId }, 'v3 run failed after start (pending kept)');
+      return { status: 'waiting', retryAfter: new Date(env.nowFn().getTime() + 60_000).toISOString(), message: `v3：${(err as Error).message}`, summary: { v3: { pendingKept: true } } };
+    }
     await cleanupRun('killed', 'unknown').catch(() => {});
     env.log.warn({ err: (err as Error).message, taskId: task.id }, 'agent task failed before run');
     return { status: 'retry', errorClass: 'unknown', message: (err as Error).message };
   }
 }
 
-/** run 进行中：等待、收割、finalize（也是 reattach 的入口） */
-export async function finishRun(
+type FinishRunArgs = Parameters<typeof finishRunInner>[4];
+
+/** run 进行中：等待、收割、finalize（也是 reattach 的入口）。期间 run id 记在 finalizingRuns 里（见 v3RunBusy） */
+export async function finishRun(env: ExecEnv, ctx: PipelineContext, handler: TaskHandler, task: TaskRow, r: FinishRunArgs): Promise<TaskResult> {
+  const id = r.session.spec.runId;
+  finalizingRuns.add(id);
+  try {
+    return await finishRunInner(env, ctx, handler, task, r);
+  } finally {
+    finalizingRuns.delete(id);
+  }
+}
+
+async function finishRunInner(
   env: ExecEnv,
   ctx: PipelineContext,
   handler: TaskHandler,
@@ -569,11 +697,13 @@ export async function finishRun(
   };
   let result: RunResult;
   const detach = new Promise<null>((resolve) => {
-    if (r.signal.aborted && r.signal.reason === 'detach') resolve(null);
-    r.signal.addEventListener('abort', () => {
+    const handleAbort = (): void => {
       if (r.signal.reason === 'detach') resolve(null);
       else onAbort();
-    });
+    };
+    // 在注册监听之前就已经 abort（取消落在 startRun 的 await 期间）：事件不会补发，这里直接处理
+    if (r.signal.aborted) handleAbort();
+    else r.signal.addEventListener('abort', handleAbort, { once: true });
   });
   try {
     const waited = await Promise.race([handle.wait(), detach]);
@@ -592,13 +722,30 @@ export async function finishRun(
   const finalState: RunState = result.outcome.status === 'cancelled' ? 'killed' : 'exited';
   await env.db
     .update(runs)
-    .set({ state: finalState, endedAt: new Date().toISOString(), exitCode: result.exit.code, errorClass: result.outcome.errorClass ?? null, outcome: { status: result.outcome.status, message: result.outcome.message }, usage: result.outcome.usage as unknown as Record<string, unknown>, denials: result.outcome.denials.length, sessionId: result.outcome.sessionId ?? null, modelReported: result.outcome.model ?? null })
+    .set({ state: finalState, endedAt: new Date().toISOString(), exitCode: result.exit.code, errorClass: result.outcome.errorClass ?? null, outcome: { status: result.outcome.status, message: result.outcome.message, ...(session.contract === 'v3' && result.outcome.retryAfter ? { retryAfter: result.outcome.retryAfter } : {}) }, usage: result.outcome.usage as unknown as Record<string, unknown>, denials: result.outcome.denials.length, sessionId: result.outcome.sessionId ?? null, modelReported: result.outcome.model ?? null })
     .where(eq(runs.id, session.spec.runId));
 
   // 8. 收割
   let stagedOutDir = '';
   let files: string[] = [];
-  if (book) {
+  const v3Book = session.contract === 'v3' && book ? book : null;
+  let v3Manifest: string | null = null;
+  let v3Failure: unknown = null;
+  if (v3Book) {
+    // v3：先收稿再判定错误类（额度用完、超时、崩溃之前写下的正文都要收）。收稿失败：快照和 pending 都留着，下次只收稿不开 run
+    try {
+      const ch = await collectRunChanges({ snapshotDir: session.spec.bookDir, baseCommit: session.runCtx.baseCommit, liveBookDir: v3Book.dir, taskId: task.id, runId: session.spec.runId });
+      v3Manifest = ch.manifestFile;
+      await patchPending(env.db, v3Book.id, session.spec.runId, { stage: 'harvested', manifestFile: v3Manifest });
+      // 改动已复制到 live 树 work/ 下，快照这时才能删
+      if (r.snapshot) await removeRunSnapshot(r.snapshot).catch(() => {});
+    } catch (err) {
+      v3Failure = err;
+      env.log.warn({ err: (err as Error).message, taskId: task.id, runId: session.spec.runId }, 'v3 harvest failed (snapshot and pending kept)');
+    }
+    // 测试钩子：收稿之后、提交之前“进程死掉”（任务停在 leased，lease 过期后由下一次执行消化 pending）
+    if (!v3Failure && (await serverFault(ctx, session.spec.inDir, 'crashAfterHarvest'))) return { status: 'waiting', message: 'detached', summary: { detached: true } };
+  } else if (book) {
     const harvested = await harvestOut(session.spec.outDir, book.dir, task.id, session.spec.attempt).catch(() => ({ stagedDir: '', files: [] as string[] }));
     stagedOutDir = harvested.stagedDir;
     files = harvested.files;
@@ -611,11 +758,19 @@ export async function finishRun(
     await syncBack(env, r.resolved).catch((err) => env.log.warn({ err: (err as Error).message }, 'syncBackCredentials failed'));
   }
 
-  // 9. nonce + 组装
-  const echoed = await readEchoedNonces(stagedOutDir, result.outcome);
-  const nonce: NonceCheckReport = checkNonces({ nonces: session.compiled.nonces, echoed, events: log.events, inDir: session.spec.inDir, role: session.spec.role });
-  await env.db.update(runs).set({ nonceReport: nonce.layers as unknown[] }).where(eq(runs.id, session.spec.runId));
+  // 9. nonce + 组装（v3 没有 nonce）
+  let nonce: NonceCheckReport = { layers: [], tainted: false, missingTail: [], ok: true };
+  if (!v3Book) {
+    const echoed = await readEchoedNonces(stagedOutDir, result.outcome);
+    nonce = checkNonces({ nonces: session.compiled.nonces, echoed, events: log.events, inDir: session.spec.inDir, role: session.spec.role });
+    await env.db.update(runs).set({ nonceReport: nonce.layers as unknown[] }).where(eq(runs.id, session.spec.runId));
+  }
   const harvested: HarvestedRun = { run: session.runCtx, outcome: result.outcome, stagedOutDir, files, artifacts: session.artifacts, nonce, audit: result.audit };
+  if (v3Book) {
+    // 主人取消的是任务（cancelTask）；单纯 killRun 时任务还活着
+    const taskState = (await env.db.select({ state: tasks.state }).from(tasks).where(eq(tasks.id, task.id)).limit(1))[0]?.state;
+    harvested.v3 = { manifestFile: v3Manifest, lost: false, stderrTail: result.stderrTail, trailerKey: session.trailerKey ?? `${task.id}@${session.spec.runId}`, ownerCancelled: taskState === 'cancelled' };
+  }
 
   // 10. 结算配额、熔断
   await settle(env.db, {
@@ -646,8 +801,15 @@ export async function finishRun(
   env.bus.publish({ type: 'run_exit', runId: session.spec.runId, state: 'finalized', errorClass: result.outcome.errorClass ?? null });
 
   // 11. 判定
+  const meta: PromoteMeta = { harness: r.route.harness as string, model: (r.route.model as string | null) ?? undefined, isolation: session.isolation, instructionsHash: session.compiled.stackHash };
+  if (v3Book) {
+    const res = v3Failure
+      ? await pendingFailure(env, task, v3Book.id, session.spec.runId, v3Failure)
+      : await judgeRunV3(env, ctx, handler, task, harvested, { profile: r.route.profile as string, account: (r.route.account as string | null) ?? null, harness: r.route.harness as string }, result.outcome);
+    return attachMeta(res, meta, harvested);
+  }
   const res = await judgeRun(env, ctx, handler, task, harvested, r.route.profile as string, r.route.harness as string, result.outcome);
-  return attachMeta(res, { harness: r.route.harness as string, model: (r.route.model as string | null) ?? undefined, isolation: session.isolation, instructionsHash: session.compiled.stackHash }, harvested);
+  return attachMeta(res, meta, harvested);
 }
 
 async function renewRunLease(env: ExecEnv, taskId: string, runId: string): Promise<void> {
@@ -750,6 +912,234 @@ async function judgeRun(env: ExecEnv, ctx: PipelineContext, handler: TaskHandler
     }
   }
   return result;
+}
+
+// ───────────────────────── v3：收稿、判定、pending ─────────────────────────
+
+const OK_NONCE: NonceCheckReport = { layers: [], tainted: false, missingTail: [], ok: true };
+const ZERO_USAGE: Outcome['usage'] = { input: 0, cachedInput: 0, cacheWrite: 0, output: 0, reasoning: 0, costSource: 'unknown' };
+
+/**
+ * v3 快照里除了服务器自己写的根 AGENTS.md / CLAUDE.md / ORDER.md 和 instructions/ 之外的 harness 指令文件（任意深度、不分大小写）一律删掉。
+ * 不进隐藏目录（.git 等）和 work/；返回删掉的相对路径。
+ */
+export async function removeStrayInstructionFiles(snapshotDir: string): Promise<string[]> {
+  const removed: string[] = [];
+  const walk = async (abs: string, rel: string): Promise<void> => {
+    const entries = await fs.readdir(abs, { withFileTypes: true }).catch(() => []);
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (e.name.startsWith('.') || r === 'work' || r === 'instructions') continue;
+        await walk(path.join(abs, e.name), r);
+        continue;
+      }
+      if (!isInstructionFile(r) || r === 'AGENTS.md' || r === 'CLAUDE.md') continue;
+      await fs.rm(path.join(abs, e.name), { force: true });
+      removed.push(r);
+    }
+  };
+  await walk(snapshotDir, '');
+  return removed;
+}
+
+/** v3 没有 system channel、没有 nonce：只保留 stackHash（进 trailer 与 pending.route） */
+export function emptyCompiled(stackHash: string): CompiledInstructions {
+  return { systemMd: '', mirrorMd: '', layers: [], nonces: {}, stackHash, bytes: 0, lastAuthorLayerId: 'L3' };
+}
+
+function agentsSizeInbox(bookId: string, v3: NonNullable<AgentPlan['v3']>, detail: string): Parameters<typeof createInboxItem>[2] {
+  return {
+    kind: 'notice',
+    bookId,
+    title: `本书的 AGENTS.md 有 ${v3.agentsBytes} 字节：${detail}`,
+    body: { bytes: v3.agentsBytes, softLimit: V3_AGENTS_SOFT_LIMIT, layers: v3.layers ?? [] },
+    actions: [{ id: 'dismiss', label: '知道了' }],
+    dedupeKey: `v3_agents_size:${bookId}`,
+  };
+}
+
+/** pending 对应的 run 行 → Outcome（丢失的 run 记为 harness_crash） */
+function outcomeOfRunRow(row: typeof runs.$inferSelect | null): Outcome {
+  const base = { usage: ZERO_USAGE, denials: [], signal: null, rateLimits: [] };
+  if (!row || row.state === 'lost') return { ...base, status: 'failed', errorClass: 'harness_crash', message: 'run lost', exitCode: null };
+  const o = (row.outcome ?? {}) as { status?: Outcome['status']; message?: string; retryAfter?: string };
+  return { ...base, status: o.status ?? 'failed', ...(row.errorClass ? { errorClass: row.errorClass as ErrorClass } : {}), ...(o.message ? { message: o.message } : {}), ...(o.retryAfter ? { retryAfter: o.retryAfter } : {}), exitCode: row.exitCode ?? null };
+}
+
+/**
+ * 服务器侧失败（收稿 / finalize / 提交）：pending 留着，failures+1；按书的阶梯等待，下次只收稿不开 run。
+ * 第 2 次发待办 v3_pending:<book>；第 3 次任务 blocked，待办带“重试 / 放弃”（确定性的服务器问题，等主人，不打转）。
+ */
+async function pendingFailure(env: ExecEnv, task: TaskRow, bookId: string, runId: string, err: unknown): Promise<TaskResult> {
+  const msg = (err as Error)?.message ?? String(err);
+  env.log.warn({ err: msg, taskId: task.id, runId }, 'v3 pending harvest failed');
+  const now = env.nowFn();
+  const p = await patchPending(env.db, bookId, runId, { lastError: msg.slice(0, 1000) }, { incFailures: true });
+  if (!p) return { status: 'waiting', retryAfter: new Date(now.getTime() + 60_000).toISOString(), message: `v3：${msg}` };
+  const failures = p.failures;
+  const dedupeKey = `v3_pending:${bookId}`;
+  const title = `收稿失败 ${failures} 次：${msg.slice(0, 200)}`;
+  const body = { runId, taskId: task.id, manifestFile: p.manifestFile, snapshotDir: p.snapshotDir, lastError: msg, on: { retry: { task: 'ready' }, discard: { task: 'ready' } } };
+  const summary = { v3: { pendingKept: true, failures } };
+  if (failures >= 3) {
+    const actions = [
+      { id: 'retry', label: '重试收稿' },
+      { id: 'discard', label: '放弃这次的稿（已提交的章撤回到 drafts/，改动留在 work/ 下）', danger: true },
+    ];
+    const updated = await env.db.update(inbox).set({ title, body, actions, relatedTaskId: task.id }).where(and(eq(inbox.dedupeKey, dedupeKey), eq(inbox.state, 'open'))).returning({ id: inbox.id });
+    if (updated.length === 0) await createInboxItem(env.db, env.bus, { kind: 'block', bookId, title, body, actions, dedupeKey, relatedTaskId: task.id });
+    return { status: 'blocked', errorClass: 'unknown', message: title, summary };
+  }
+  if (failures >= 2) await createInboxItem(env.db, env.bus, { kind: 'notice', bookId, title, body, actions: [{ id: 'dismiss', label: '知道了' }], dedupeKey, relatedTaskId: task.id });
+  const wait = BOOK_LADDER_MS[Math.min(Math.max(failures - 1, 0), BOOK_LADDER_MS.length - 1)] as number;
+  return { status: 'waiting', retryAfter: new Date(now.getTime() + wait).toISOString(), message: `v3：${msg}`, summary };
+}
+
+/** 有 pending 时的一次执行：先把快照收进 work/（还没收的话），再走 finalize + 判定；不开新 run */
+async function consumePending(env: ExecEnv, ctx: PipelineContext, handler: TaskHandler, task: TaskRow, pending: V3Pending, runRow: typeof runs.$inferSelect | null): Promise<TaskResult> {
+  const book = ctx.book as BookHandle;
+  await setTaskState(env.db, task.id, 'running');
+  let manifestFile = pending.manifestFile;
+  let lost = !runRow || runRow.state === 'lost';
+  if (pending.stage === 'run') {
+    const snapExists = await fs.stat(pending.snapshotDir).then((st) => st.isDirectory(), () => false);
+    try {
+      const ch = await collectRunChanges({ snapshotDir: pending.snapshotDir, baseCommit: pending.baseCommit, liveBookDir: book.dir, taskId: pending.taskId, runId: pending.runId });
+      manifestFile = ch.manifestFile;
+      await patchPending(env.db, book.id, pending.runId, { stage: 'harvested', manifestFile });
+    } catch (err) {
+      return pendingFailure(env, task, book.id, pending.runId, err);
+    }
+    // 快照不在了（被手工清掉）：改动集为空，按 lost 记
+    if (!snapExists) lost = true;
+    else await removeRunSnapshot({ dir: pending.snapshotDir, baseCommit: pending.baseCommit, bookDir: book.dir }).catch(() => {});
+  }
+  const outcome = outcomeOfRunRow(runRow);
+  const run: RunContext = {
+    runId: pending.runId,
+    attempt: pending.attempt,
+    runDir: pending.runDir,
+    snapshotDir: pending.snapshotDir,
+    outDir: '',
+    inDir: pending.inDir,
+    baseCommit: pending.baseCommit,
+    profileId: pending.route.profile,
+    accountId: pending.route.account,
+    harness: pending.route.harness,
+    model: pending.route.model ?? '',
+    role: 'writer',
+    degraded: [],
+  };
+  const harvested: HarvestedRun = {
+    run,
+    outcome,
+    stagedOutDir: '',
+    files: [],
+    artifacts: [],
+    nonce: OK_NONCE,
+    audit: { ok: true, extraFiles: [], tamperedConfig: [] },
+    v3: { manifestFile, lost, stderrTail: '', trailerKey: pending.trailerKey, ownerCancelled: false },
+  };
+  const res = await judgeRunV3(env, ctx, handler, task, harvested, { profile: pending.route.profile, account: pending.route.account, harness: pending.route.harness }, outcome);
+  return attachMeta(res, { harness: pending.route.harness, ...(pending.route.model ? { model: pending.route.model } : {}), isolation: pending.route.isolation, instructionsHash: pending.route.stackHash }, harvested);
+}
+
+/**
+ * v3 判定（p1-plan §3 executor 10）：总是先 finalize（没有 INFRA 短路），再按 classifyV3Run 定状态、退避和记账。
+ * 运行从不返回 retry / blocked；planFailure 的副作用（账号睡眠、认证失效、待办、换 profile）照样执行。
+ */
+async function judgeRunV3(env: ExecEnv, ctx: PipelineContext, handler: TaskHandler, task: TaskRow, harvested: HarvestedRun, route: { profile: string; account: string | null; harness: string }, outcome: Outcome): Promise<TaskResult> {
+  const book = ctx.book as BookHandle;
+  const runId = harvested.run.runId;
+  const v3 = harvested.v3 as NonNullable<HarvestedRun['v3']>;
+  let fin: TaskResult;
+  try {
+    if (!handler.finalize) throw new Error(`handler ${task.kind} 没有 finalize`);
+    fin = await handler.finalize(ctx, task, harvested);
+  } catch (err) {
+    return pendingFailure(env, task, book.id, runId, err);
+  }
+  const now = env.nowFn();
+  const orch = orchOf(task);
+  const cls = outcome.errorClass ?? null;
+  const infraClass = cls && INFRA_CLASSES.has(cls) && outcome.status !== 'completed' ? cls : null;
+  const fp: FailurePlan | null = infraClass
+    ? planFailure(infraClass, {
+        taskId: task.id,
+        kind: task.kind as TaskKind,
+        bookId: task.bookId,
+        outcome,
+        orch,
+        profile: route.profile,
+        accountId: route.account,
+        vendor: vendorOf(route.harness),
+        refusalRetryOtherVendor: book.config.policy.refusal_retry_other_vendor ?? true,
+        denialInOutDir: false,
+        now,
+      })
+    : null;
+  const sum = (fin.summary?.v3 ?? {}) as { accepted?: number; changed?: number; noChapterStreak?: number; completed?: unknown };
+  const accountKey = zeroDiffAccountKey(route.account, route.profile);
+  const accountStreak = await readZeroDiff(env.db, accountKey);
+  const bookRow = (await env.db.select({ meta: books.meta }).from(books).where(eq(books.id, book.id)).limit(1))[0];
+  const verdict = classifyV3Run({
+    outcome,
+    ownerCancelled: v3.ownerCancelled,
+    lost: v3.lost,
+    accepted: sum.accepted ?? 0,
+    completed: !!sum.completed && !!fin.promote,
+    changed: sum.changed ?? 0,
+    noChapterStreak: sum.noChapterStreak ?? 0,
+    emptyStreak: readV3Meta(bookRow?.meta).emptyStreak,
+    accountStreak,
+    planFailure: fp ? { status: fp.result.status, ...(fp.result.retryAfter ? { retryAfter: fp.result.retryAfter } : {}), ...(fp.result.avoidProfile ? { avoidProfile: fp.result.avoidProfile } : {}) } : null,
+    now,
+  });
+  if (fp) {
+    // 账号睡眠 / 认证失效 / 待办 / 换 profile 属于 run 结束的那一刻：每个 run 只做一次。
+    // 提交失败或重启后再次消化同一个 pending 时不能重做（主人可能已经修好了账号）
+    const pend = await readPending(env.db, book.id);
+    const applied = pend?.runId === runId && pend.infraApplied === true;
+    if (!applied) {
+      await applyFailurePlan(env, task, fp);
+      await patchPending(env.db, book.id, runId, { infraApplied: true });
+    }
+  }
+
+  // 账号空跑连击：有新章 / 有改动 → 归零；空跑 → +1；其余（取消、基础设施、lost、正常结束却没写）不动
+  let streak = accountStreak;
+  if (verdict.zeroDiff) streak = await bumpZeroDiff(env.db, accountKey, true, now);
+  else if (verdict.bookEmpty === 'reset') streak = await bumpZeroDiff(env.db, accountKey, false, now);
+  // 书的空跑连击：+1 在这里；有改动时由 v3.batch 效果归零
+  if (verdict.bookEmpty === 'inc') await bumpBookEmpty(env.db, book.id, 'inc');
+  else if (verdict.bookEmpty === 'reset' && !fin.promote) await bumpBookEmpty(env.db, book.id, 'reset');
+  if (verdict.pauseAccount) {
+    if (route.account) await sleepAccount(env.db, route.account, new Date(now.getTime() + ZERO_DIFF_PAUSE_MS).toISOString(), 'v3 连续空跑');
+    await createInboxItem(env.db, env.bus, zeroDiffInbox(route.account ?? accountKey, streak, v3.stderrTail));
+  }
+  if (verdict.bookInbox) {
+    const noProse = verdict.bookInbox === 'no_prose';
+    await createInboxItem(env.db, env.bus, {
+      kind: 'notice',
+      bookId: book.id,
+      title: noProse ? '连续 5 次运行有改动却没有合格的新章' : '连续 5 次运行什么都没写',
+      body: { taskId: task.id, runId, detail: noProse ? '作者在改笔记或写的章节没通过检查（被截断、太短、重复）。看一下 drafts/ 和最近的系统提示。' : '运行没有在书房里留下任何文件。检查账号、模型和 harness。' },
+      actions: [{ id: 'dismiss', label: '知道了' }],
+      dedupeKey: `v3_${noProse ? 'no_prose' : 'empty'}:${book.id}`,
+    });
+  }
+  const keep = verdict.status === 'keep_cancelled';
+  const status: 'done' | 'waiting' = verdict.status === 'waiting' ? 'waiting' : 'done';
+  const summary = { ...(fin.summary ?? {}), v3: { ...((fin.summary?.v3 as Record<string, unknown> | undefined) ?? {}), verdict: verdict.status, ...(keep ? { keepCancelled: true } : {}) } };
+  return {
+    ...fin,
+    status,
+    ...(status === 'waiting' && verdict.retryAfter ? { retryAfter: verdict.retryAfter } : {}),
+    ...(verdict.avoidProfile ? { avoidProfile: verdict.avoidProfile } : {}),
+    ...(status !== 'done' && infraClass ? { errorClass: infraClass, message: outcome.message ?? infraClass } : {}),
+    summary,
+  };
 }
 
 async function patchOrch(env: ExecEnv, task: TaskRow, patch: Partial<OrchTaskState>): Promise<void> {
@@ -917,6 +1307,7 @@ export async function finishTask(deps: ExecutorDeps, task: TaskRow, result: Task
   const env = execEnv(deps);
   const latest = ((await env.db.select().from(tasks).where(eq(tasks.id, task.id)).limit(1)) as TaskRow[])[0];
   if (!latest) return;
+  if (result.promote?.v3 || isV3Kind(task.kind)) return finishTaskV3(env, task, latest, result);
   if (latest.state === 'cancelled') return;
   if (result.summary?.detached) return; // 进程退出：lease 过期后由 recovery 接管
   // fencing：lease 过期被别的 runner 接走后，这里的旧结果不能再提交
@@ -999,6 +1390,78 @@ export async function finishTask(deps: ExecutorDeps, task: TaskRow, result: Task
   if (promoted && (promoted.status === 'committed' || promoted.status === 'rebased') && result.chapter?.state === 'accepted' && bookId) {
     await publishAccepted(env, bookId, result.chapter.no);
   }
+}
+
+/**
+ * v3 的 finishTask（p1-plan §3 executor 11）：逐章提交（promoteV3，出错不抛给 dispatchOne）、清 pending、每章一个 chapter_accepted。
+ * 主人取消的任务照样收稿提交，任务保持 cancelled。
+ */
+async function finishTaskV3(env: ExecEnv, task: TaskRow, latest: TaskRow, result: TaskResult): Promise<void> {
+  if (result.summary?.detached) return; // 进程退出 / 模拟崩溃：lease 过期后由下一次执行消化 pending
+  const bookId = task.bookId;
+  const attached = RESULT_META.get(result);
+  const runId = attached?.harvested?.run.runId ?? result.promote?.runId ?? null;
+  const cancelled = latest.state === 'cancelled';
+  if (cancelled) {
+    // 只有本进程仍拥有这次 run 时才收（取消的任务没有 lease owner，看 run 行）
+    const own = runId ? (await env.db.select({ o: runs.leaseOwner }).from(runs).where(eq(runs.id, runId)).limit(1))[0]?.o === env.owner : false;
+    if (!own || !bookId) return;
+  } else if (!ACTIVE_STATES.includes(latest.state as (typeof ACTIVE_STATES)[number]) || (latest.leaseOwner && latest.leaseOwner !== env.owner)) {
+    env.log.warn({ taskId: task.id, state: latest.state, leaseOwner: latest.leaseOwner }, 'finishTask: 已失去 lease，丢弃结果');
+    return;
+  }
+  const v3sum = (result.summary?.v3 ?? {}) as { keepCancelled?: boolean; pendingKept?: boolean };
+  const keepCancelled = cancelled || v3sum.keepCancelled === true;
+  const plan = result.promote?.v3 ? (result.promote as PromotePlan & { v3: V3CommitPlan }) : null;
+  let landedNew: number[] = [];
+
+  if (plan && bookId && (result.status === 'done' || result.status === 'waiting')) {
+    const book = await env.pipe.openBook(env.pdeps, bookId);
+    if (!cancelled) await setTaskState(env.db, task.id, 'finalizing');
+    try {
+      const inDir = attached?.harvested?.run.inDir;
+      if (inDir && (await serverFault({ deps: env.pdeps, book }, inDir, 'promote'))) throw new Error('serverFault: promote');
+      const promoted = await promoteV3(env.db, book.repo, latest, plan, attached?.meta ?? {});
+      for (const n of promoted.notices) await createInboxItem(env.db, env.bus, n);
+      const fresh = new Set(plan.v3.parts.filter((p) => !p.rewrite).map((p) => p.no));
+      landedNew = promoted.landed.filter((n) => fresh.has(n));
+    } catch (err) {
+      // 提交失败不交给 dispatchOne（那里会每 30 秒 repromote 一次）：pending 留着，按书的阶梯等
+      const failed = await pendingFailure(env, latest, bookId, runId ?? plan.runId ?? '', err);
+      if (!cancelled) {
+        const state = await completeTask(env.db, task.id, failed, completeOpts(env));
+        env.bus.publish({ type: 'task_changed', taskId: task.id, book: bookId, state });
+      }
+      return;
+    }
+  } else if (bookId && runId && !v3sum.pendingKept) {
+    // 没有可提交的改动（空跑）：这次 run 的 pending 到此为止
+    await clearPending(env.db, bookId, runId);
+  }
+
+  if (keepCancelled) {
+    for (const i of result.inbox ?? []) await createInboxItem(env.db, env.bus, { ...i, bookId: i.bookId ?? bookId, relatedTaskId: i.relatedTaskId ?? task.id });
+  } else {
+    const { promote: _p, ...persisted } = result;
+    const state = await completeTask(env.db, task.id, persisted as TaskResult, completeOpts(env));
+    env.bus.publish({ type: 'task_changed', taskId: task.id, book: bookId, state });
+    if (state === 'failed') {
+      await createInboxItem(env.db, env.bus, {
+        kind: 'block',
+        bookId,
+        title: `任务失败：${task.kind}（${task.target}）`,
+        body: { taskId: task.id, errorClass: result.errorClass ?? latest.lastErrorClass, message: result.message },
+        actions: [
+          { id: 'retry', label: '重试' },
+          { id: 'dismiss', label: '忽略' },
+        ],
+        dedupeKey: `failed:${task.id}`,
+        relatedTaskId: task.id,
+      });
+    }
+    await drainOutbox(env, task.id);
+  }
+  if (bookId) for (const no of landedNew) await publishAccepted(env, bookId, no);
 }
 
 function completeOpts(env: ExecEnv): { now?: Date; backoffBaseMs?: number } {
@@ -1171,7 +1634,8 @@ export async function markRunLost(env: ExecEnv, runRow: typeof runs.$inferSelect
   const session = await loadSession(runRow.runDir);
   if (session) {
     await releaseReservations(env.db, session.reservationIds);
-    if (session.spec.bookDir) {
+    // v3：不收稿、不删快照——pending（stage 'run'）指着它，本书下一次执行任何 v3 任务时收
+    if (session.spec.bookDir && session.contract !== 'v3') {
       const rows = await env.db.select({ dir: books.slug }).from(books).where(eq(books.id, runRow.bookId ?? '')).limit(1);
       if (rows[0]) await removeRunSnapshot({ dir: session.spec.bookDir, baseCommit: session.runCtx.baseCommit, bookDir: path.join(env.paths.books, rows[0].dir) }).catch(() => {});
     }

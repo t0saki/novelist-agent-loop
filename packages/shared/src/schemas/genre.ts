@@ -88,6 +88,8 @@ export const zGenrePack = z.object({
   extends: z.array(z.string()).default([]),
   version: z.string().default('1'),
   builtin: z.boolean().default(false),
+  /** 停用：不再出现在开书页和自动开书里；已有的书照常解析这个包 */
+  hidden: z.boolean().default(false),
   /** 事件词族：召回探针用（§6.6），如 death: [死, 陨落, 断气] */
   event_families: z.record(z.string(), z.array(z.string())).default({}),
   catalogs: z.record(z.string(), z.array(z.string())).default({}),

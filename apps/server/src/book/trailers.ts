@@ -9,6 +9,12 @@ export const TRAILER = {
   isolation: 'Novelist-Isolation',
   migration: 'Novelist-Migration',
   owner: 'Novelist-Owner-Edit',
+  /** v3：一批里每章提交带 `${key}#${no}` */
+  part: 'Novelist-Part',
+  /** v3：最后一个提交上落地的新章号，如 "6,7,8" */
+  chapters: 'Novelist-Chapters',
+  /** v3：运行期间被主人改过、因此放弃了作者版本的路径 */
+  ownerWins: 'Novelist-Owner-Wins',
 } as const;
 
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;

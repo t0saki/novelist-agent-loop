@@ -5,7 +5,7 @@ import { and, count, desc, eq, inArray, ne, notInArray } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { parseDocument } from 'yaml';
 import type { BookOverview, BookSummary, CreateBook, Frontiers, GitCommitRow, PublishOverview } from '@novelist/shared';
-import { chapterId, countCjk, stripBeatMarkers, zCreateBook } from '@novelist/shared';
+import { V3_PUBLISH_DEFAULTS, V3_TITLE_PLACEHOLDER, chapterId, countCjk, parseChapterHeading, stripBeatMarkers, stripTitleLine, zCreateBook } from '@novelist/shared';
 import type { z } from 'zod';
 import type { AppDeps } from '../app.js';
 import { bookFiles, CanonicalParseError, initBookRepo, openRepo, P, type BookRepo } from '../book/index.js';
@@ -24,7 +24,7 @@ const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 export const LIVE_TASK_STATES = ['pending', 'ready', 'waiting', 'leased', 'running', 'finalizing'] as const;
 const ACTIVE_RUN_STATES = ['preparing', 'spawned', 'running'] as const;
 
-export async function makeSlug(deps: Pick<AppDeps, 'db' | 'paths'>, title: string): Promise<string> {
+export async function makeSlug(deps: Pick<AppDeps, 'db' | 'paths'>, title: string, opts: { blankRandom?: boolean } = {}): Promise<string> {
   const taken = new Set((await deps.db.select({ s: books.slug }).from(books)).map((r) => r.s));
   try {
     for (const name of await fs.readdir(deps.paths.books)) taken.add(name);
@@ -32,7 +32,8 @@ export async function makeSlug(deps: Pick<AppDeps, 'db' | 'paths'>, title: strin
     // books 目录尚未创建
   }
   const { slugifyName } = await import('../state/ids.js');
-  const candidate = slugifyName(title, taken).slice(0, 60).replace(/-$/, '');
+  // 空书名（只有 v3 允许）：不拼音化，直接用随机 slug
+  const candidate = title.trim() || opts.blankRandom !== true ? slugifyName(title, taken).slice(0, 60).replace(/-$/, '') : '';
   if (SLUG_RE.test(candidate) && !taken.has(candidate)) return candidate;
   return `book-${nanoid(8).toLowerCase().replace(/[^a-z0-9]/g, '0')}`;
 }
@@ -41,11 +42,13 @@ export async function makeSlug(deps: Pick<AppDeps, 'db' | 'paths'>, title: strin
 export async function createBook(deps: AppDeps, input: CreateBook): Promise<BookSummary> {
   const parsed: z.output<typeof zCreateBook> = zCreateBook.parse(input);
   if (!(await genreExists(deps.paths, parsed.genre))) throw new HttpProblem(400, 'unknown_genre', `题材包不存在：${parsed.genre}`);
-  const slug = parsed.slug ?? (await makeSlug(deps, parsed.title));
+  const slug = parsed.slug ?? (await makeSlug(deps, parsed.title, { blankRandom: parsed.flow === 'v3' }));
   const existing = await deps.db.select({ id: books.id }).from(books).where(eq(books.slug, slug)).limit(1);
   if (existing[0]) throw conflict(`书 ${slug} 已存在`);
   const dir = bookDir(deps, slug);
   if (await fs.stat(dir).then(() => true, () => false)) throw conflict(`目录 ${slug} 已存在`);
+
+  if (parsed.flow === 'v3') return createBookV3(deps, parsed, slug, dir);
 
   const tier = parsed.tier ?? (await loadSystemSettings(deps.db)).defaultTier;
   const config: Record<string, unknown> = { slug, title: parsed.title, genre: parsed.genre, tier };
@@ -57,6 +60,39 @@ export async function createBook(deps: AppDeps, input: CreateBook): Promise<Book
   await deps.db.insert(books).values({ id, slug, title: parsed.title, genre: parsed.genre, status: 'draft', tier, headCommit: commit });
   await deps.db.insert(bookEvents).values({ bookId: id, kind: 'book.created', body: { slug, seed_chars: parsed.seed.length } });
   if (parsed.start) await deps.orchestrator.startBook(id, { interview: parsed.interview });
+  deps.bus.publish({ type: 'book_changed', book: slug });
+  const row = await bookBySlug(deps, slug);
+  return (await summarize(deps, [row]))[0] as BookSummary;
+}
+
+/**
+ * v3 开书（p1-plan §3 WP-C）：book.yaml 写 flow/v3/发布默认值，仓库用 v3 布局（seed.md、不入库的根 AGENTS.md）。
+ * 书名可留空：用 '未命名·' 占位（与自动开书的 '待命名·' 不同，nameAutoBooks 不会碰），由作者在 bible.md 里起名（auto_title）。
+ */
+async function createBookV3(deps: AppDeps, parsed: z.output<typeof zCreateBook>, slug: string, dir: string): Promise<BookSummary> {
+  const settings = await loadSystemSettings(deps.db);
+  const len = parsed.v3?.length ?? 'medium';
+  const target = parsed.v3?.target_cjk ?? settings.autoStart.lengths[len].targetCjk;
+  const n0 = Math.max(1, Math.ceil(target / 4000));
+  const batch = parsed.v3?.batch ?? 5;
+  const typed = parsed.title.trim();
+  const title = typed || `${V3_TITLE_PLACEHOLDER}${nanoid(6)}`;
+  const maxBuffer = Math.max(15, 2 * batch);
+  const config: Record<string, unknown> = {
+    slug,
+    title,
+    genre: parsed.genre,
+    tier: 'lite',
+    flow: 'v3',
+    v3: { length: len, target_cjk: target, planned_chapters: n0, planned_chapters_initial: n0, batch, min_chapter_cjk: parsed.v3?.min_chapter_cjk ?? 3000, auto_title: !typed },
+    publish: { ...V3_PUBLISH_DEFAULTS, max_buffer: maxBuffer, resume_buffer: maxBuffer - 5 },
+  };
+  const { commit } = await initBookRepo(dir, { config: config as never, premise: parsed.seed, layout: 'v3' });
+  const id = randomUUID();
+  const meta = { v3: { hints: [], noChapterStreak: 0, emptyStreak: 0, finaleNoMarker: 0, lastBatchFrom: null, lastBatchAt: null, hintedShort: [], locked: [], pending: null } };
+  await deps.db.insert(books).values({ id, slug, title, genre: parsed.genre, status: 'draft', tier: 'lite', headCommit: commit, meta });
+  await deps.db.insert(bookEvents).values({ bookId: id, kind: 'book.created', body: { slug, seed_chars: parsed.seed.length, flow: 'v3' } });
+  if (parsed.start) await deps.orchestrator.startBook(id, { interview: false });
   deps.bus.publish({ type: 'book_changed', book: slug });
   const row = await bookBySlug(deps, slug);
   return (await summarize(deps, [row]))[0] as BookSummary;
@@ -97,12 +133,23 @@ export async function reindexBook(deps: AppDeps, slug: string): Promise<void> {
   let acceptedThrough = 0;
   let totalCjk = 0;
   const nos = manuscriptFiles.map(noOf).sort((a, b) => a - b);
+  const v3 = (await files.config().catch(() => null))?.config.flow === 'v3';
   for (const [i, no] of nos.entries()) {
     if (no === i + 1) acceptedThrough = no;
     const text = await files.manuscript(no, head);
     if (text === null) continue;
     const cjk = countCjk(text, 'han');
     totalCjk += cjk;
+    if (v3) {
+      // v3：标题只取正文首行的标题行；没有标题行就保留库里的值，从不编造“第N章”
+      const heading = parseChapterHeading(text.split('\n').find((l) => l.trim() !== '') ?? '');
+      const update = { chapterId: chapterId(no), cjk, state: 'accepted', updatedAt: nowIso, ...(heading ? { title: heading.title } : {}) };
+      await deps.db
+        .insert(chapters)
+        .values({ bookId: book.id, no, title: heading?.title ?? '', volume: '', arc: '', ...update, publishedAt: no <= pubThrough ? nowIso : null })
+        .onConflictDoUpdate({ target: [chapters.bookId, chapters.no], set: update });
+      continue;
+    }
     const card = await files.card(no, head).catch(() => null);
     const update = { chapterId: chapterId(no), cjk, state: 'accepted', updatedAt: nowIso, ...(card ? { title: card.title, volume: card.volume, arc: card.arc } : {}) };
     const publishedAt = no <= pubThrough ? nowIso : null;
@@ -232,13 +279,14 @@ export async function patchBookYaml(deps: AppDeps, row: BookRow, repo: BookRepo,
   return next;
 }
 
-export async function collectManuscripts(repo: BookRepo, nos: number[]): Promise<Map<number, string>> {
+/** stripTitle：v3 书的正文首行是“# 第N章 标题”，读者端去掉它（v2 和导入的书保留原样） */
+export async function collectManuscripts(repo: BookRepo, nos: number[], opts?: { stripTitle?: boolean }): Promise<Map<number, string>> {
   const rels = nos.map((n) => P.manuscript(n));
   const texts = repo.readMany ? await repo.readMany(rels) : await Promise.all(rels.map((r) => repo.readFile(r)));
   const out = new Map<number, string>();
   nos.forEach((no, i) => {
     const t = texts[i];
-    if (t != null) out.set(no, stripBeatMarkers(t));
+    if (t != null) out.set(no, opts?.stripTitle ? stripTitleLine(stripBeatMarkers(t)) : stripBeatMarkers(t));
   });
   return out;
 }

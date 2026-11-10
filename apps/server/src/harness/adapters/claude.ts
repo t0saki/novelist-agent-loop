@@ -29,6 +29,7 @@ import {
   readSchemaFile,
   standardProbe,
   toolCallEvent,
+  wantsSchema,
 } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
@@ -416,7 +417,7 @@ export const claudeAdapter: HarnessAdapter = {
     if (spec.mcp) argv.push('--mcp-config', path.join(spec.inDir, 'mcp.cc.json'));
     if (settingsPath) argv.push('--settings', settingsPath);
     argv.push(...matArgv);
-    if (caps.structuredOutput === 'native') {
+    if (wantsSchema(spec, caps)) {
       const schema = readSchemaFile(spec);
       if (schema) argv.push('--json-schema', schema);
     }

@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Capabilities, HarnessInstall, NEventBody } from '@novelist/shared';
 import type { TOOL_KINDS } from '@novelist/shared';
+import { V3_LAUNCH_PROMPT } from '@novelist/shared';
 import { RunPrepareError, runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, Invocation, ProbeContext, ResolvedAccount, RunSpec } from '../types.js';
 import { parseVersion, satisfies, whichSync } from '../util.js';
@@ -122,12 +123,23 @@ export function filterExtraArgs(args: string[], deny: RegExp[]): string[] {
 
 /** 读 receipt schema（命令行内联用）。去掉 $schema：zod 4 产出 draft 2020-12 声明，cc 内置的校验器不认这个元 schema（本机 2.1.319 实测报错） */
 export function readSchemaFile(spec: RunSpec): string | null {
+  if (spec.contract === 'v3') return null;
   try {
     const { $schema: _dropped, ...schema } = JSON.parse(readFileSync(spec.receiptSchemaFile, 'utf8')) as Record<string, unknown>;
     return JSON.stringify(schema);
   } catch {
     return null;
   }
+}
+
+/** v3 没有回执：不传 --json-schema / --output-schema */
+export function wantsSchema(spec: RunSpec, caps: Capabilities): boolean {
+  return spec.contract !== 'v3' && caps.structuredOutput === 'native';
+}
+
+/** 启动语：v3 统一为 V3_LAUNCH_PROMPT，旧契约用 adapter 自己的工作单提示 */
+export function launchPrompt(spec: RunSpec, legacy: string): string {
+  return spec.contract === 'v3' ? V3_LAUNCH_PROMPT : legacy;
 }
 
 /** 通用 Invocation 骨架 */

@@ -141,9 +141,10 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const book = await bookBySlug(deps, req.params.slug);
     const patch = parsePatch(zPutPublish, req.body);
     const repo = openRepo(bookDir(deps, book.slug));
-    const current = (await bookFiles(repo).config()).config.publish;
+    const cfg = (await bookFiles(repo).config()).config;
+    const current = cfg.publish;
     const next = zPublishConfig.parse({ ...current, ...patch });
-    assertPublishConfig(next);
+    assertPublishConfig(next, cfg.flow === 'v3' ? { batch: cfg.v3.batch } : undefined);
     await patchBookYaml(
       deps,
       book,

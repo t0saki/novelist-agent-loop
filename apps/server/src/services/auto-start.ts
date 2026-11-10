@@ -175,7 +175,7 @@ export async function maybeStartBook(deps: AppDeps, now: Date, s: SystemSettings
     return orphan.slug;
   }
 
-  const packs = (await listGenres(deps.paths)).filter((p) => (cfg.genres ? cfg.genres.includes(p.id) : p.auto?.enabled === true) && (p.auto?.weight ?? 1) > 0);
+  const packs = (await listGenres(deps.paths)).filter((p) => !p.hidden && (cfg.genres ? cfg.genres.includes(p.id) : p.auto?.enabled === true) && (p.auto?.weight ?? 1) > 0);
   // v1 的教训：没有题材就不开书，避免写出无关内容
   if (packs.length === 0) return null;
   const counted = await deps.db.select({ genre: books.genre, n: count() }).from(books).groupBy(books.genre);

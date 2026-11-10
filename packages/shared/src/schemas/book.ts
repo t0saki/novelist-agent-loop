@@ -40,6 +40,36 @@ export const zExhaustPolicy = z.object({
   canon_hard: z.enum(['block', 'hold']).default('block'),
 });
 
+/** Novelist 3（docs/v3/DESIGN.md）：书级流程开关。缺省 v2 = 旧流水线 */
+export const FLOWS = ['v2', 'v3'] as const;
+export type Flow = (typeof FLOWS)[number];
+export const zEffort = z.enum(['low', 'medium', 'high']);
+export type Effort = z.infer<typeof zEffort>;
+export const V3_LENGTHS = ['short', 'medium', 'long', 'epic'] as const; // 与 AUTO_LENGTHS 同一组 id
+export type V3Length = (typeof V3_LENGTHS)[number];
+/** Placeholder title for v3 books created without a title. Deliberately different from auto-start's '待命名·' so nameAutoBooks never touches v3 books. */
+export const V3_TITLE_PLACEHOLDER = '未命名·';
+
+export const zV3BookConfig = z.object({
+  length: z.enum(V3_LENGTHS).default('medium'),
+  /** Lower bound for the whole book (CJK chars). Exceeding it triggers nothing. */
+  target_cjk: z.number().int().positive().default(60_000),
+  /** Planned chapter count. Server writes N0 = ceil(target_cjk / 4000) at creation and updates it from outline.md "计划：共 N 章" (clamped to [ceil(N0/2), 2*N0]). */
+  planned_chapters: z.number().int().positive().optional(),
+  /** N0, fixed at creation (used for the clamp and for "最多 X 章" in ORDER). */
+  planned_chapters_initial: z.number().int().positive().optional(),
+  min_chapter_cjk: z.number().int().positive().default(3000),
+  batch: z.number().int().min(1).max(8).default(5),
+  /** §3.4: a chapter becomes publishable this many hours after acceptance (if nothing else frees it earlier) */
+  publish_after_hours: z.number().positive().default(24),
+  /** Title left empty at creation: take the title from line 1 of bible.md after a harvest, until one is found */
+  auto_title: z.boolean().default(false),
+  effort: z
+    .object({ open: zEffort.default('medium'), write: zEffort.default('medium'), finale: zEffort.default('high') })
+    .default({ open: 'medium', write: 'medium', finale: 'high' }),
+});
+export type V3BookConfig = z.infer<typeof zV3BookConfig>;
+
 export const zBookConfig = z.object({
   schema: z.literal('nv.book/1').default('nv.book/1'),
   format_version: z.number().int().default(BOOK_FORMAT_VERSION),
@@ -149,6 +179,23 @@ export const zBookConfig = z.object({
   mcp: z.enum(['auto', 'on', 'off']).default('off'),
   /** persona 模式：append（默认）| replace（需 canary） */
   persona_mode: z.enum(['append', 'replace']).default('append'),
+  /** 流程：v2（缺省，旧流水线）| v3（一次运行写一批，docs/v3/DESIGN.md） */
+  flow: z.enum(FLOWS).default('v2'),
+  /** v3 专属配置；flow ≠ v3 时不读 */
+  v3: zV3BookConfig.default(zV3BookConfig.parse({})),
 });
 export type BookConfig = z.infer<typeof zBookConfig>;
+
+/** v3 publish defaults written into book.yaml by createBook (DESIGN §3.4 / §12.6) */
+export const V3_PUBLISH_DEFAULTS = {
+  mode: 'scheduled',
+  cadence: '0 8 * * *',
+  timezone: 'Asia/Shanghai',
+  per_slot: 2,
+  lag: 0,
+  min_lag: 0,
+  require_audited: false,
+  max_buffer: 15,
+  resume_buffer: 10,
+} as const satisfies Partial<PublishConfig>;
 export type BookConfigInput = z.input<typeof zBookConfig>;

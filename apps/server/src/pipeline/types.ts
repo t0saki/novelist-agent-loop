@@ -35,6 +35,9 @@ import type { ResolvedGenre } from '../genres/index.js';
 import type { NonceCheckReport } from '../instructions/types.js';
 import type { RunLimits } from '../harness/types.js';
 import type { DbEffect } from './effects.js';
+import type { V3CommitPlan } from '../flow/types.js';
+
+export type { V3CommitPlan } from '../flow/types.js';
 
 export type TaskRow = typeof tasks.$inferSelect;
 
@@ -126,6 +129,11 @@ export interface AgentPlan {
   limits?: Partial<RunLimits>;
   /** 修订是否尝试 resume（默认 false：新开 run） */
   resume?: { sessionId: string } | null;
+  /** v3 契约（docs/v3/DESIGN.md）：工作区根 AGENTS.md + ORDER.md，无回执 / schema / nonce */
+  contract?: 'v3';
+  v3?: { agentsMd: string; agentsBytes: number; claudeMd: string; orderMd: string; launchPrompt: string; stackHash: string; /** 各层字节数（超限待办用） */ layers?: { id: string; label: string; bytes: number }[] };
+  /** per-run effort override (wins over profile.effort) */
+  effort?: 'low' | 'medium' | 'high';
 }
 
 export type PrepareResult = { kind: 'run'; plan: AgentPlan } | { kind: 'skip'; result: TaskResult };
@@ -140,6 +148,8 @@ export interface HarvestedRun {
   artifacts: ArtifactDecl[];
   nonce: NonceCheckReport;
   audit: { ok: boolean; extraFiles: string[]; tamperedConfig: string[] };
+  /** v3：收稿清单（book/harvest.ts 的 changes.json；null = 没有收到任何改动）与本次 run 的幂等键 */
+  v3?: { manifestFile: string | null; lost: boolean; stderrTail: string; trailerKey: string; ownerCancelled: boolean };
 }
 
 export interface InboxInput {
@@ -171,6 +181,8 @@ export interface PromotePlan {
   effect?: DbEffect;
   /** 闭包形式（只用于测试桩）：无法写进 VALIDATED.json，崩溃恢复时会退回重跑 handler */
   dbEffects?: (tx: Tx, commitSha: string) => Promise<void>;
+  /** v3：逐章提交计划（committer.promoteV3）；存在时 files/message 不用 */
+  v3?: V3CommitPlan;
 }
 
 export type TaskStatus = 'done' | 'retry' | 'failed' | 'blocked' | 'hold' | 'waiting';
@@ -198,6 +210,8 @@ export interface TaskHandler {
   role: RoleId | null;
   lane: Lane;
   maxAttempts: number;
+  /** 'v3' = 新流程的 run 生命周期（pending 收稿、逐章提交、classifyV3Run）；缺省 = 旧契约 */
+  contract?: 'v3';
   manifest(ctx: PipelineContext, spec: TaskSpec): Promise<Manifest>;
   prepare?(ctx: PipelineContext, task: TaskRow, run: RunContext): Promise<PrepareResult>;
   finalize?(ctx: PipelineContext, task: TaskRow, h: HarvestedRun): Promise<TaskResult>;

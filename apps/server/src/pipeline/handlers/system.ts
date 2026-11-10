@@ -99,7 +99,8 @@ export const publish: TaskHandler = {
     const from = (rows[0]?.published ?? 0) + 1;
     const params = task.params as { manual?: boolean; ignoreAudit?: boolean };
     // 手动发布默认也服从 require_audited，只有显式 ignoreAudit 才越过审计
-    const auditCap = params.manual && params.ignoreAudit !== true && book.config.publish.require_audited ? (rows[0]?.audited ?? 0) : Number.MAX_SAFE_INTEGER;
+    // v3 书不看审计前沿（发布规则见 flow/publish.ts）
+    const auditCap = book.config.flow !== 'v3' && params.manual && params.ignoreAudit !== true && book.config.publish.require_audited ? (rows[0]?.audited ?? 0) : Number.MAX_SAFE_INTEGER;
     const to = Math.min(through, rows[0]?.accepted ?? through, auditCap);
     if (to < from) return { status: 'done', summary: { published: 0, through } };
     // tag 幂等（-f）；DB 更新重放也幂等（COALESCE / GREATEST）

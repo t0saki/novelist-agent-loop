@@ -71,6 +71,11 @@ export interface RunSpec {
   extraArgs: string[];
   /** 作者层通道：append（默认，追加到 harness 自带系统提示）/ replace（整体替换；需 caps.systemReplace） */
   personaMode?: 'append' | 'replace';
+  /**
+   * 'v3': cwd = writable book snapshot, instructions via root AGENTS.md/CLAUDE.md, no receipt/schema/nonce. Absent = old contract.
+   * v3 下 workOrderFile 是启动语文件 $RUN/in/launch.md，systemFile 是空的 $RUN/in/system.md，receiptSchemaFile 指向不会写入的路径。
+   */
+  contract?: 'v3';
 }
 
 /** prepareHome 的产物：home 的配置部分（每 run 重生成）与需要的 env */

@@ -7,7 +7,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { type GatesFile, type GenrePack, GENRE_FILES, type Lexicon, type Pacing, type PlainObject, mergeLayers, zGatesFile, zGenrePack, zLexicon, zPacing } from '@novelist/shared';
-import { parse as yamlParse, stringify as yamlStringify } from 'yaml';
+import { parse as yamlParse, parseDocument, stringify as yamlStringify } from 'yaml';
 import { TRAILER, ensureGitRepo, NothingToCommitError, openRepo } from '../book/index.js';
 import type { DataPaths } from '../config/index.js';
 
@@ -167,13 +167,78 @@ async function commitGenres(paths: DataPaths, message: string, task: string): Pr
     });
 }
 
-/** 首次启动：拷贝内置包（不覆盖已有）并 git init $DATA/genres；返回新拷贝的包 id */
+/** 主人删掉的内置包 id（一行一个，随删除一起提交）；seedBuiltinGenres 不再拷回 */
+export const REMOVED_BUILTIN_FILE = '.removed-builtin';
+
+export async function removedBuiltinIds(paths: DataPaths): Promise<Set<string>> {
+  const text = await fs.readFile(path.join(paths.genres, REMOVED_BUILTIN_FILE), 'utf8').catch(() => '');
+  return new Set(text.split('\n').map((l) => l.trim()).filter(Boolean));
+}
+
+/** 删除的题材包移到这里（$DATA/trash/genres/<id>-<时间>），不做不可恢复的删除；genres 仓库的历史里也还在 */
+export function genreTrashDir(paths: DataPaths): string {
+  return path.join(paths.root, 'trash', 'genres');
+}
+
+/** 题材包 id 只能是 genres/ 下的一层目录名：不含 / \，不是 . 或 ..（删除、停用这类写操作的最后一道防线） */
+export function assertPlainGenreId(id: string): void {
+  if (id === '' || id === '.' || id === '..' || /[/\\]/.test(id) || id.startsWith('.')) throw new Error(`题材包 id 不合法：${id}`);
+}
+
+/**
+ * 删除题材包（调用方先确认没有书在用、没有包继承它）：目录移进回收站，内置包另记墓碑，然后在 genres 仓库提交。
+ * 返回回收站里的位置。
+ */
+export async function trashGenre(paths: DataPaths, id: string, opts: { builtin: boolean }): Promise<string> {
+  assertPlainGenreId(id);
+  await ensureGitRepo(paths.genres);
+  const trash = genreTrashDir(paths);
+  await fs.mkdir(trash, { recursive: true });
+  const dest = path.join(trash, `${id}-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+  await fs.rename(path.join(paths.genres, id), dest).catch(async (e: NodeJS.ErrnoException) => {
+    // 回收站和数据目录不在同一个文件系统：复制后再移走原目录
+    if (e.code !== 'EXDEV') throw e;
+    await fs.cp(path.join(paths.genres, id), dest, { recursive: true });
+    await fs.rm(path.join(paths.genres, id), { recursive: true, force: true });
+  });
+  if (opts.builtin) {
+    const removed = await removedBuiltinIds(paths);
+    if (!removed.has(id)) await fs.appendFile(path.join(paths.genres, REMOVED_BUILTIN_FILE), `${id}\n`, 'utf8');
+  }
+  await openRepo(paths.genres)
+    .commit({ message: `genres: delete ${id}`, trailers: { [TRAILER.owner]: 'true' } })
+    .catch((e: unknown) => {
+      if (!(e instanceof NothingToCommitError)) throw e;
+    });
+  return dest;
+}
+
+/** 停用 / 恢复：把 hidden 写进 pack.yaml（保留注释）并以 owner 身份提交 */
+export async function setGenreHidden(paths: DataPaths, id: string, hidden: boolean): Promise<GenrePack> {
+  assertPlainGenreId(id);
+  await readPack(path.join(paths.genres, id), id);
+  const file = path.join(paths.genres, id, GENRE_FILES.pack);
+  const doc = parseDocument(await fs.readFile(file, 'utf8'));
+  if (hidden) doc.set('hidden', true);
+  else doc.delete('hidden');
+  await fs.writeFile(file, doc.toString({ lineWidth: 0 }), 'utf8');
+  await ensureGitRepo(paths.genres);
+  await openRepo(paths.genres)
+    .commit({ message: `genres: ${hidden ? 'hide' : 'unhide'} ${id}`, trailers: { [TRAILER.owner]: 'true' }, paths: [`${id}/${GENRE_FILES.pack}`] })
+    .catch((e: unknown) => {
+      if (!(e instanceof NothingToCommitError)) throw e;
+    });
+  return readPack(path.join(paths.genres, id), id);
+}
+
+/** 首次启动：拷贝内置包（不覆盖已有，因此也不动已有包的 hidden；主人删过的内置包不拷回）并 git init $DATA/genres；返回新拷贝的包 id */
 export async function seedBuiltinGenres(paths: DataPaths): Promise<string[]> {
   await ensureGitRepo(paths.genres);
   const entries = await fs.readdir(BUILTIN_GENRES_DIR, { withFileTypes: true });
+  const removed = await removedBuiltinIds(paths);
   const seeded: string[] = [];
   for (const e of entries) {
-    if (!e.isDirectory()) continue;
+    if (!e.isDirectory() || removed.has(e.name)) continue;
     const dest = path.join(paths.genres, e.name);
     if (await fs.stat(dest).then(() => true, () => false)) continue;
     await fs.cp(path.join(BUILTIN_GENRES_DIR, e.name), dest, { recursive: true });

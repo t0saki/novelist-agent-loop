@@ -92,7 +92,7 @@ export async function claimNext(db: Db, f: ClaimFilter): Promise<TaskRow | null>
       or(eq(tasks.state, 'ready'), and(eq(tasks.state, 'waiting'), isNotNull(tasks.notBefore))),
       or(isNull(tasks.notBefore), lte(tasks.notBefore, now)),
       sql`(${books.id} is null or ${books.status} in ('active','planning','completed') or ${tasks.kind} = 'publish')`,
-      sql`not (coalesce(${books.pausedReason}, '') = 'max_buffer' and ${tasks.kind} = 'chapter.write')`,
+      sql`not (coalesce(${books.pausedReason}, '') = 'max_buffer' and ${tasks.kind} in ('chapter.write','book.write'))`,
     ];
     if (f.lanes && f.lanes.length > 0) conds.push(inArray(tasks.lane, f.lanes));
     if (f.roles) {

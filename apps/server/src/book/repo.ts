@@ -417,6 +417,11 @@ async function gitInit(dir: string): Promise<void> {
 
 export const ROOT_AGENTS_PLACEHOLDER = '本文件由 Novelist 生成；你的书层指令在 instructions/AGENTS.md\n';
 const INSTRUCTIONS_TEMPLATE = '<!-- 书层指令（归你所有）：在这里写本书专属的要求。Novelist 原样传递、不改写不过滤；书层位于指令栈最后，优先级最高。 -->\n';
+/** v3 书：每次运行前生成到快照根目录、不入库的文件（只锚定根目录：不带 / 的 AGENTS.md 会连 instructions/AGENTS.md 一起忽略） */
+export const V3_GENERATED_FILES = ['/AGENTS.md', '/CLAUDE.md', '/ORDER.md'] as const;
+/** v3 书：主人的种子（原样保留） */
+export const V3_SEED_FILE = 'seed.md';
+const V3_BOOK_DIRS = ['manuscript', 'notes', 'drafts'] as const;
 
 /** book.yaml 文本：scale 的区间写成行内序列（设置页表单按单行读写） */
 function bookYamlText(config: Record<string, unknown>): string {
@@ -432,8 +437,10 @@ function bookYamlText(config: Record<string, unknown>): string {
  * 初始化书仓库：目录树、.gitignore、book.yaml、bible/premise.md（种子原样写入）、instructions/AGENTS.md（空模板）、
  * .claude/skills → ../.agents/skills 软链；首个 commit 带 Novelist-Task: book.init。
  * book.yaml 只写调用方显式给出的键（加 schema），默认值不固化。
+ * layout 'v3'（p1-plan §3 WP-C）：.gitignore 另加 AGENTS.md/CLAUDE.md/ORDER.md（每次运行前生成，不入库），种子写 seed.md；
+ * 不写根 AGENTS.md 占位、.agents/skills、.claude/skills 软链和 state/overrides.jsonl；磁盘上只建 manuscript/、notes/、drafts/。
  */
-export async function initBookRepo(dir: string, init: { config: BookConfigInput; premise: string }): Promise<{ repo: BookRepo; commit: string }> {
+export async function initBookRepo(dir: string, init: { config: BookConfigInput; premise: string; layout?: 'v3' }): Promise<{ repo: BookRepo; commit: string }> {
   const parsed = zBookConfig.safeParse(init.config);
   if (!parsed.success) throw new Error(`invalid book config: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   const abs = path.resolve(dir);
@@ -441,12 +448,23 @@ export async function initBookRepo(dir: string, init: { config: BookConfigInput;
   const existing = (await fs.readdir(abs)).filter((n) => n !== '.' && n !== '..');
   if (existing.length > 0) throw new Error(`book dir not empty: ${abs}`);
   await gitInit(abs);
-  for (const d of BOOK_DIRS) await fs.mkdir(path.join(abs, d), { recursive: true });
 
   const { schema: _schema, ...rest } = init.config as Record<string, unknown>;
   void _schema;
   const yamlDoc = bookYamlText({ schema: 'nv.book/1', ...rest });
   const repo = openRepo(abs);
+  if (init.layout === 'v3') {
+    for (const d of V3_BOOK_DIRS) await fs.mkdir(path.join(abs, d), { recursive: true });
+    await repo.writeFiles([
+      { path: P.gitignore, content: `${[...BOOK_GITIGNORE, ...V3_GENERATED_FILES].join('\n')}\n` },
+      { path: P.bookYaml, content: yamlDoc },
+      { path: V3_SEED_FILE, content: init.premise },
+      { path: P.instructionsAgents, content: INSTRUCTIONS_TEMPLATE },
+    ]);
+    const commit = await repo.commit({ message: `book: init ${parsed.data.slug}`, trailers: { [TRAILER.task]: 'book.init' } });
+    return { repo, commit };
+  }
+  for (const d of BOOK_DIRS) await fs.mkdir(path.join(abs, d), { recursive: true });
   await repo.writeFiles([
     { path: P.gitignore, content: `${BOOK_GITIGNORE.join('\n')}\n` },
     { path: P.bookYaml, content: yamlDoc },

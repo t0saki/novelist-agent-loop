@@ -110,15 +110,26 @@ interface LayerSpec {
 
 export async function resolveStack(input: ResolveStackInput): Promise<InstructionStack> {
   const read = makeReader(input.drafts);
-  const { role, taskKind } = input;
+  const v3 = input.v3;
+  // v3：角色固定 writer，不读任务文件
+  const role = v3 ? 'writer' : input.role;
+  const taskKind = v3 ? null : input.taskKind;
   if (taskKind && !/^[a-z0-9_.-]+$/.test(taskKind)) throw new Error(`非法 taskKind：${taskKind}`);
+  if (v3 && !/^[a-z]+$/.test(v3.length)) throw new Error(`非法篇幅：${v3.length}`);
 
-  const specs: LayerSpec[] = [
-    { id: 'S0', kind: 'S0', label: 'S0 文件机制', owner: 'novelist', file: path.join(BUILTIN_INSTRUCTIONS_DIR, 'contract.md'), root: BUILTIN_INSTRUCTIONS_DIR, required: true },
-    { id: 'S1', kind: 'S1', label: `S1 内置角色 ${role}`, owner: 'novelist', file: path.join(BUILTIN_INSTRUCTIONS_DIR, 'roles', `${role}.md`), root: BUILTIN_INSTRUCTIONS_DIR, required: true, isRole: true },
+  const specs: LayerSpec[] = v3
+    ? [
+        { id: 'S0', kind: 'S0', label: 'S0 书房约定（v3）', owner: 'novelist', file: path.join(BUILTIN_INSTRUCTIONS_DIR, 'v3', 'contract.md'), root: BUILTIN_INSTRUCTIONS_DIR, required: true },
+        { id: 'S1', kind: 'S1', label: `S1 篇幅要领 ${v3.length}`, owner: 'novelist', file: path.join(BUILTIN_INSTRUCTIONS_DIR, 'v3', `length-${v3.length}.md`), root: BUILTIN_INSTRUCTIONS_DIR, required: true },
+      ]
+    : [
+        { id: 'S0', kind: 'S0', label: 'S0 文件机制', owner: 'novelist', file: path.join(BUILTIN_INSTRUCTIONS_DIR, 'contract.md'), root: BUILTIN_INSTRUCTIONS_DIR, required: true },
+        { id: 'S1', kind: 'S1', label: `S1 内置角色 ${role}`, owner: 'novelist', file: path.join(BUILTIN_INSTRUCTIONS_DIR, 'roles', `${role}.md`), root: BUILTIN_INSTRUCTIONS_DIR, required: true, isRole: true },
+      ];
+  specs.push(
     { id: 'L1', kind: 'L1', label: 'L1 全局 AGENTS.md', owner: 'user', file: path.join(input.globalDir, 'AGENTS.md'), root: input.globalDir },
     { id: 'L1.role', kind: 'L1', label: `L1 全局角色 ${role}`, owner: 'user', file: path.join(input.globalDir, 'roles', `${role}.md`), root: input.globalDir, isRole: true },
-  ];
+  );
   if (taskKind) specs.push({ id: 'L1.task', kind: 'L1', label: `L1 全局任务 ${taskKind}`, owner: 'user', file: path.join(input.globalDir, 'tasks', `${taskKind}.md`), root: input.globalDir });
   for (const g of input.genreDirs) {
     specs.push({ id: `L2:${g.id}`, kind: 'L2', label: `L2 题材 ${g.id}`, owner: 'user', file: path.join(g.dir, 'AGENTS.md'), root: g.dir });
@@ -145,7 +156,7 @@ export async function resolveStack(input: ResolveStackInput): Promise<Instructio
     layers.push({ id: s.id, kind: s.kind, label: s.label, owner: s.owner, source: s.file, content, mode: parsed.mode, nonceTag: nonceTagFor(s.id) });
   }
 
-  const notes = input.ownerNotes.filter((n) => n.text.trim() !== '');
+  const notes = v3 ? [] : input.ownerNotes.filter((n) => n.text.trim() !== '');
   if (notes.length > 0) {
     layers.push({
       id: 'L3.9',

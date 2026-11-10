@@ -16,7 +16,7 @@ import { buildOutcome, classifyText } from '../classify.js';
 import { arr, errorEvent, ndjsonParser, num, obj, optNum, str } from '../events.js';
 import { runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, StreamParser } from '../types.js';
-import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, minimalEnv, parseModelLines, readSchemaFile, standardProbe, toolCallEvent, toolKindOf } from './common.js';
+import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, minimalEnv, parseModelLines, readSchemaFile, standardProbe, toolCallEvent, toolKindOf, wantsSchema } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'native',
@@ -213,7 +213,7 @@ export const grokAdapter: HarnessAdapter = {
       argv.push('-r', spec.session.id);
       if (spec.session.mode === 'fork') argv.push('--fork-session');
     }
-    if (caps.structuredOutput === 'native') {
+    if (wantsSchema(spec, caps)) {
       const schema = readSchemaFile(spec);
       if (schema) argv.push('--json-schema', schema);
     }

@@ -80,6 +80,18 @@ describe('facade chapter actions', () => {
     expect(ch3).toMatchObject({ state: 'planned', acceptedCommit: null, publishedAt: null });
   });
 
+  it('rewind 不依赖能打开书：book.yaml 坏了（v2 书）照样回退，回退顺带修好', async () => {
+    t = await createOrchTestEnv({ pipeline: { handlers: {} } });
+    const book = await addFixtureBook(t, 'broken', { cards: 6, accepted: 4 });
+    const good = await book.repo.readFile('book.yaml');
+    await book.repo.writeFiles([{ path: 'book.yaml', content: 'slug: [unclosed\n' }]);
+    await book.repo.commit({ message: 'owner: break book.yaml', trailers: { [TRAILER.owner]: 'true' }, paths: ['book.yaml'] });
+    const orch = createOrchestrator(t.deps);
+    await orch.bookAction(book.id, { action: 'rewind', to: 2, confirm: false });
+    expect((await t.db.select().from(books).where(eq(books.id, book.id)))[0]?.acceptedThrough).toBe(2);
+    expect(await book.repo.readFile('book.yaml')).toBe(good);
+  });
+
   it('rewind 之后章节能重新写作：同 id 的已完成任务不挡路，workflow.seq 保留', async () => {
     const written: string[] = [];
     const write: TaskHandler = { ...noopHandler('chapter.write'), lane: 'write', execute: async (_c, task) => {

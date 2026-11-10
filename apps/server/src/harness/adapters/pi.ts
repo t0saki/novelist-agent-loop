@@ -16,7 +16,7 @@ import { buildOutcome, classifyText } from '../classify.js';
 import { arr, errorEvent, ndjsonParser, num, obj, optNum, str } from '../events.js';
 import { runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, StreamParser } from '../types.js';
-import { buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, minimalEnv, standardProbe, toolCallEvent, toolKindOf } from './common.js';
+import { buildEnv, detectBin, effortOf, filterExtraArgs, invocation, launchPrompt, materializeVia, minimalEnv, standardProbe, toolCallEvent, toolKindOf } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'none',
@@ -222,7 +222,7 @@ export const piAdapter: HarnessAdapter = {
     argv.push('--tools', 'read,write,edit,grep,find,ls', '--no-mcp');
     argv.push(...mat.argv);
     argv.push(...filterExtraArgs(spec.extraArgs, DENY_EXTRA));
-    argv.push(`阅读并执行工作单 ${spec.workOrderFile}（先完整读取该文件）。Read ${spec.workOrderFile} and execute it.`);
+    argv.push(launchPrompt(spec, `阅读并执行工作单 ${spec.workOrderFile}（先完整读取该文件）。Read ${spec.workOrderFile} and execute it.`));
     const env = buildEnv(spec, inst, acct.secretEnv, home.env, mat.env);
     return invocation(spec, argv, env, 'devnull', [
       { signal: 'SIGINT', graceMs: 10_000 },

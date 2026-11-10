@@ -6,13 +6,14 @@ import type { Capabilities, HarnessId, InstructionFileEntry, InstructionPreview,
 import { ROLE_IDS, zInstructionPreviewRequest, zInstructionScope, zPutRepoFile } from '@novelist/shared';
 import { desc, eq } from 'drizzle-orm';
 import type { AppDeps } from '../../../app.js';
-import { ensureGitRepo, gitBlobSha, NothingToCommitError, openRepo, P, pathOwner, TRAILER } from '../../../book/index.js';
+import { bookFiles, ensureGitRepo, gitBlobSha, NothingToCommitError, openRepo, P, pathOwner, TRAILER } from '../../../book/index.js';
 import { capabilities } from '../../../db/schema.js';
 import { BUILTIN_INSTRUCTIONS_DIR, previewInstructions } from '../../../instructions/index.js';
-import { genreExists } from '../../../genres/index.js';
+import { V3_AGENTS_SOFT_LIMIT, renderAgentsMdV3 } from '../../../instructions/v3.js';
+import { genreExists, loadGenre } from '../../../genres/index.js';
 import { saveRepoFile } from '../../../services/repo-files.js';
 import { audit, bookBySlug, bookDir, domain, parseBody, requireRel } from '../../helpers.js';
-import { badRequest, conflict, forbidden, notFound } from '../../problem.js';
+import { HttpProblem, badRequest, conflict, forbidden, notFound } from '../../problem.js';
 
 type ScopeQuery = { Querystring: { scope?: string; path?: string } };
 
@@ -77,6 +78,35 @@ async function commitTo(root: ScopeRoot, rel: string, content: string | null, me
   }
 }
 
+/**
+ * v3 书（flow: v3）：把草稿当作未保存内容、对整本书目录渲染一次根 AGENTS.md（和运行时一样，nv:include 可以引到书里别处的文件，例如 ../style/voice.md），
+ * 超过 16 KB 拒收（400 instructions_too_large，errors 里列各层字节数）；include 找不到、越界之类的渲染错误是 400 instruction_include。
+ * 书库本身不动。v2 书不检查。全局 / 题材层的保存检查留到第二阶段。
+ */
+async function assertV3AgentsSize(deps: AppDeps, bookRoot: string, rel: string, content: string): Promise<void> {
+  const cfg = await bookFiles(openRepo(bookRoot)).config().then((c) => c.config).catch(() => null);
+  if (cfg?.flow !== 'v3') return;
+  const genre = await loadGenre(deps.paths, cfg.genre);
+  let agents: Awaited<ReturnType<typeof renderAgentsMdV3>>;
+  try {
+    agents = await renderAgentsMdV3({
+      globalDir: deps.paths.instructionsGlobal,
+      genreDirs: genre.chain.map((g) => ({ id: g.id, dir: g.dir, name: g.pack.name ?? g.id })),
+      bookDir: bookRoot,
+      length: cfg.v3.length,
+      drafts: { [path.join(bookRoot, rel)]: content },
+    });
+  } catch (e) {
+    throw new HttpProblem(400, 'instruction_include', `保存后本书的 AGENTS.md 渲染失败：${(e as Error).message}`);
+  }
+  if (agents.bytes > V3_AGENTS_SOFT_LIMIT) {
+    throw new HttpProblem(400, 'instructions_too_large', `保存后本书的 AGENTS.md 有 ${agents.bytes} 字节，超过 ${V3_AGENTS_SOFT_LIMIT} 字节`, {
+      detail: agents.layers.map((l) => `${l.label}：${l.bytes} 字节`).join('；'),
+      errors: agents.layers.map((l) => ({ path: l.id, message: `${l.label}：${l.bytes} 字节` })),
+    });
+  }
+}
+
 export async function register(app: FastifyInstance, deps: AppDeps): Promise<void> {
   app.get<ScopeQuery>('/api/admin/instructions/files', async (req): Promise<InstructionFileEntry[]> => {
     const root = await scopeRoot(deps, req.query.scope);
@@ -113,6 +143,8 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     if (root.kind === 'book') {
       const book = await bookBySlug(deps, root.id);
       if (!root.include?.test(rel) || pathOwner(rel) !== 'user') throw badRequest('书层指令只能写 instructions/、style/ 和 gates.yaml');
+      // style/ 也可能被 nv:include 引进 AGENTS.md，一并量一下
+      if (rel.startsWith('instructions/') || rel.startsWith('style/')) await assertV3AgentsSize(deps, root.dir, rel, body.content);
       const r = await saveRepoFile(deps, book, { path: rel, content: body.content, baseSha: body.baseSha, message: body.message, confirm: body.confirm });
       if (r.kind === 'needs_confirm') return reply.code(409).send(r.impact);
       await audit(deps, req, 'instruction.write', `book:${book.slug}`, { path: rel });

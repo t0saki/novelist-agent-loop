@@ -450,10 +450,19 @@ describe('routing and settings', () => {
     expect((await admin('DELETE', '/api/admin/instructions/file?scope=global&path=AGENTS.md')).statusCode).toBe(200);
   });
 
-  it('genres list and protect builtin', async () => {
+  it('genres list, in-use builtin cannot be deleted but can be hidden', async () => {
     const list = (await admin('GET', '/api/admin/genres')).json();
-    expect(list.some((g: { id: string; builtin: boolean }) => g.id === 'xianxia' && g.builtin)).toBe(true);
-    expect((await admin('DELETE', '/api/admin/genres/xianxia')).statusCode).toBe(403);
+    expect(list.some((g: { id: string; builtin: boolean; hidden: boolean }) => g.id === 'xianxia' && g.builtin && !g.hidden)).toBe(true);
+    const del = await admin('DELETE', '/api/admin/genres/xianxia');
+    expect(del.statusCode).toBe(409);
+    expect(del.json().code).toBe('genre_in_use');
+    const hide = await admin('POST', '/api/admin/genres/xianxia/visibility', { hidden: true });
+    expect(hide.statusCode).toBe(200);
+    expect(hide.json().hidden).toBe(true);
+    expect((await admin('GET', '/api/admin/genres')).json().find((g: { id: string }) => g.id === 'xianxia').hidden).toBe(true);
+    const unhide = await admin('POST', '/api/admin/genres/xianxia/visibility', { hidden: false });
+    expect(unhide.statusCode).toBe(200);
+    expect((await admin('GET', '/api/admin/genres')).json().find((g: { id: string }) => g.id === 'xianxia').hidden).toBe(false);
     const created = await admin('POST', '/api/admin/genres', { id: 'custom-a', name: '自定义', extends: [] });
     expect(created.statusCode).toBe(201);
     expect((await admin('POST', '/api/admin/genres', { id: 'custom-a', name: '自定义', extends: [] })).statusCode).toBe(409);

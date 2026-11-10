@@ -6,6 +6,8 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { Tx } from '../db/client.js';
 import { books, chapters } from '../db/schema.js';
+import { readV3Meta } from '../flow/state.js';
+import type { V3BatchEffectArgs, V3Hint } from '../flow/types.js';
 
 export interface DbEffect {
   name: string;
@@ -72,7 +74,19 @@ interface AuditAdvanceArgs {
   audit: { window_through: number; arc_through: number };
 }
 
-type Handler = (tx: Tx, sha: string, args: never) => Promise<void>;
+/** promoteV3 实际落地的结果（v3.batch 用）：landed = 已提交的章号（改写 + 新章），dropped = 主人改过而放弃的路径 */
+export interface DbEffectExtra {
+  landed?: number[];
+  dropped?: string[];
+}
+
+type Handler = (tx: Tx, sha: string, args: never, extra?: DbEffectExtra) => Promise<void>;
+
+/** 主人在运行期间改过的文件：作者版本另存了，下一次任务单里告诉作者 */
+function ownerEditHint(p: string, nowIso: string): V3Hint {
+  const copy = p.startsWith('drafts/owner-conflicts/') ? '' : `，你的版本另存在 drafts/owner-conflicts/${p}`;
+  return { kind: 'owner_edit', text: `主人在你上次运行期间改了 ${p}，以主人的版本为准${copy}；需要的话把你的改动并进主人的版本。`, at: nowIso };
+}
 
 const REGISTRY: Record<string, Handler> = {
   async 'chapter.accept'(tx: Tx, sha: string, a: AcceptArgs) {
@@ -166,14 +180,86 @@ const REGISTRY: Record<string, Handler> = {
       })
       .where(eq(books.id, a.bookId));
   },
+
+  /**
+   * v3 一批收稿（p1-plan §3 pipeline/effects.ts）：章节行、书的计数、meta.v3（提示、连击、发布规则用的 lastBatchFrom、pending 清理）。
+   * 在 books 行上 select … for update；同一 commit 只跑一次（committer 的 effectsCommit），重放也幂等。
+   */
+  async 'v3.batch'(tx: Tx, sha: string, a: V3BatchEffectArgs, extra?: DbEffectExtra) {
+    const rows = await tx.select().from(books).where(eq(books.id, a.bookId)).limit(1).for('update');
+    const b = rows[0];
+    if (!b) return;
+    const landed = extra?.landed ? new Set(extra.landed) : null;
+    const chs = a.chapters.filter((c) => !landed || landed.has(c.no));
+    const fresh = chs.filter((c) => !c.rewrite).map((c) => c.no);
+    let delta = 0;
+    for (const c of chs) {
+      const prev = (await tx.select({ cjk: chapters.cjk, acceptedAt: chapters.acceptedAt }).from(chapters).where(and(eq(chapters.bookId, a.bookId), eq(chapters.no, c.no))).limit(1))[0];
+      delta += c.cjk - (prev?.cjk ?? 0);
+      const values = {
+        state: 'accepted' as const,
+        title: c.title,
+        cjk: c.cjk,
+        acceptedCommit: sha,
+        // 改写保留原来的 acceptedAt（发布规则按入库时间算），记 revisedAt
+        ...(c.rewrite && prev?.acceptedAt ? { revisedAt: a.nowIso } : { acceptedAt: a.nowIso }),
+        volume: '',
+        arc: '',
+        workflow: { v3: true },
+        updatedAt: a.nowIso,
+      };
+      await tx
+        .insert(chapters)
+        .values({ bookId: a.bookId, no: c.no, chapterId: c.cid, ...values })
+        .onConflictDoUpdate({ target: [chapters.bookId, chapters.no], set: values });
+    }
+    // 结束全书的那一章（本批最后一个新章）被主人改动顶掉时，完结不算数
+    const lastNew = a.chapters.filter((c) => !c.rewrite).reduce((m, c) => Math.max(m, c.no), 0);
+    // 没有新章、结局批只在已入库的末章上补了标记（completedOn）：补标记的那次改写被主人改动顶掉时同样不算；章已冻结时没有改写，直接算
+    const endOn = lastNew === 0 ? a.completedOn : undefined;
+    const endRewrite = endOn !== undefined ? a.chapters.some((c) => c.rewrite && c.no === endOn) : false;
+    const endOk = endOn !== undefined && (!endRewrite || chs.some((c) => c.no === endOn));
+    const completed = a.completed !== false && (lastNew > 0 ? fresh.includes(lastNew) : endOk) ? a.completed : false;
+    const old = readV3Meta(b.meta);
+    const rawMeta = (b.meta ?? {}) as Record<string, unknown>;
+    const oldV3 = (rawMeta.v3 && typeof rawMeta.v3 === 'object' ? rawMeta.v3 : {}) as Record<string, unknown>;
+    const v3: Record<string, unknown> = {
+      ...oldV3,
+      hints: [...a.hints, ...(extra?.dropped ?? []).map((p) => ownerEditHint(p, a.nowIso))],
+      noChapterStreak: a.noChapterStreak,
+      finaleNoMarker: a.finaleNoMarker,
+      emptyStreak: 0,
+      lastBatchFrom: fresh.length ? Math.min(...fresh) : old.lastBatchFrom,
+      lastBatchAt: fresh.length ? a.nowIso : old.lastBatchAt,
+      hintedShort: a.hintedShort,
+      ...(completed ? { completedAt: old.completedAt ?? a.nowIso, completedReason: completed } : {}),
+      // 只清自己这次 run 的 pending（别的 run 的不动）；locked 不在这里改
+      pending: old.pending && old.pending.runId === a.runId ? null : (old.pending ?? null),
+    };
+    const meta = { ...rawMeta, ...(a.blurb !== undefined ? { blurb: a.blurb } : {}), v3 };
+    const maxNew = fresh.length ? Math.max(...fresh) : 0;
+    await tx
+      .update(books)
+      .set({
+        acceptedThrough: sql`GREATEST(${books.acceptedThrough}, ${maxNew})`,
+        cursor: sql`GREATEST(${books.cursor}, ${maxNew + 1})`,
+        totalCjk: sql`${books.totalCjk} + ${delta}`,
+        headCommit: sha,
+        status: completed ? sql`CASE WHEN ${books.status} = 'archived' THEN ${books.status} ELSE 'completed' END` : sql`CASE WHEN ${books.status} = 'planning' THEN 'active' ELSE ${books.status} END`,
+        ...(a.title !== undefined ? { title: a.title } : {}),
+        meta,
+        updatedAt: a.nowIso,
+      })
+      .where(eq(books.id, a.bookId));
+  },
 };
 
 export function hasDbEffect(name: string): boolean {
   return name in REGISTRY;
 }
 
-export async function runDbEffect(tx: Tx, sha: string, effect: DbEffect): Promise<void> {
+export async function runDbEffect(tx: Tx, sha: string, effect: DbEffect, extra?: DbEffectExtra): Promise<void> {
   const fn = REGISTRY[effect.name];
   if (!fn) throw new Error(`unknown db effect: ${effect.name}`);
-  await fn(tx, sha, effect.args as never);
+  await fn(tx, sha, effect.args as never, extra);
 }

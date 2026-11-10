@@ -2,16 +2,16 @@
  * lane F 公共出口 + Orchestrator 门面（API / CLI 只通过它驱动编排）。Owner: lane F。
  */
 import { randomUUID } from 'node:crypto';
-import { and, count, eq, inArray } from 'drizzle-orm';
+import { and, count, eq, gt, inArray, like } from 'drizzle-orm';
 import { books, chapters, inbox as inboxTable, runs, settings, tasks } from '../db/schema.js';
 import { P } from '../book/layout.js';
 import { openRepo } from '../book/repo.js';
 import type { PipelineContext, TaskRow, TaskSpec } from '../pipeline/types.js';
 import type { BookAction, ChapterAction, FeasibilityReport, InboxItem } from './facade-types.js';
-import { commitOwnerEdit } from './committer.js';
+import { commitOwnerEdit, revertPartialV3 } from './committer.js';
 import type { EventBus } from './bus.js';
 import { enqueueSpec, execEnv, type ExecutorDeps } from './executor.js';
-import { actOnInbox } from './inbox.js';
+import { actOnInbox, createInboxItem } from './inbox.js';
 import { ACTIVE_STATES, QUEUED_STATES, retryTaskRow, setTaskState } from './queue.js';
 import { rewindBook } from './rewind.js';
 import { chapterActionSpecs } from '../pipeline/next.js';
@@ -25,6 +25,15 @@ import { createScheduler, type Scheduler } from './scheduler.js';
 import { logFiles } from '../harness/index.js';
 import { ACTIVE_RUN_STATES } from './executor.js';
 import { promises as fs } from 'node:fs';
+import { HttpProblem } from '../api/problem.js';
+import type { BookRuntimeState } from '../pipeline/next.js';
+import { resumeZeroDiffAccount } from '../flow/accounts.js';
+import { clearPending, patchPending, readPending } from '../flow/state.js';
+
+/** v3 的 nextTasks 自己读 DB，不用 BookRuntimeState */
+const EMPTY_STATE: BookRuntimeState = { active: [], acceptedThrough: 0, cardsThrough: 0, publishedThrough: 0, auditedThrough: 0, productionPaused: false, openApprovals: [] };
+
+const v3Unsupported = (): HttpProblem => new HttpProblem(409, 'v3_unsupported', '新流程的书暂不支持回退/重写（P1b 提供）');
 
 export * from './bus.js';
 export * from './queue.js';
@@ -92,6 +101,12 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
     return (await enqueueSpec(env, await ctxFor(bookId), spec)).id;
   }
 
+  /** v3：只把 draft / paused 改成 planning（已在写或已完结的书不重置），然后按 nextTasks 入队（只有 0 章时才会是 book.open） */
+  async function startV3(bookId: string, ctx: PipelineContext): Promise<void> {
+    await env.db.update(books).set({ status: 'planning', pausedReason: null, updatedAt: new Date().toISOString() }).where(and(eq(books.id, bookId), inArray(books.status, ['draft', 'paused'])));
+    for (const spec of await env.pipe.nextTasks(ctx, EMPTY_STATE)) await enqueueSpec(env, ctx, spec);
+  }
+
   async function setSystemEnabled(enabled: boolean): Promise<void> {
     const cur = await loadSystemSettings(env.db);
     const value = { ...cur, schedulerEnabled: enabled };
@@ -124,6 +139,11 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
     async startBook(bookId, opts) {
       const ctx = await ctxFor(bookId);
       const book = ctx.book as NonNullable<PipelineContext['book']>;
+      if (book.config.flow === 'v3') {
+        await startV3(bookId, ctx);
+        await notifyBook(bookId);
+        return;
+      }
       await env.db.update(books).set({ status: 'planning', updatedAt: new Date().toISOString() }).where(and(eq(books.id, bookId), inArray(books.status, ['draft', 'paused'])));
       for (const spec of env.pipe.initialTasks(book, opts)) await enqueueSpec(env, ctx, spec);
       await notifyBook(bookId);
@@ -134,6 +154,10 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
         case 'start': {
           const ctx = await ctxFor(bookId);
           const book = ctx.book as NonNullable<PipelineContext['book']>;
+          if (book.config.flow === 'v3') {
+            await startV3(bookId, ctx);
+            break;
+          }
           await env.db.update(books).set({ status: 'planning', pausedReason: null, updatedAt: now }).where(eq(books.id, bookId));
           for (const spec of env.pipe.initialTasks(book, { interview: a.interview === true })) await enqueueSpec(env, ctx, spec);
           break;
@@ -152,6 +176,12 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
           await enqueueOne(bookId, { kind: 'index.rebuild', bookId, target: 'book', lane: 'system' });
           break;
         case 'rewind': {
+          // 只为认出 v3：打不开的书（book.yaml 不合法、题材包没了）照旧走 v2 的回退，回退本身不需要解析配置
+          const isV3 = await ctxFor(bookId).then(
+            (c) => c.book?.config.flow === 'v3',
+            () => false,
+          );
+          if (isV3) throw v3Unsupported();
           if (a.to === undefined) throw new Error('rewind 需要 to');
           await rewindBook(env, bookId, a.to, a.confirm === true);
           break;
@@ -175,6 +205,7 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
       const chapterRow = chapterRows[0];
       const bookHandle = (await ctxFor(bookId)).book as NonNullable<PipelineContext['book']>;
       const workflow = (chapterRow?.workflow ?? {}) as Partial<ChapterWorkflow>;
+      if (bookHandle.config.flow === 'v3' && (a.action === 'rewrite' || a.action === 'repair' || a.action === 'reextract')) throw v3Unsupported();
       const instance = `${a.action}-${randomUUID().slice(0, 12)}`;
       const assertNotFrozen = (): void => {
         if (chapterRow?.publishedAt && bookHandle.config.publish.freeze_on_publish && !a.confirm) throw new Error(`第 ${no} 章已发布，受 freeze_on_publish 保护；确认要修改请带 confirm=true`);
@@ -237,6 +268,8 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
       await notifyBook(bookId);
     },
     async retryTask(taskId) {
+      // 取消后本进程还在收尾（杀 harness、收稿、提交）：这时复活同一个任务会让两份执行去收同一个快照
+      if (scheduler.inFlight().some((x) => x.taskId === taskId)) throw new Error(`任务还在收尾，稍后再重试：${taskId}`);
       if (!(await retryTaskRow(env.db, taskId))) throw new Error(`任务不可重试：${taskId}`);
       env.bus.publish({ type: 'task_changed', taskId, book: null, state: 'ready' });
     },
@@ -265,6 +298,44 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
     async actInbox(id, action, note, payload) {
       const rows = await env.db.select().from(inboxTable).where(eq(inboxTable.id, id)).limit(1);
       const row = rows[0];
+      const dedupe = row?.state === 'open' ? (row.dedupeKey ?? '') : '';
+      // v3 空跑暂停的账号：恢复 = 清 sleep_until + 连击归零
+      if (dedupe.startsWith('zero_diff:') && action === 'resume') {
+        const accountId = String((row?.body as { accountId?: unknown } | undefined)?.accountId ?? dedupe.slice('zero_diff:'.length));
+        await resumeZeroDiffAccount(env.db, accountId);
+        // 暂停期间路由不到账号的任务按 sleepUntil 停到了 7 天后：叫醒所有"路由等待"的任务（路由仍然不通的会再等一次），不动 attempts
+        const nowIso = new Date().toISOString();
+        const woken = await env.db
+          .update(tasks)
+          .set({ notBefore: nowIso, updatedAt: nowIso })
+          .where(and(eq(tasks.state, 'waiting'), gt(tasks.notBefore, nowIso), like(tasks.waitReason, '路由等待%')))
+          .returning({ bookId: tasks.bookId });
+        for (const b of new Set(woken.map((w) => w.bookId).filter((x): x is string => !!x))) await notifyBook(b);
+      }
+      // v3 收稿连续失败：重试 = failures 归零（任务回 ready）；放弃 = 清 pending（收到的改动留在 work/ 下，GC 保留 30 天）
+      if (dedupe.startsWith('v3_pending:') && row?.bookId && (action === 'retry' || action === 'discard')) {
+        const runId = String((row.body as { runId?: unknown }).runId ?? '');
+        if (action === 'retry') await patchPending(env.db, row.bookId, runId, { failures: 0 });
+        else {
+          // 提交中途失败留下的分章提交 DB 从没计入：先撤回到 drafts/，否则下一批会按旧的 acceptedThrough 编号、把它们覆盖掉
+          const pending = await readPending(env.db, row.bookId);
+          const bookRows = await env.db.select({ slug: books.slug }).from(books).where(eq(books.id, row.bookId)).limit(1);
+          if (pending && pending.runId === runId && bookRows[0]) {
+            const reverted = await revertPartialV3(env.db, openRepo(`${env.paths.books}/${bookRows[0].slug}`), row.bookId, pending);
+            if (reverted.length) {
+              await createInboxItem(env.db, env.bus, {
+                kind: 'notice',
+                bookId: row.bookId,
+                title: `第 ${reverted.join('、')} 章已提交过，已撤回到 drafts/`,
+                body: { runId, chapters: reverted, detail: `放弃收稿时，这次运行已经提交的第 ${reverted.join('、')} 章从正文里撤回，原文存在 drafts/cNNNNN.discarded.md。` },
+                actions: [{ id: 'dismiss', label: '知道了' }],
+                dedupeKey: `v3_discard:${row.bookId}:${runId}`,
+              });
+            }
+          }
+          await clearPending(env.db, row.bookId, runId);
+        }
+      }
       if (row?.kind === 'agents_md_edit' && action === 'migrate' && row.bookId && row.state === 'open') {
         const bookRows = await env.db.select({ slug: books.slug }).from(books).where(eq(books.id, row.bookId)).limit(1);
         if (bookRows[0]) {

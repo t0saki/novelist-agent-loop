@@ -148,7 +148,9 @@ export function mountPlanFor(spec: RunSpec, homeStateDirs: string[], extraRo: st
   };
   const liveGit = liveGitDirOf(spec.bookDir);
   if (liveGit) ro.add(liveGit);
-  ro.add(spec.bookDir);
+  // v3：整个书快照归作者使用（收割走快照目录）；live .git 与 $RUN/in 仍只读
+  if (spec.contract === 'v3') rw.add(spec.bookDir);
+  else ro.add(spec.bookDir);
   ro.add(spec.inDir);
   for (const p of extraRo) {
     ro.add(p);

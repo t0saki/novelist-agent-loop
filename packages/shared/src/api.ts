@@ -27,7 +27,7 @@ import { zProfile, zRoleRoute, zRoutingPreset } from './config/routing.js';
 import type { SystemSettings } from './config/settings.js';
 import { zSystemSettings } from './config/settings.js';
 import type { BookConfig, PublishConfig } from './schemas/book.js';
-import { zBookConfig } from './schemas/book.js';
+import { FLOWS, V3_LENGTHS, zBookConfig } from './schemas/book.js';
 import { zPublishConfig } from './schemas/book.js';
 import type { Card } from './schemas/plan.js';
 import type { Delta } from './schemas/delta.js';
@@ -142,7 +142,8 @@ export interface BookOverview extends BookSummary {
   formatVersion: number;
 }
 export const zCreateBook = z.object({
-  title: z.string().min(1),
+  /** v3 可留空（由作者在 bible.md 里起名）；v2 必填，见下方 superRefine */
+  title: z.string().default(''),
   slug: z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/).optional(),
   genre: z.string().min(1),
   /** 种子：premise / 设想 / 参考，原样写入 bible/premise.md */
@@ -163,6 +164,19 @@ export const zCreateBook = z.object({
     .partial()
     .optional(),
   start: z.boolean().default(true),
+  /** 流程；缺省 = 'v2' */
+  flow: z.enum(FLOWS).optional(),
+  v3: z
+    .object({
+      length: z.enum(V3_LENGTHS).optional(),
+      target_cjk: z.number().int().positive().optional(),
+      batch: z.number().int().min(1).max(8).optional(),
+      min_chapter_cjk: z.number().int().positive().optional(),
+    })
+    .optional(),
+}).superRefine((v, ctx) => {
+  // 旧流程照旧只要求非空串（和原来的 min(1) 一样，空白书名照收）；v3 可以留空，由作者起名
+  if (v.flow !== 'v3' && v.title.length < 1) ctx.addIssue({ code: 'custom', path: ['title'], message: '书名不能为空' });
 });
 export type CreateBook = z.input<typeof zCreateBook>;
 export const zPatchBook = z.object({ status: z.enum(['active', 'paused', 'archived']).optional(), title: z.string().optional() });
@@ -401,11 +415,16 @@ export interface GenreSummary {
   description: string;
   extends: string[];
   builtin: boolean;
+  /** 已停用（不出现在开书页和自动开书里） */
+  hidden: boolean;
   books: number;
   files: string[];
   /** pack.yaml 的 auto 配置摘要；null 表示未配置 */
   auto: { enabled: boolean; weight: number; keywords: number; lengthHint: string } | null;
 }
+/** 题材包停用 / 恢复 */
+export const zGenreVisibility = z.object({ hidden: z.boolean() });
+export type GenreVisibility = z.infer<typeof zGenreVisibility>;
 export const zCreateGenre = z.object({ id: z.string().regex(/^[a-z0-9][a-z0-9-]*$/), name: z.string(), extends: z.array(z.string()).default([]), copyFrom: z.string().optional() });
 
 // ───────────────────────── Harness / 账号 / profile / 路由 ─────────────────────────
@@ -677,7 +696,8 @@ export const ROUTES: RouteSpec[] = [
   { method: 'POST', path: '/api/admin/instructions/preview', auth: 'admin', req: 'InstructionPreviewRequest', res: 'InstructionPreview', desc: '编译预览（按 harness）+ 生效 gate' },
   { method: 'GET', path: '/api/admin/genres', auth: 'admin', res: 'GenreSummary[]', desc: '题材包列表' },
   { method: 'POST', path: '/api/admin/genres', auth: 'admin', req: 'CreateGenre', res: 'GenreSummary', desc: '新建题材包' },
-  { method: 'DELETE', path: '/api/admin/genres/:id', auth: 'admin', res: 'Ok', desc: '删除题材包（内置不可删）' },
+  { method: 'DELETE', path: '/api/admin/genres/:id', auth: 'admin', res: 'Ok', desc: '删除题材包（没有书在用、没有包继承；内置包记墓碑，目录移进回收站）' },
+  { method: 'POST', path: '/api/admin/genres/:id/visibility', auth: 'admin', req: 'GenreVisibility', res: 'GenreSummary', desc: '停用 / 恢复题材包' },
   // harness / accounts / profiles / routing
   { method: 'GET', path: '/api/admin/harness', auth: 'admin', res: 'HarnessStatus[]', desc: 'harness 状态' },
   { method: 'POST', path: '/api/admin/harness/:id/probe', auth: 'admin', res: 'Capabilities', desc: '能力探测（?accountId）' },

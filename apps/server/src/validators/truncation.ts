@@ -3,6 +3,8 @@ import { stripBeatMarkers } from '@novelist/shared';
 
 /** 句末可接受的结束字符（含收尾引号与括号） */
 const SENTENCE_END = /[。．.！!？?…～~—”’」』）)】》〕"'`*_>|\]}]$/u;
+/** 同样的收句符号的全角 / 变体写法：⋯（U+22EF）〜（U+301C）﹗﹖（小型）；只在 variantEnds 时认（v3 收稿），旧流程的门禁不变 */
+const VARIANT_END = /[⋯〜﹗﹖]$/u;
 const PAIRS: [string, string][] = [
   ['“', '”'],
   ['「', '」'],
@@ -15,6 +17,8 @@ const PAIRS: [string, string][] = [
 export interface TruncationOptions {
   /** 是否要求最后一段以句末符号收尾（章节正文 = true；通用 markdown = false） */
   sentence?: boolean;
+  /** 也认 ⋯ 〜 ﹗ ﹖ 这些变体收句符号（v3 收稿用；缺省 false，旧流程不变） */
+  variantEnds?: boolean;
 }
 
 /** 末尾完整性：未闭合引号/括号、半个 UTF-8 序列、最后一段截断在句中 */
@@ -31,7 +35,7 @@ export function checkTruncation(text: string, opts: TruncationOptions = {}): { o
     if (last.split(open).length > last.split(close).length) return { ok: false, detail: `最后一段的 ${open} 未闭合` };
   }
   if ((last.match(/"/g)?.length ?? 0) % 2 === 1) return { ok: false, detail: '最后一段的英文引号未闭合' };
-  if (opts.sentence !== false && last.length > 0 && !SENTENCE_END.test(last)) {
+  if (opts.sentence !== false && last.length > 0 && !SENTENCE_END.test(last) && !(opts.variantEnds === true && VARIANT_END.test(last))) {
     return { ok: false, detail: `最后一段没有以句末标点结束：…${last.slice(-12)}` };
   }
   return { ok: true };

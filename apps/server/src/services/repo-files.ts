@@ -9,6 +9,7 @@ import type { AppDeps } from '../app.js';
 import { bookFiles, gitBlobSha, openRepo, P, pathOwner, type BookRepo } from '../book/index.js';
 import { books, chapters, tasks, usageLedger } from '../db/schema.js';
 import { commitOwnerEdit } from '../orchestrator/index.js';
+import { lockChapter } from '../flow/state.js';
 import { HttpProblem, badRequest, notFound } from '../api/problem.js';
 import { assertPublishConfig } from './publish-config.js';
 import { bookDir, requireRel, type BookRow } from '../api/helpers.js';
@@ -67,7 +68,7 @@ export async function saveBookConfig(deps: AppDeps, row: BookRow, repo: BookRepo
   const doc = parseBookConfig(raw);
   if (!doc.parsed) throw new HttpProblem(422, 'invalid_config', 'book.yaml 校验失败', { errors: doc.errors });
   if (doc.parsed.slug !== row.slug) throw badRequest('slug 不能修改');
-  assertPublishConfig(doc.parsed.publish);
+  assertPublishConfig(doc.parsed.publish, doc.parsed.flow === 'v3' ? { batch: doc.parsed.v3.batch } : undefined);
   await commitOwnerEdit(deps.db, repo, row.id, { files: [{ path: P.bookYaml, content: raw }], message: 'owner: edit book.yaml', baseSha });
   await syncBookIndex(deps, row.id, doc.parsed);
   return doc;
@@ -77,9 +78,13 @@ export async function syncBookIndex(deps: Pick<AppDeps, 'db'>, bookId: string, c
   await deps.db.update(books).set({ title: cfg.title, genre: cfg.genre, tier: cfg.tier, priority: cfg.budgets.priority, updatedAt: new Date().toISOString() }).where(eq(books.id, bookId));
 }
 
+/** v3 书（book.yaml flow: v3）：没有账本级联，手改正文只提交并锁章 */
+const isV3 = (cfg: BookConfig | null): boolean => cfg?.flow === 'v3';
+
 /** 保存前影响估算（§6.10 第 5 条）：作废的待执行任务 + 级联重跑 */
 export async function estimateImpact(deps: AppDeps, row: BookRow, repo: BookRepo, rel: string): Promise<ImpactEstimate> {
   const cfg = await bookFiles(repo).config().then((c) => c.config).catch(() => null);
+  const v3 = isV3(cfg);
   const liveTasks = await deps.db.select({ id: tasks.id, hard: tasks.hardManifest }).from(tasks).where(and(eq(tasks.bookId, row.id), inArray(tasks.state, ['pending', 'ready', 'waiting'])));
   const invalidated = liveTasks.filter((t) => rel in t.hard).length;
   const ms = /^manuscript\/c(\d{5})\.md$/.exec(rel) ?? /^state\/ledger\/c(\d{5})\.json$/.exec(rel);
@@ -89,7 +94,8 @@ export async function estimateImpact(deps: AppDeps, row: BookRow, repo: BookRepo
   let estimatedRuns = invalidated;
   if (ms) {
     const no = Number(ms[1]);
-    if (no <= row.acceptedThrough) {
+    // v3 没有账本：不估级联重跑（否则每次保存都会多问一次确认）
+    if (!v3 && no <= row.acceptedThrough) {
       affected = [no, row.acceptedThrough];
       affectedDeltas = row.acceptedThrough - no + 1;
       estimatedRuns += affectedDeltas;
@@ -143,16 +149,20 @@ export async function saveRepoFile(deps: AppDeps, row: BookRow, input: SaveFileI
   const impact = await estimateImpact(deps, row, repo, rel);
   if (impact.needsConfirm && !input.confirm) return { kind: 'needs_confirm', impact };
   await commitOwnerEdit(deps.db, repo, row.id, { files: [{ path: rel, content: input.content }], message: input.message ?? `owner: edit ${rel}`, baseSha: input.baseSha });
+  // v3：主人改过的已验收章节锁定，之后的运行不能再改写它
+  const ms = /^manuscript\/c(\d{5})\.md$/.exec(rel);
+  if (ms && Number(ms[1]) <= row.acceptedThrough && isV3(await bookFiles(repo).config().then((c) => c.config).catch(() => null))) await lockChapter(deps.db, row.id, Number(ms[1]));
   return { kind: 'saved', file: await readRepoFile(repo, rel) };
 }
 
-/** 手改已验收正文：提交 → 更新索引 → 排 reextract（级联由 E 的 chapter.reextract 处理） */
+/** 手改已验收正文：提交 → 更新索引 → 排 reextract（级联由 E 的 chapter.reextract 处理）；v3 书不排 reextract，改为锁章 */
 export async function saveChapterText(deps: AppDeps, row: BookRow, no: number, text: string, baseSha: string | null, confirm: boolean): Promise<{ kind: 'saved' } | { kind: 'needs_confirm'; impact: ImpactEstimate }> {
   const rel = P.manuscript(no);
   const repo = openRepo(bookDir(deps, row.slug));
   const impact = await estimateImpact(deps, row, repo, rel);
   const chapterRows = await deps.db.select({ publishedAt: chapters.publishedAt, cjk: chapters.cjk }).from(chapters).where(and(eq(chapters.bookId, row.id), eq(chapters.no, no))).limit(1);
-  const frozen = !!chapterRows[0]?.publishedAt && (await bookFiles(repo).config()).config.publish.freeze_on_publish;
+  const cfg = await bookFiles(repo).config().then((c) => c.config).catch(() => null);
+  const frozen = !!chapterRows[0]?.publishedAt && (cfg ?? (await bookFiles(repo).config()).config).publish.freeze_on_publish;
   if ((impact.needsConfirm || frozen) && !confirm) return { kind: 'needs_confirm', impact: { ...impact, needsConfirm: true, ...(frozen ? { notes: [...impact.notes, '本章已发布（freeze_on_publish），修改需要二次确认'] } : {}) } };
   const clean = stripBeatMarkers(text);
   await commitOwnerEdit(deps.db, repo, row.id, { files: [{ path: rel, content: clean }], message: `owner: edit manuscript c${String(no).padStart(5, '0')}`, baseSha });
@@ -161,7 +171,13 @@ export async function saveChapterText(deps: AppDeps, row: BookRow, no: number, t
   const newCjk = countCjk(clean, 'han');
   await deps.db.update(chapters).set({ cjk: newCjk, revisedAt: nowIso, updatedAt: nowIso }).where(and(eq(chapters.bookId, row.id), eq(chapters.no, no)));
   await deps.db.update(books).set({ totalCjk: sql`${books.totalCjk} + ${newCjk - (chapterRows[0]?.cjk ?? 0)}`, updatedAt: nowIso }).where(eq(books.id, row.id));
-  if (no <= row.acceptedThrough) await deps.orchestrator.chapterAction(row.id, no, { action: 'reextract', confirm: true });
+  if (isV3(cfg)) {
+    // v3 的章名只来自首行标题（与 reindex 一致：有标题行才更新，"# 第七章" 没有章名时记 ''）；阅读端去掉首行、只显示 DB 里的章名
+    const { parseChapterHeading } = await import('@novelist/shared');
+    const heading = parseChapterHeading(clean.split('\n').find((l) => l.trim() !== '') ?? '');
+    if (heading) await deps.db.update(chapters).set({ title: heading.title }).where(and(eq(chapters.bookId, row.id), eq(chapters.no, no)));
+    if (no <= row.acceptedThrough) await lockChapter(deps.db, row.id, no);
+  } else if (no <= row.acceptedThrough) await deps.orchestrator.chapterAction(row.id, no, { action: 'reextract', confirm: true });
   return { kind: 'saved' };
 }
 

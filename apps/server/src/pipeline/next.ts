@@ -13,6 +13,7 @@ import { loadBookState } from '../state/index.js';
 import { auditProgress, windowTarget } from './handlers/audit.js';
 import { highestCard, totalChapters } from './handlers/plan.js';
 import { BAKEOFF_DIR } from './handlers/system.js';
+import { isV3Kind, nextTasksV3 } from '../flow/handlers.js';
 import type { BookHandle, PipelineContext, TaskResult, TaskRow, TaskSpec } from './types.js';
 import { getChapterRow } from './workflow.js';
 import type { ChapterWorkflow } from './workflow.js';
@@ -33,6 +34,8 @@ const spec = (book: BookHandle, kind: TaskSpec['kind'], target: string, params?:
 
 /** 开书：返回第一批任务（plan.interview? → plan.premise …） */
 export function initialTasks(book: BookHandle, opts: { interview: boolean }): TaskSpec[] {
+  // v3：门面的 start 直接调 nextTasks（v3 分支自己读 DB）
+  if (book.config.flow === 'v3') return [];
   return [opts.interview ? spec(book, 'plan.interview', 'book') : spec(book, 'plan.premise', 'book')];
 }
 
@@ -157,6 +160,7 @@ export async function nextTasks(ctx: PipelineContext, state: BookRuntimeState): 
   const rows = await ctx.deps.db.select().from(books).where(eq(books.id, book.id)).limit(1);
   const row = rows[0];
   if (!row || row.status === 'archived') return [];
+  if (book.config.flow === 'v3') return nextTasksV3(ctx, book, row);
   if (row.status === 'completed') return maintenance(ctx, book, state);
 
   const opening = await openingStep(ctx, book, state);
@@ -283,6 +287,12 @@ export async function maintenance(ctx: PipelineContext, book: BookHandle, state:
 
 /** 任务完成后的即时后续（scheduler 下一 tick 也会补齐；这里只是更快） */
 export async function onTaskDone(ctx: PipelineContext, task: TaskRow, result: TaskResult): Promise<TaskSpec[]> {
+  if (isV3Kind(task.kind)) {
+    // 只是加快：下一个 tick 也会提出同一个 id
+    if (result.status !== 'done' || !ctx.book) return [];
+    const row = (await ctx.deps.db.select().from(books).where(eq(books.id, ctx.book.id)).limit(1))[0];
+    return row ? nextTasksV3(ctx, ctx.book, row) : [];
+  }
   if (!ctx.book || result.status !== 'done') return [];
   if (task.kind === 'chapter.accept' || /^(summary|audit)\./.test(task.kind)) {
     const state = await loadBookState(ctx.book.dir);

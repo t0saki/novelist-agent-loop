@@ -132,6 +132,8 @@ const fake: Materializer = async (input) => ({
 const MATERIALIZERS: Record<string, Materializer> = { 'claude-code': claudeCode, codex, grok, agy, dsh, pi, fake };
 
 export async function materializeFor(harness: HarnessId, input: MaterializeInput): Promise<MaterializeResult> {
+  // v3：指令只在工作区根 AGENTS.md / CLAUDE.md（不传 agy --agent、cc --append-system-prompt-file、codex developer_instructions）
+  if (input.spec.contract === 'v3') return { files: [], argv: [], env: {}, budget: { ok: true, bytes: 0, limit: null }, notes: ['v3：指令只在工作区 AGENTS.md'] };
   const m = MATERIALIZERS[harness];
   if (!m) return refuse(refuseReason(input, `${harness} 没有指令物化方式`));
   return m(input);

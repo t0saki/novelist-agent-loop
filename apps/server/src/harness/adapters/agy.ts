@@ -21,7 +21,7 @@ import { dataRootOf } from '../isolation.js';
 import { runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, RunSpec, StreamParser } from '../types.js';
 import { pathExists } from '../util.js';
-import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, minimalEnv, parseModelLines, standardProbe, toolCallEvent, toolKindOf } from './common.js';
+import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, launchPrompt, materializeVia, minimalEnv, parseModelLines, standardProbe, toolCallEvent, toolKindOf, wantsSchema } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'native',
@@ -49,6 +49,7 @@ const DEFAULTS: CapabilityDefaults = {
 export const AGY_KNOWN_MODELS = ['gemini-4-argon-high', 'gemini-4-argon-medium', 'gemini-4-argon-low', 'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low'];
 export const AGY_TOKEN_FILE = '.gemini/antigravity-cli/antigravity-oauth-token';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const SLUG_EFFORT = /-(low|medium|high)$/;
 const DENY_EXTRA = [/^--settings/, /^--add-dir/, /^--remote-agent$/, /^--project/, /^--new-project$/, /^-i$/, /^--prompt-interactive/, /^--sandbox$/];
 
 /** 每 run 的 settings（--settings 文件）：信任工作区 + 拒绝 shell / 网络 / .git 写入 / $RUN/in 写入（纵深防御） */
@@ -295,11 +296,15 @@ export const agyAdapter: HarnessAdapter = {
   materialize: (spec, compiled, caps, ctx) => materializeVia('agy', spec, compiled, caps, ctx?.home),
   buildInvocation(spec, caps, home, mat, acct, inst) {
     checkAuthEnv(acct.authMode, acct.secretEnv);
-    const prompt = `阅读并执行工作单 ${spec.workOrderFile}（先完整读取该文件；产物只写入其中声明的 out_dir）。Read ${spec.workOrderFile} and execute it.`;
+    const prompt = launchPrompt(spec, `阅读并执行工作单 ${spec.workOrderFile}（先完整读取该文件；产物只写入其中声明的 out_dir）。Read ${spec.workOrderFile} and execute it.`);
     const argv = [inst.binPath, '-p', prompt, '--output-format', 'stream-json'];
-    if (caps.structuredOutput === 'native') argv.push('--json-schema', spec.receiptSchemaFile);
-    argv.push('--model', spec.model);
+    if (wantsSchema(spec, caps)) argv.push('--json-schema', spec.receiptSchemaFile);
     const eff = effortOf(spec, EFFORTS);
+    // agy 的模型名自带档位（xxx-low/-medium/-high）。v3 按运行种类指定 effort 时，模型名的档位跟着换，避免 slug 与 --effort 打架
+    const model = spec.contract === 'v3' && eff && SLUG_EFFORT.test(spec.model) && ['low', 'medium', 'high'].includes(eff)
+      ? spec.model.replace(SLUG_EFFORT, '-' + eff)
+      : spec.model;
+    argv.push('--model', model);
     if (eff) argv.push('--effort', eff);
     argv.push(...mat.argv);
     const settingsFile = home.configFiles.find((f) => f.path.endsWith('agy.settings.json'));

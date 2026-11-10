@@ -39,7 +39,9 @@ function AutoStartCard({ value: a, onChange }: { value: SystemSettings['autoStar
   const genres = useApi<GenreSummary[]>('/api/admin/genres');
   const num = (v: string, min: number, fallback: number) => (v === '' || Number.isNaN(Number(v)) ? fallback : Math.max(min, Math.floor(Number(v))));
   const all = genres.data ?? [];
-  const selected = a.genres ?? all.filter((g) => g.auto?.enabled).map((g) => g.id);
+  // 停用的包不参与自动开书（服务端会跳过）：跟随 pack.yaml 时不算进默认选择；已选上的照样列出，带“已停用”，可以取消
+  const selected = a.genres ?? all.filter((g) => g.auto?.enabled && !g.hidden).map((g) => g.id);
+  const usable = selected.filter((id) => all.some((g) => g.id === id && !g.hidden));
   const toggle = (id: string, on: boolean) => onChange({ ...a, genres: on ? [...new Set([...selected, id])] : selected.filter((x) => x !== id) });
   return (
     <Card title="自动开书">
@@ -80,13 +82,15 @@ function AutoStartCard({ value: a, onChange }: { value: SystemSettings['autoStar
           <div className="grid sm:grid-cols-2 gap-x-3 gap-y-1">
             {all.map((g) => (
               <label key={g.id} className="flex items-center gap-2 text-sm min-w-0">
-                <input type="checkbox" checked={selected.includes(g.id)} onChange={(e) => toggle(g.id, e.target.checked)} />
+                <input type="checkbox" checked={selected.includes(g.id)} disabled={g.hidden && !selected.includes(g.id)} onChange={(e) => toggle(g.id, e.target.checked)} />
                 <span className="truncate">{g.name}</span>
+                {g.hidden && <span className="text-xs text-faint whitespace-nowrap">已停用</span>}
                 <span className="text-xs text-faint whitespace-nowrap">{g.books} 本{g.auto ? ` · 权重 ${g.auto.weight}${g.auto.lengthHint ? ` · ${g.auto.lengthHint}` : ''}` : ''}</span>
               </label>
             ))}
           </div>
         )}
+        {a.enabled && all.length > 0 && usable.length === 0 && <div className="text-xs text-warn mt-1">没有可用的题材包（停用的包不参与），自动开书不会开新书。</div>}
       </div>
     </Card>
   );

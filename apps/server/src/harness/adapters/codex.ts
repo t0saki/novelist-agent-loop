@@ -18,7 +18,7 @@ import { arr, errorEvent, ndjsonParser, num, obj, str } from '../events.js';
 import { runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, RunSpec, StreamParser } from '../types.js';
 import { isInside } from '../util.js';
-import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, minimalEnv, standardProbe, toolCallEvent } from './common.js';
+import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, minimalEnv, standardProbe, toolCallEvent, wantsSchema } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'native',
@@ -306,7 +306,8 @@ export const codexAdapter: HarnessAdapter = {
   async prepareHome(acct, _inst, spec): Promise<HomeLayout> {
     const H = acct.home;
     const CH = path.join(H, '.codex');
-    const rawSchema = await fs.readFile(spec.receiptSchemaFile, 'utf8').catch(() => null);
+    // v3 没有回执 schema
+    const rawSchema = spec.contract === 'v3' ? null : await fs.readFile(spec.receiptSchemaFile, 'utf8').catch(() => null);
     const schema = rawSchema === null ? null : codexOutputSchema(rawSchema);
     return {
       home: H,
@@ -331,7 +332,7 @@ export const codexAdapter: HarnessAdapter = {
     opts.push(...mat.argv);
     opts.push('--dangerously-bypass-approvals-and-sandbox');
     const outputSchema = home.configFiles.find((f) => f.path.endsWith('receipt.codex.json'));
-    if (caps.structuredOutput === 'native' && outputSchema) opts.push('--output-schema', outputSchema.path);
+    if (wantsSchema(spec, caps) && outputSchema) opts.push('--output-schema', outputSchema.path);
     opts.push('-o', path.join(spec.logDir, 'last-message.json'));
     if (!spec.persistSession) opts.push('--ephemeral');
     opts.push(...filterExtraArgs(spec.extraArgs, DENY_EXTRA));
