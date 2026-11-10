@@ -14,14 +14,14 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { AuthMethodSpec, NEvent, NEventBody } from '@novelist/shared';
-import { RISK_NOTES } from '@novelist/shared';
+import { RISK_NOTES, V3_LAUNCH_PROMPT } from '@novelist/shared';
 import { buildOutcome, classifyText } from '../classify.js';
 import { errorEvent, ndjsonParser, num, obj, str } from '../events.js';
 import { dataRootOf } from '../isolation.js';
 import { runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, RunSpec, StreamParser } from '../types.js';
 import { pathExists } from '../util.js';
-import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, launchPrompt, materializeVia, minimalEnv, parseModelLines, standardProbe, toolCallEvent, toolKindOf, wantsSchema } from './common.js';
+import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, minimalEnv, parseModelLines, standardProbe, toolCallEvent, toolKindOf } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'native',
@@ -293,20 +293,16 @@ export const agyAdapter: HarnessAdapter = {
       env: { HOME: acct.home },
     };
   },
-  materialize: (spec, compiled, caps, ctx) => materializeVia('agy', spec, compiled, caps, ctx?.home),
-  buildInvocation(spec, caps, home, mat, acct, inst) {
+  buildInvocation(spec, _caps, home, acct, inst) {
     checkAuthEnv(acct.authMode, acct.secretEnv);
-    const prompt = launchPrompt(spec, `阅读并执行工作单 ${spec.workOrderFile}（先完整读取该文件；产物只写入其中声明的 out_dir）。Read ${spec.workOrderFile} and execute it.`);
-    const argv = [inst.binPath, '-p', prompt, '--output-format', 'stream-json'];
-    if (wantsSchema(spec, caps)) argv.push('--json-schema', spec.receiptSchemaFile);
+    const argv = [inst.binPath, '-p', V3_LAUNCH_PROMPT, '--output-format', 'stream-json'];
     const eff = effortOf(spec, EFFORTS);
-    // agy 的模型名自带档位（xxx-low/-medium/-high）。v3 按运行种类指定 effort 时，模型名的档位跟着换，避免 slug 与 --effort 打架
-    const model = spec.contract === 'v3' && eff && SLUG_EFFORT.test(spec.model) && ['low', 'medium', 'high'].includes(eff)
+    // agy 的模型名自带档位（xxx-low/-medium/-high）。按运行种类指定 effort 时，模型名的档位跟着换，避免 slug 与 --effort 打架
+    const model = eff && SLUG_EFFORT.test(spec.model) && ['low', 'medium', 'high'].includes(eff)
       ? spec.model.replace(SLUG_EFFORT, '-' + eff)
       : spec.model;
     argv.push('--model', model);
     if (eff) argv.push('--effort', eff);
-    argv.push(...mat.argv);
     const settingsFile = home.configFiles.find((f) => f.path.endsWith('agy.settings.json'));
     if (settingsFile) argv.push('--settings', settingsFile.path);
     argv.push('--add-dir', spec.inDir);
@@ -315,7 +311,7 @@ export const agyAdapter: HarnessAdapter = {
     argv.push('--dangerously-skip-permissions', '--disable-slash-commands');
     // agy 不支持 resume（caps.resume=false）：session 一律 fresh
     argv.push(...filterExtraArgs(spec.extraArgs, DENY_EXTRA));
-    const env = buildEnv(spec, inst, modeEnv(acct), home.env, mat.env);
+    const env = buildEnv(spec, inst, modeEnv(acct), home.env);
     return invocation(spec, argv, env, 'devnull', [
       { signal: 'SIGINT', graceMs: 10_000 },
       { signal: 'SIGTERM', graceMs: 10_000 },

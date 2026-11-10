@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHAPTER_HEADING_RE, countCjk, parseChapterHeading, V3_LAUNCH_PROMPT } from '@novelist/shared';
 import { afterAll, describe, expect, it } from 'vitest';
-import { checkTruncation } from '../../validators/truncation.js';
+import { checkTruncation } from '../../flow/truncation.js';
 import { FAKE_END_MARKER, parseOrderText, type FakeScenario } from './fake-harness.js';
 
 const SCRIPT = fileURLToPath(new URL('./fake-harness.ts', import.meta.url));
@@ -351,5 +351,30 @@ describe('fake harness v3: phase-2 modes and switches', () => {
   it('markerAlways: a write order also gets the end marker', () => {
     const r = run(ORDER.write(), { v3: { markerAlways: true } });
     expectChapter(r, 8, { marker: true });
+  });
+});
+
+describe('fake harness 目录探测（canary）', () => {
+  const CANARY = '在当前目录写一个文件 canary.txt，第一行写 NOVELIST-CANARY-ABC234，第二行写 AGENTS.md 里的暗号。不要做别的事。\n';
+  const agents = { 'AGENTS.md': '这是探测运行。读 ORDER.md 并照做。\n暗号：NV-CANARY-0a1b2c3d4e5f\n' };
+  it('canary order: writes canary.txt with marker and AGENTS code, nothing else', () => {
+    const r = run(CANARY, undefined, agents);
+    expect(r.status).toBe(0);
+    expect(r.read('canary.txt')).toBe('NOVELIST-CANARY-ABC234\nNV-CANARY-0a1b2c3d4e5f\n');
+    expect(r.files()).toEqual(['canary.txt']);
+    expect(resultOf(r)).toMatchObject({ status: 'success' });
+  });
+  it('{canary:"skipAgents"} leaves the AGENTS code out', () => {
+    const r = run(CANARY, { canary: 'skipAgents' }, agents);
+    expect(r.read('canary.txt')).toBe('NOVELIST-CANARY-ABC234\n\n');
+  });
+  it('without --v3 the harness still runs the directory mode (the old work-order mode is gone)', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nv-fake-v3-'));
+    roots.push(root);
+    fs.writeFileSync(path.join(root, 'ORDER.md'), CANARY);
+    fs.writeFileSync(path.join(root, 'AGENTS.md'), agents['AGENTS.md']);
+    const r = spawnSync(process.execPath, [SCRIPT, '--model', 'fake-model'], { cwd: root, encoding: 'utf8', timeout: 25_000 });
+    expect(r.status).toBe(0);
+    expect(fs.readFileSync(path.join(root, 'canary.txt'), 'utf8')).toContain('NV-CANARY-0a1b2c3d4e5f');
   });
 });

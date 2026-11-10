@@ -9,7 +9,7 @@ import { and, desc, eq, lte } from 'drizzle-orm';
 import { V3_TITLE_PLACEHOLDER, chapterId } from '@novelist/shared';
 import { books, chapters } from '../db/schema.js';
 import { loadSystemSettings } from '../orchestrator/routing.js';
-import type { BookHandle, PipelineContext, TaskResult, TaskRow } from '../pipeline/types.js';
+import type { BookHandle, PipelineContext, TaskResult, TaskRow } from '../runtime/types.js';
 import { BUFFER_FULL_WAIT, ENDING_LIST_RE, NOTE_BUDGETS, isFrozenChapter, noteSize } from './contract.js';
 
 export { noteSize };
@@ -27,7 +27,7 @@ const LIBRARY_MAX = 20;
 
 const cache = new Map<string, string>();
 
-async function readOrderTemplate(mode: OrderMode): Promise<string> {
+async function readOrderTemplate(mode: OrderMode | 'takeover'): Promise<string> {
   const hit = cache.get(mode);
   if (hit !== undefined) return hit;
   const text = await fs.readFile(path.join(ORDER_TEMPLATES_DIR, `order.${mode}.md`), 'utf8');
@@ -149,6 +149,41 @@ export async function renderOrder(spec: OrderSpec, extra: OrderExtra): Promise<s
     .split('\n')
     .filter((l) => l.trim() !== '')
     .join('\n');
+  if (spec.takeover && spec.mode !== 'retro') {
+    // 接手的旧书的第一次写作 / 开书（P3 D16）：先读最后几章和旧资料、补出笔记，再续写。
+    // 结局控制和写作批一样：结局批（含短篇）要写完全书并写（全书完），其余批不许写；收尾阶段、提醒、改写授权、上一批统计照常带上
+    const to = spec.from + spec.count - 1;
+    const finale = spec.finale;
+    const fresh = spec.accepted === 0;
+    const lastChapters = spec.takeover.lastChapters.map((k) => `manuscript/${chapterId(k)}.md`).join('、');
+    const vars: Record<string, string> = {
+      task_line: finale
+        ? `接手这本书，然后从第 ${spec.from} 章写到全书结束（计划还剩约 ${spec.count} 章，章数不限）`
+        : `接手这本书，然后新写第 ${spec.from}–${to} 章（共 ${spec.count} 章）`,
+      rewrite_line: rewriteLine(spec.allowRewrite),
+      owner_line: extra.ownerNote ? OWNER_LINE : '',
+      read_line: fresh || !lastChapters
+        ? '1. 这本书还没有写好的章节。先读下面这些旧资料（主人原来的设定和规划，有的很长，看到够用为止）。沿用其中的书名、设定和方向，不要另选方向：'
+        : `1. 读最后三章：${lastChapters}。再读下面这些旧资料（有的很长，看到够用为止）：`,
+      must_read: mustRead || '- （没有旧资料）',
+      continue_line: fresh ? '3. 然后从第 1 章写起，正文从 manuscript/c00001.md 起，每个文件第一行写"# 第N章 章名"。' : `3. 然后接着第 ${spec.accepted} 章往下写，正文从 manuscript/c${pad5(spec.from)}.md 起，每个文件第一行写"# 第N章 章名"。`,
+      end_rule: finale
+        ? `4. ${endingListLine(spec.endingListExists)}按清单把故事写完，章数不够就加，不要仓促收尾；最后一章写完后，在末尾单独一行写"（全书完）"。`
+        : '4. 故事还没到结局批，不要写"（全书完）"。',
+      end_check: finale ? '\n- 结束前确认最后一章末尾有"（全书完）"。' : '',
+      ending: renderEnding(spec),
+      feedback: renderFeedback(spec.feedback),
+      from: String(spec.from),
+      to: String(to),
+      accepted: String(spec.accepted),
+      total_cjk: String(spec.totalCjk),
+      planned: String(spec.planned),
+      target_cjk: String(spec.targetCjk),
+      min_chars: String(spec.minChars),
+      hints,
+    };
+    return fillTemplate(await readOrderTemplate('takeover'), vars, 'order.takeover');
+  }
   if (spec.mode === 'retro') {
     const r = spec.retro ?? { from: Math.max(1, spec.accepted), to: spec.accepted };
     const vars: Record<string, string> = {
@@ -243,9 +278,9 @@ export async function buildOrderSpec(ctx: PipelineContext, book: BookHandle, tas
   const ending = kind === 'book.write' ? endingPhase({ length: cfg.length, accepted: row.acceptedThrough, planned, runawayBase, batch: cfg.batch, factor, runawayBatches: meta.runawayBatches }) : null;
   if (!retro) {
     const maxBuffer = book.config.publish.max_buffer;
-    // 有等着的改写请求时存稿满了也写这一批（只多一批：max_buffer ≥ 2 × batch）；结局批不受存稿上限限制（decide.ts finaleBypassesBuffer）
+    // 有等着的改写请求、主人要求立即写下一批（writeNow）时存稿满了也写这一批（只多一批：max_buffer ≥ 2 × batch）；结局批不受存稿上限限制（decide.ts finaleBypassesBuffer）
     const finaleFirst = ending !== null && finaleBypassesBuffer(ending.mode, meta.finaleNoMarker);
-    if (ownerReqs.length === 0 && !finaleFirst && (row.acceptedThrough - row.publishedThrough >= maxBuffer || row.pausedReason === 'max_buffer')) {
+    if (ownerReqs.length === 0 && !meta.writeNow && !finaleFirst && (row.acceptedThrough - row.publishedThrough >= maxBuffer || row.pausedReason === 'max_buffer')) {
       return { skip: { status: 'waiting', message: BUFFER_FULL_WAIT, retryAfter: new Date(now.getTime() + 30 * 60_000).toISOString(), summary: { stale: 'buffer_full' } } };
     }
   }
@@ -303,10 +338,21 @@ export async function buildOrderSpec(ctx: PipelineContext, book: BookHandle, tas
   const tailLines = step.kind === 'retro' ? Math.max(30, step.to - step.from + 1 + 5) : 30;
   if (has('notes/chapters.md')) mustLines.push(`- notes/chapters.md 的最后 ${tailLines} 行；`);
   if (prev && has(prev)) mustLines.push(`- 上一章全文：${prev}。`);
+  // 接手的旧书（P3 D16）：第一次写作的任务单改成“先接手”，必读清单换成 HEAD 上的旧资料
+  let takeover: OrderSpec['takeover'];
+  // 一章都没有的旧书也一样（book.open）：旧的 premise / notes 是主人的设定，不能当新书另起方向
+  if ((kind === 'book.write' || kind === 'book.open') && meta.takeover?.status === 'pending') {
+    const legacy = await legacyFilesAt(book, head);
+    const lastChapters: number[] = [];
+    for (let k = Math.max(1, row.acceptedThrough - 2); k <= row.acceptedThrough; k += 1) lastChapters.push(k);
+    takeover = { lastChapters, legacyFiles: legacy.map((f) => f.path) };
+    mustLines.length = 0;
+    for (const f of legacy) mustLines.push(`- ${f.path}${f.long ? '（很长，只看开头）' : ''}`);
+  }
 
   // 书库摘要（WP-3，p2-plan §5.3）：同题材全部 + 全站最近 20 本 + 近期最常用的标签
   let library = '';
-  if (mode === 'open-short' || mode === 'open-long') {
+  if ((mode === 'open-short' || mode === 'open-long') && !takeover) {
     const genreId = book.config.genre ?? row.genre;
     const genreName = (book.genre?.pack as { name?: string } | undefined)?.name || genreId;
     library = renderLibraryV3(await loadLibrary(db, book.id, genreId), genreName);
@@ -336,6 +382,7 @@ export async function buildOrderSpec(ctx: PipelineContext, book: BookHandle, tas
     ownerMessageSha,
     ownerRequests: ownerReqs.map((r) => ({ id: r.id, chapter: r.chapter, note: r.note })),
   };
+  if (takeover) spec.takeover = takeover;
   if (step.kind === 'retro') spec.retro = { from: step.from, to: step.to };
   if (step.kind === 'write') {
     spec.phase = step.phase;
@@ -349,6 +396,28 @@ export async function buildOrderSpec(ctx: PipelineContext, book: BookHandle, tas
     };
   }
   return { spec, extra: { library, mustRead: mustLines.join('\n'), budgets: retro ? '' : noteBudgetLines(sizes).join('\n'), ownerNote } };
+}
+
+/** 接手任务单里列的旧资料：这几个固定文件，再加 notes/v1/、bible/（.md、.yaml）、plan/volumes/ 下各最多 12 个文件（排序后取前面的）；超过 64 KB 的标“很长” */
+const TAKEOVER_FIXED = ['seed.md', 'bible/premise.md', 'bible.md', 'outline.md', 'notes/progress.md'];
+const TAKEOVER_DIRS: { dir: string; re: RegExp }[] = [
+  { dir: 'notes/v1', re: /^notes\/v1\/[^/].*[^/]$/ },
+  { dir: 'bible', re: /^bible\/.+\.(md|ya?ml)$/ },
+  { dir: 'plan/volumes', re: /^plan\/volumes\/.+\.ya?ml$/ },
+];
+const TAKEOVER_PER_DIR = 12;
+const TAKEOVER_LONG_BYTES = 64 * 1024;
+
+async function legacyFilesAt(book: BookHandle, head: string): Promise<{ path: string; long: boolean }[]> {
+  const paths: string[] = [];
+  const shas = await book.repo.blobShas(TAKEOVER_FIXED, head);
+  for (const p of TAKEOVER_FIXED) if ((shas[p] ?? '') !== '') paths.push(p);
+  for (const d of TAKEOVER_DIRS) {
+    const listed = (await book.repo.list(d.dir, { rev: head, recursive: true }).catch(() => [] as string[])).filter((p) => d.re.test(p) && !paths.includes(p)).sort();
+    paths.push(...listed.slice(0, TAKEOVER_PER_DIR));
+  }
+  const texts = await readMany(book, paths, head);
+  return paths.map((p) => ({ path: p, long: Buffer.byteLength(texts.get(p) ?? '', 'utf8') > TAKEOVER_LONG_BYTES }));
 }
 
 /** 最近 10 个入库章（no ≤ accepted）的平均字数；没有章节时 null */

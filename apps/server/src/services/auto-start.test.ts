@@ -4,31 +4,25 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { and, eq, inArray } from 'drizzle-orm';
 import { AUTO_LENGTH_MIX_DEFAULT, zSystemSettings, type LengthMix } from '@novelist/shared';
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml';
-import { createBook, deleteBook } from './books.js';
-import { accountsState, bookEvents, books, circuitBreakers, profiles, runs, tasks } from '../db/schema.js';
+import { deleteBook } from './books.js';
+import { accountsState, bookEvents, books, profiles, runs, settings, tasks } from '../db/schema.js';
 import { convertV1Packs, createGenre, listGenres } from '../genres/index.js';
 import { silentLogger } from '../log.js';
 import { enqueue } from '../orchestrator/queue.js';
-import { resolveRoute } from '../orchestrator/routing.js';
+import { markProfileDown, resolveSlot } from '../orchestrator/routing.js';
 import { createTestApp, type TestApp } from '../testing.js';
 import { bookDir } from '../api/helpers.js';
 import { openRepo, P } from '../book/index.js';
 import {
-  AUTO_TITLE_PREFIX,
-  autoScale,
   autoStartsToday,
-  buildAutoSeed,
   buildAutoSeedV3,
   createAutoStarter,
   diversityBrief,
-  extractAutoTitle,
   lengthClass,
   maybeStartBook,
-  nameAutoBooks,
   pickGenre,
   pickKeywords,
   pickLength,
-  premiseDigest,
   unfinishedOwnBooks,
   writerIdle,
 } from './auto-start.js';
@@ -53,38 +47,13 @@ describe('auto-start helpers', () => {
     expect(pickGenre([], new Map())).toBeNull();
   });
 
-  it('lengthClass 按 v1 规则分档，autoScale 换算规模', () => {
+  it('lengthClass 按 v1 规则分档', () => {
     expect(['超长篇', '长篇', '中篇', '短篇', ''].map(lengthClass)).toEqual(['epic', 'long', 'medium', 'short', 'short']);
-    const d = zSystemSettings.parse({}).autoStart.lengths;
-    expect(autoScale(d.short, 4, 3000)).toEqual({ target_cjk: 15000, hard_max_cjk: 22500, volumes: [1, 1], chapters_per_volume: [4, 8] });
-    expect(autoScale(d.epic, 20, 3000).volumes).toEqual([2, 5]);
-    expect(autoScale(d.short, 20, 3000)).toMatchObject({ target_cjk: 60000, chapters_per_volume: [20, 20] });
   });
 
-  it('种子带关键词、撞题列表，adult_only 才带年龄声明', () => {
-    const auto = { enabled: true, weight: 1, keywords: ['甲', '乙'], length_hint: '中篇', min_chapters: null, adult_only: false };
-    const seed = buildAutoSeed({ name: 'X', auto }, ['旧书']);
-    expect(seed).toContain('甲、乙');
-    expect(seed).toContain('旧书');
-    expect(seed).not.toContain('成年人');
-    expect(buildAutoSeed({ name: 'X', auto: { ...auto, adult_only: true } }, [])).toContain('成年人');
-  });
-
-  it('diversityBrief 连续多本不重复同一组合，premiseDigest 取一句话卖点', () => {
+  it('diversityBrief 连续多本不重复同一组合', () => {
     expect(new Set(Array.from({ length: 420 }, (_, i) => diversityBrief(i))).size).toBe(420);
-    expect(premiseDigest('# 《X》\n\n## 一句话卖点\n\n> 老师傅替没人要的表上弦。\n')).toBe('老师傅替没人要的表上弦。');
-    expect(premiseDigest('**一句话卖点**：她要在月底前还完所有的表\n')).toBe('她要在月底前还完所有的表');
-    expect(premiseDigest('没有这一节')).toBeNull();
-    const seed = buildAutoSeed({ name: 'X' }, [], { ordinal: 1, sameGenre: [{ title: '旧', digest: '旧卖点' }] });
-    expect(seed).toContain('《旧》：旧卖点');
-    expect(seed).toContain('贴身第三人称');
-  });
-
-  it('extractAutoTitle 只认规划师写的书名，不把种子当书名', () => {
-    expect(extractAutoTitle('# 《雪夜》\n正文')).toBe('雪夜');
-    expect(extractAutoTitle('\n## 书名：《春水》\n')).toBe('春水');
-    expect(extractAutoTitle(buildAutoSeed({ name: 'X' }, []))).toBeNull();
-    expect(extractAutoTitle('# 《书名》')).toBeNull();
+    expect(diversityBrief(1)).toContain('贴身第三人称');
   });
 });
 
@@ -228,6 +197,8 @@ describe('v3 auto-start against a real app', () => {
     expect(third).toBeNull();
   });
 
+  /** 库里旧存的键（P3 已从 schema 删掉）：不起作用 */
+  const STORED_OLD_KEY = { maxActiveBooks: 1 };
   it('cap maxUnfinishedBooks counts planning/active/paused own books, not imported or completed; a stored maxActiveBooks: 1 is ignored', async () => {
     await addPack(t, 'p-on', { enabled: true });
     await addBook('own-a');
@@ -235,9 +206,11 @@ describe('v3 auto-start against a real app', () => {
     await addBook('own-done', { status: 'completed' });
     await addBook('imp-a', { meta: { v1: { id: 1 } } });
     await addBook('imp-p', { status: 'paused', meta: { v1: { id: 2 } } });
+    // 旧书（没有 meta.v3）也不算
+    await addBook('legacy-own', { meta: {} });
     expect(await unfinishedOwnBooks(t.deps.db)).toBe(2);
-    expect(await maybeStartBook(t.deps, NOW, cfg({ maxUnfinishedBooks: 2, maxActiveBooks: 1 }))).toBeNull();
-    const slug = await maybeStartBook(t.deps, NOW, cfg({ maxUnfinishedBooks: 3, maxActiveBooks: 1 }));
+    expect(await maybeStartBook(t.deps, NOW, cfg({ maxUnfinishedBooks: 2, ...STORED_OLD_KEY }))).toBeNull();
+    const slug = await maybeStartBook(t.deps, NOW, cfg({ maxUnfinishedBooks: 3, ...STORED_OLD_KEY }));
     expect(slug).not.toBeNull();
     await fill(slug!);
     expect((await writerIdle(t.deps.db, NOW, { allowFakeHarness: true })).idle).toBe(true);
@@ -245,7 +218,7 @@ describe('v3 auto-start against a real app', () => {
     expect(await maybeStartBook(t.deps, NOW, cfg({ maxUnfinishedBooks: 4 }))).not.toBeNull();
   });
 
-  it('writer not idle → null: active write task / account sleeping / auth bad / a book not buffer-full / circuit open / circuit pending_open / no route', async () => {
+  it('writer not idle → null: active write task / account sleeping / auth bad / a book not buffer-full / writer profile cooling down / no route', async () => {
     await addPack(t, 'p-on', { enabled: true });
     const idle = async () => (await writerIdle(t.deps.db, NOW, { allowFakeHarness: true })).idle;
     expect(await idle()).toBe(true);
@@ -281,22 +254,16 @@ describe('v3 auto-start against a real app', () => {
       () => t.deps.db.update(books).set({ status: 'paused' }).where(eq(books.id, 'room')),
       /^buffer_room:room/,
     );
+    // 旧书（meta.v3 不是对象）从不开写，不占着写手（P3 D24）
+    await addBook('v2room', { meta: {} });
+    expect(await idle()).toBe(true);
+    const route = await resolveSlot(t.deps.db, { slot: 'writer', book: null, ignoreConcurrency: true, now: NOW, allowFakeHarness: true });
+    expect(route.profile).toBe('fake');
+    // model_unavailable 之后的冷却（没有备用）：写手不闲
     await check(
-      () => addBook('v2room', { meta: {} }),
-      () => t.deps.db.update(books).set({ pausedReason: 'max_buffer' }).where(eq(books.id, 'v2room')),
-      /^buffer_room:v2room/,
-    );
-    const route = await resolveRoute(t.deps.db, { book: null, role: 'writer', tier: 'standard', ignoreConcurrency: true, now: NOW, allowFakeHarness: true });
-    const harness = route.harness!;
-    await check(
-      () => t.deps.db.insert(circuitBreakers).values({ harness, version: '1', isolation: 'none', state: 'open' }),
-      () => t.deps.db.update(circuitBreakers).set({ state: 'closed' }).where(eq(circuitBreakers.harness, harness)),
-      /^no_route:circuit_open/,
-    );
-    await check(
-      () => t.deps.db.update(circuitBreakers).set({ state: 'pending_open' }).where(eq(circuitBreakers.harness, harness)),
-      () => t.deps.db.update(circuitBreakers).set({ state: 'closed' }).where(eq(circuitBreakers.harness, harness)),
-      /^circuit_pending:/,
+      () => markProfileDown(t.deps.db, route.profile!, new Date(NOW.getTime() + 3600_000).toISOString(), 'model gone'),
+      () => t.deps.db.delete(settings).where(eq(settings.key, `routing.down:${route.profile}`)),
+      /^no_route:down/,
     );
     await check(
       () => t.deps.db.update(profiles).set({ enabled: false }).where(eq(profiles.id, route.profile!)),
@@ -377,22 +344,6 @@ describe('v3 auto-start against a real app', () => {
     await hook(NOW, zSystemSettings.parse({}));
     await hook(new Date(NOW.getTime() + 60_000), zSystemSettings.parse({ autoStart: {} }));
     expect(await t.deps.db.select().from(books)).toHaveLength(0);
-  });
-
-  it('规划师写好 premise 后改名（v2 占位名的书），用户改过的名字不动', async () => {
-    await addPack(t, 'p-on', { enabled: true });
-    const slug = 'auto-v2name';
-    await createBook(t.deps, { title: `${AUTO_TITLE_PREFIX}abc`, slug, genre: 'p-on', start: false });
-    const repo = openRepo(bookDir(t.deps, slug));
-    await nameAutoBooks(t.deps);
-    expect((await bookRow(slug))?.title.startsWith(AUTO_TITLE_PREFIX)).toBe(true);
-    await t.deps.db.update(books).set({ status: 'planning' }).where(eq(books.slug, slug));
-    const row = (await bookRow(slug))!;
-    const { commitOwnerEdit } = await import('../orchestrator/index.js');
-    await commitOwnerEdit(t.deps.db, repo, row.id, { files: [{ path: P.premise, content: '# 《雪夜》\n' }], message: 'test', baseSha: null });
-    await nameAutoBooks(t.deps);
-    expect((await bookRow(slug))?.title).toBe('雪夜');
-    expect(yamlParse((await repo.readFile(P.bookYaml))!).title).toBe('雪夜');
   });
 
   it('convertV1Packs：meta.v1 转成 auto + extends generic，幂等，保留 meta', async () => {

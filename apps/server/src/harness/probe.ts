@@ -5,22 +5,22 @@
  * 实现：
  * - detectInstalls：每个 adapter.detect → HarnessInstall（sha256 TOFU，按 path+size+mtime 缓存；tier/status 取 harness.lock.yaml，
  *   没有锁记录时 tier=unknown，版本落在 supportedVersions 内则 status=active —— IMPL §5：目标主机上不强制先 canary）。
- * - runProbe：adapter.probe（--version / --help flag 扫描 / 列模型）+ ctx.live 时跑 canary（写文件 + receipt + 回显首尾 nonce），
+ * - runProbe：adapter.probe（--version / --help flag 扫描 / 列模型）+ ctx.live 时跑目录探测（runDirectoryCanary：照 ORDER.md 写文件、带回 AGENTS.md 的暗号），
  *   并把原始流录成 fixture。
  */
 import { randomBytes, randomUUID } from 'node:crypto';
 import { statSync, realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import type { Capabilities, HarnessId, HarnessInstall, IsolationBackend } from '@novelist/shared';
-import { toJsonSchema, zCapabilities, zHarnessInstall, zReceipt } from '@novelist/shared';
+import type { CanaryResult, Capabilities, HarnessId, HarnessInstall, IsolationBackend } from '@novelist/shared';
+import { V3_LAUNCH_PROMPT, zCapabilities, zHarnessInstall } from '@novelist/shared';
 import { parse as parseYaml } from 'yaml';
-import type { CompiledInstructions } from '../instructions/types.js';
+import { V3_CLAUDE_MD } from '../instructions/v3.js';
 import { capsFrom } from './adapters/common.js';
 import { getAdapter, listAdapters } from './registry.js';
 import { startRun } from './runner.js';
 import type { HarnessAdapter, ProbeContext, ResolvedAccount, RunSpec } from './types.js';
-import { readJsonFile, satisfies, sha256FileImpl } from './util.js';
+import { satisfies, sha256FileImpl } from './util.js';
 
 const shaCache = new Map<string, { key: string; sha: string }>();
 async function cachedSha(p: string): Promise<string> {
@@ -89,10 +89,10 @@ export async function detectInstalls(harnessDir: string): Promise<HarnessInstall
   return out;
 }
 
-export async function runProbe(adapter: HarnessAdapter, inst: HarnessInstall, acct: ResolvedAccount, ctx: ProbeContext): Promise<Capabilities> {
+export async function runProbe(adapter: HarnessAdapter, inst: HarnessInstall, acct: ResolvedAccount, ctx: ProbeContext & { effort?: string }): Promise<Capabilities> {
   await fs.mkdir(ctx.scratchDir, { recursive: true });
   let caps = await adapter.probe(inst, acct, ctx);
-  if (ctx.live) caps = await runCanary(adapter, inst, acct, ctx, caps);
+  if (ctx.live) caps = (await runDirectoryCanary(adapter, inst, acct, ctx, caps)).caps;
   return zCapabilities.parse(caps);
 }
 
@@ -111,132 +111,90 @@ function rand12(): string {
   return s;
 }
 
-/** canary 用的最小 RunSpec + 文件（§3.8 第 4 步：写文件、写 receipt、回显首尾 nonce） */
-export async function prepareCanary(
+/** 目录探测的任务单第一行（fake harness 认这一行） */
+export const CANARY_ORDER_LINE = '在当前目录写一个文件 canary.txt，第一行写';
+
+/**
+ * 目录探测（canary，§3.8 第 4 步，按 v3 的目录契约）：临时书房 $scratch/runs/canary/<id>/book 里放
+ * AGENTS.md（带一个暗号）、CLAUDE.md（@AGENTS.md）和 ORDER.md（写 canary.txt：第一行标记，第二行暗号），启动语 = V3_LAUNCH_PROMPT。
+ * 步骤：canary.run（正常结束）、canary.write（canary.txt 含标记）、canary.agents（canary.txt 含 AGENTS.md 的暗号 = 指令文件真的被读到）。
+ * 返回的能力：workspaceDocLoaded = tailNonceSurvives = honouredAgents（后者只为旧 schema 兼容保留）。
+ */
+export async function runDirectoryCanary(
   adapter: HarnessAdapter,
-  caps: Capabilities,
+  inst: HarnessInstall,
   acct: ResolvedAccount,
-  ctx: ProbeContext,
-): Promise<{ spec: RunSpec; compiled: CompiledInstructions; head: string; tail: string; marker: string }> {
+  ctx: ProbeContext & { model?: string; effort?: string },
+  caps: Capabilities,
+): Promise<{ caps: Capabilities; result: CanaryResult }> {
+  const steps = [...caps.probeSteps];
+  const fail = (detail: string): { caps: Capabilities; result: CanaryResult } => {
+    steps.push({ step: 'canary', ok: false, detail });
+    return { caps: { ...caps, probeSteps: steps }, result: { ok: false, steps, wroteFile: false, honouredAgents: false, toolSteps: 0 } };
+  };
   const runId = randomUUID();
   const runDir = path.join(ctx.scratchDir, 'runs', 'canary', runId);
   const inDir = path.join(runDir, 'in');
   const logDir = path.join(runDir, 'log');
   const bookDir = path.join(runDir, 'book');
   const outDir = path.join(bookDir, 'work', 'canary', 'attempt-1', 'out');
-  for (const d of [inDir, logDir, outDir]) await fs.mkdir(d, { recursive: true });
-  const head = `NV-B-HEAD-${rand12()}`;
-  const tail = `NV-B-TAIL-${rand12()}`;
   const marker = `NOVELIST-CANARY-${rand12()}`;
-  const systemMd = `${head}\n\n# 书层指令（canary）\n\n你是 Novelist 的探测代理。完成工作单后，在 receipt.json 的 nonces 数组里原样列出本系统提示中出现的所有以 NV- 开头的标记。不要读取 ${inDir} 下的 system.md。\n\n${tail}\n`;
-  const compiled: CompiledInstructions = {
-    systemMd,
-    mirrorMd: systemMd.replace(head, '').replace(tail, ''),
-    layers: [],
-    nonces: { L3: { head, tail } },
-    stackHash: 'canary',
-    bytes: Buffer.byteLength(systemMd),
-    lastAuthorLayerId: 'L3',
-  };
-  const dialect = caps.schemaDialect === 'strict' ? 'strict' : 'lenient';
-  const receiptSchemaFile = path.join(inDir, `receipt.${dialect}.json`);
-  await fs.writeFile(receiptSchemaFile, JSON.stringify(toJsonSchema(zReceipt, dialect), null, 2));
-  const systemFile = path.join(inDir, 'system.md');
-  await fs.writeFile(systemFile, systemMd);
-  const workOrderFile = path.join(inDir, 'workorder.md');
-  const wo = `---
-schema: nv.workorder/1
-task_id: canary-${runId.slice(0, 8)}
-run_id: ${runId}
-kind: harness.canary
-role: canary
-book: null
-target: canary
-out_dir: ${outDir}
-inputs: []
-artifacts:
-  - path: canary.txt
-    kind: markdown
-  - path: receipt.json
-    kind: receipt
-    schema: nv.receipt/1
----
-
-# 探测任务（canary）
-
-1. 在 \`${outDir}/canary.txt\` 写入一行：${marker}
-2. 在 \`${outDir}/receipt.json\` 写入 JSON 回执：{"schema":"nv.receipt/1","status":"done","artifacts":[{"path":"canary.txt"}],"nonces":[…系统提示中所有 NV- 标记…]}
-3. 只写这两个文件，不要创建其他文件，不要运行命令。
-`;
-  await fs.writeFile(workOrderFile, wo);
-  const spec: RunSpec = {
-    runId,
-    taskId: `canary-${runId.slice(0, 8)}`,
-    attempt: 1,
-    role: 'canary',
-    taskKind: 'harness.canary',
-    harness: adapter.id,
-    profileId: `canary-${adapter.id}`,
-    accountId: acct.id,
-    bookSlug: null,
-    runDir,
-    bookDir,
-    outDir,
-    inDir,
-    logDir,
-    workOrderFile,
-    systemFile,
-    receiptSchemaFile,
-    model: ctx.model ?? adapter.devModel ?? caps.models[0] ?? 'default',
-    limits: { wallMs: ctx.timeoutMs ?? 5 * 60_000, idleMs: Math.min(ctx.timeoutMs ?? 5 * 60_000, 3 * 60_000), maxTurns: 12 },
-    session: { mode: 'fresh', id: runId },
-    persistSession: false,
-    egress: { allow: [] },
-    subagents: false,
-    extraArgs: [],
-  };
-  return { spec, compiled, head, tail, marker };
-}
-
-async function runCanary(adapter: HarnessAdapter, inst: HarnessInstall, acct: ResolvedAccount, ctx: ProbeContext, caps: Capabilities): Promise<Capabilities> {
-  const steps = [...caps.probeSteps];
-  let prepared: Awaited<ReturnType<typeof prepareCanary>>;
+  const code = `NV-CANARY-${randomBytes(6).toString('hex')}`;
+  let spec: RunSpec;
   try {
-    prepared = await prepareCanary(adapter, caps, acct, ctx);
+    for (const d of [inDir, logDir, outDir]) await fs.mkdir(d, { recursive: true });
+    await fs.writeFile(path.join(bookDir, 'AGENTS.md'), `这是探测运行。读 ORDER.md 并照做。\n暗号：${code}\n`);
+    await fs.writeFile(path.join(bookDir, 'CLAUDE.md'), V3_CLAUDE_MD);
+    await fs.writeFile(path.join(bookDir, 'ORDER.md'), `${CANARY_ORDER_LINE} ${marker}，第二行写 AGENTS.md 里的暗号。不要做别的事。\n`);
+    const workOrderFile = path.join(inDir, 'launch.md');
+    await fs.writeFile(workOrderFile, V3_LAUNCH_PROMPT);
+    spec = {
+      runId,
+      taskId: `canary-${runId.slice(0, 8)}`,
+      attempt: 1,
+      role: 'canary',
+      taskKind: 'canary',
+      harness: adapter.id,
+      profileId: `canary-${adapter.id}`,
+      accountId: acct.id,
+      bookSlug: null,
+      runDir,
+      bookDir,
+      outDir,
+      inDir,
+      logDir,
+      workOrderFile,
+      model: ctx.model ?? adapter.devModel ?? caps.models[0] ?? 'default',
+      ...(ctx.effort ? { effort: ctx.effort } : {}),
+      limits: { wallMs: ctx.timeoutMs ?? 5 * 60_000, idleMs: Math.min(ctx.timeoutMs ?? 5 * 60_000, 3 * 60_000), maxTurns: 12 },
+      session: { mode: 'fresh', id: runId },
+      persistSession: false,
+      egress: { allow: [] },
+      extraArgs: [],
+    };
   } catch (e) {
-    steps.push({ step: 'canary', ok: false, detail: `准备失败：${(e as Error).message}` });
-    return { ...caps, probeSteps: steps };
+    return fail(`准备失败：${(e as Error).message}`);
   }
-  const { spec, compiled, head, tail, marker } = prepared;
   const types = new Set<string>(caps.eventTypesSeen);
   try {
-    const h = await startRun({ spec, adapter, account: acct, install: inst, caps, isolation: ctx.isolation, compiled }, { onEvent: (e) => void types.add(e.t) });
+    const h = await startRun({ spec, adapter, account: acct, install: inst, caps, isolation: ctx.isolation }, { onEvent: (e) => void types.add(e.t) });
     const res = await h.wait();
-    steps.push({ step: 'canary.run', ok: res.outcome.status === 'completed', detail: `${res.outcome.status}${res.outcome.errorClass ? ` / ${res.outcome.errorClass}` : ''}${res.outcome.message ? `：${res.outcome.message.slice(0, 200)}` : ''}` });
-    const txt = await fs.readFile(path.join(spec.outDir, 'canary.txt'), 'utf8').catch(() => '');
-    steps.push({ step: 'canary.write', ok: txt.includes(marker), detail: txt ? txt.slice(0, 80) : '未写出 canary.txt' });
-    const receipt = (await readJsonFile<{ nonces?: string[] }>(path.join(spec.outDir, 'receipt.json'))) ?? (res.outcome.receipt as { nonces?: string[] } | undefined) ?? null;
-    const parsed = zReceipt.safeParse(receipt);
-    steps.push({ step: 'canary.receipt', ok: parsed.success, detail: parsed.success ? 'receipt 合法' : '缺少或不合法的 receipt.json' });
-    const echoed = new Set(receipt?.nonces ?? []);
-    const headOk = echoed.has(head);
-    const tailOk = echoed.has(tail);
-    steps.push({ step: 'canary.nonce', ok: headOk && tailOk, detail: `head ${headOk ? '✓' : '✗'} tail ${tailOk ? '✓' : '✗'}` });
-    steps.push({ step: 'canary.audit', ok: res.audit.ok, detail: res.audit.ok ? 'out/ 清单与 home 配置均正常' : `多余：${res.audit.extraFiles.join(',')} 改动：${res.audit.tamperedConfig.join(',')}` });
+    const ran = res.outcome.status === 'completed';
+    steps.push({ step: 'canary.run', ok: ran, detail: `${res.outcome.status}${res.outcome.errorClass ? ` / ${res.outcome.errorClass}` : ''}${res.outcome.message ? `：${res.outcome.message.slice(0, 200)}` : ''}` });
+    const txt = await fs.readFile(path.join(bookDir, 'canary.txt'), 'utf8').catch(() => '');
+    const wroteFile = txt.split('\n')[0]?.includes(marker) ?? false;
+    const honouredAgents = txt.includes(code);
+    steps.push({ step: 'canary.write', ok: wroteFile, detail: txt ? txt.slice(0, 80) : '未写出 canary.txt' });
+    steps.push({ step: 'canary.agents', ok: honouredAgents, detail: honouredAgents ? 'canary.txt 里有 AGENTS.md 的暗号' : 'canary.txt 里没有 AGENTS.md 的暗号（指令文件可能没被读到）' });
     if (ctx.fixturesDir) {
       await fs.mkdir(ctx.fixturesDir, { recursive: true });
       await fs.copyFile(res.stdoutFile, path.join(ctx.fixturesDir, `canary-${new Date().toISOString().replace(/[:.]/g, '-')}.ndjson`)).catch(() => {});
     }
     return {
-      ...caps,
-      systemChannelLoaded: headOk || caps.systemChannelLoaded,
-      tailNonceSurvives: tailOk,
-      eventTypesSeen: [...types],
-      verifiedAt: new Date().toISOString(),
-      probeSteps: steps,
+      caps: { ...caps, workspaceDocLoaded: honouredAgents, tailNonceSurvives: honouredAgents, eventTypesSeen: [...types], verifiedAt: new Date().toISOString(), probeSteps: steps },
+      result: { ok: ran && wroteFile && honouredAgents, steps, wroteFile, honouredAgents, toolSteps: res.toolSteps },
     };
   } catch (e) {
-    steps.push({ step: 'canary', ok: false, detail: (e as Error).message.slice(0, 300) });
-    return { ...caps, probeSteps: steps };
+    return fail((e as Error).message.slice(0, 300));
   }
 }

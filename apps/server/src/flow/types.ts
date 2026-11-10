@@ -47,6 +47,8 @@ export interface OrderSpec {
   ownerMessageSha?: string | null;
   /** WP-2：这一批要先处理的主人改写请求；复盘恒为 [] */
   ownerRequests?: { id: string; chapter: number; note: string }[];
+  /** P3：接手的旧书的第一次写作（先读最后几章和旧资料、补出笔记，再续写）。lastChapters = 要读的最后三章，legacyFiles = HEAD 上的旧资料 */
+  takeover?: { lastChapters: number[]; legacyFiles: string[] };
 }
 
 export interface ChangedFile {
@@ -136,6 +138,8 @@ export interface V3BatchEffectArgs {
   ownerRequestResults?: { id: string; chapter: number; final?: boolean }[];
   /** WP-3：这次改了 bible.md 且第三行能解析出标签 → 写进 books.meta.tags（顶层） */
   tags?: string[];
+  /** P3：接手任务单的这一批有新章入库 → meta.v3.takeover.status = 'done' */
+  takeoverDone?: boolean;
 }
 
 export interface V3BatchNote {
@@ -251,6 +255,16 @@ export interface V3BookMeta {
   ownerMessages: V3OwnerMessageMeta[];
   /** 改写请求，≤ 50（先丢最早处理完的） */
   ownerRequests: V3OwnerRequest[];
+  /** P3：接手的旧书（from = 接手后第一章）；pending = 还在用接手任务单，done = 接手后的第一批已入库。没接手过 = null */
+  takeover: V3Takeover | null;
+  /** P3：主人点了“立即写下一批”：存稿满了（或因存稿满暂停）也写一批；有新章入库就清掉（只多写这一批） */
+  writeNow?: boolean;
+}
+
+export interface V3Takeover {
+  at: string;
+  from: number;
+  status: 'pending' | 'done';
 }
 
 export interface V3OwnerMessageMeta {

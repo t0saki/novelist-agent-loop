@@ -1,28 +1,27 @@
 /**
- * 指令编辑器 + 按 harness 的编译预览 + 生效 gate（全局 / 题材 / 书层共用）。Owner: lane H。
+ * 指令编辑器 + 根 AGENTS.md 预览（全局 / 题材 / 书层共用；builtin 只读）。
  * 指令内容归用户所有，这里只原样编辑和传递。
  */
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ROLE_IDS, type HarnessStatus, type ImpactEstimate, type InstructionFileEntry, type InstructionPreview, type InstructionPreviewRequest, type RepoFile, type RoleId } from '@novelist/shared';
+import { V3_LENGTHS, type GenreSummary, type ImpactEstimate, type InstructionFileEntry, type InstructionPreviewV3, type InstructionPreviewV3Request, type RepoFile, type V3Length } from '@novelist/shared';
 import { del, post, put, qs } from '../../api/client';
 import { useApi, useInvalidate } from '../../api/hooks';
 import { fmtBytes, fmtNum } from '../../lib/format';
-import { GATE_SOURCE, ROLE_LABEL } from '../../lib/labels';
+import { V3_LENGTH_LABEL } from '../../lib/labels';
 import { CodeEditor, langForPath } from '../CodeEditor';
-import { Badge, Button, confirmDialog, cx, Empty, ErrorBox, Field, Input, Loading, Modal, Notice, Pre, Q, Select, Tabs, useDebounced } from '../ui';
+import { Badge, Button, confirmDialog, cx, Empty, ErrorBox, Field, Input, Loading, Modal, Notice, Pre, Q, Select, useDebounced } from '../ui';
 import { toast } from '../toast';
 import { saveErrorText, saveWithImpact } from './saveFlow';
 
-type PreviewTab = 'system' | 'workspace' | 'files' | 'argv' | 'gates' | 'layers';
-
 const NEW_HINT: Record<string, string> = {
-  global: '如 AGENTS.md、roles/writer.md、tasks/chapter.write.md、skills/<name>/SKILL.md',
-  genre: '如 AGENTS.md、roles/writer.md、pacing.yaml、gates.yaml、lexicon.yaml',
-  book: '如 instructions/AGENTS.md、instructions/roles/writer.md、style/voice.md',
+  global: '如 AGENTS.md、roles/writer.md、skills/<name>/SKILL.md',
+  genre: '如 AGENTS.md、roles/writer.md',
+  book: '如 instructions/AGENTS.md',
 };
 
-export function InstructionWorkbench({ scope, book, genre }: { scope: string; book?: string; genre?: string }) {
+/** filter：只列出符合的文件（篇幅档查看器只看 v3/length-*.md）；preview=false 不显示预览 */
+export function InstructionWorkbench({ scope, book, genre, filter, preview = true }: { scope: string; book?: string; genre?: string; filter?: (path: string) => boolean; preview?: boolean }) {
   const readOnly = scope === 'builtin';
   const listPath = `/api/admin/instructions/files${qs({ scope })}`;
   const files = useApi<InstructionFileEntry[]>(listPath);
@@ -41,9 +40,9 @@ export function InstructionWorkbench({ scope, book, genre }: { scope: string; bo
 
   const grouped = useMemo(() => {
     const m = new Map<string, InstructionFileEntry[]>();
-    for (const f of files.data ?? []) m.set(f.layer, [...(m.get(f.layer) ?? []), f]);
+    for (const f of (files.data ?? []).filter((x) => !filter || filter(x.path))) m.set(f.layer, [...(m.get(f.layer) ?? []), f]);
     return [...m.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [files.data]);
+  }, [files.data, filter]);
 
   const clearDraft = (p: string) =>
     setDrafts((d) => {
@@ -88,7 +87,7 @@ export function InstructionWorkbench({ scope, book, genre }: { scope: string; bo
   }
 
   const prefix = scope.split(':')[0] ?? scope;
-  const visible = [...new Set([...(files.data?.map((f) => f.path) ?? []), ...created])];
+  const visible = [...new Set([...(files.data?.map((f) => f.path).filter((p) => !filter || filter(p)) ?? []), ...created])];
 
   return (
     <div className="space-y-4">
@@ -159,7 +158,7 @@ export function InstructionWorkbench({ scope, book, genre }: { scope: string; bo
         </div>
       </div>
 
-      <PreviewPanel scope={scope} book={book} genre={genre} drafts={drafts} />
+      {preview && <PreviewPanel scope={scope} book={book} genre={genre} drafts={drafts} />}
 
       {newFile !== null && (
         <Modal
@@ -202,23 +201,22 @@ function FileRow({ path, active, dirty, size, onClick }: { path: string; active:
   );
 }
 
+/** 根 AGENTS.md 预览：和运行时同一个渲染器（按书，或按题材包 + 篇幅），带各层字节数；未保存的修改也算在内 */
 function PreviewPanel({ scope, book, genre, drafts }: { scope: string; book?: string; genre?: string; drafts: Record<string, string> }) {
-  const harness = useApi<HarnessStatus[]>('/api/admin/harness');
-  const [role, setRole] = useState<RoleId>('writer');
-  const [picked, setPicked] = useState<string | null>(null);
-  const [tab, setTab] = useState<PreviewTab>('system');
-  const harnessId = picked ?? harness.data?.find((h) => h.installed && h.id !== 'fake')?.id ?? harness.data?.[0]?.id ?? null;
-
+  const genres = useApi<GenreSummary[]>(book || genre ? null : '/api/admin/genres');
+  const [pickedGenre, setPickedGenre] = useState<string | null>(null);
+  const [length, setLength] = useState<V3Length>('medium');
+  const genreId = genre ?? pickedGenre ?? genres.data?.find((g) => !g.hidden)?.id ?? null;
   const scoped = useMemo(() => Object.fromEntries(Object.entries(drafts).map(([p, v]) => [`${scope}:${p}`, v])), [drafts, scope]);
   const debounced = useDebounced(scoped, 800);
-  const q = useQuery<InstructionPreview>({
-    queryKey: ['instruction-preview', scope, book, genre, role, harnessId, debounced],
-    enabled: harnessId !== null,
+  const q = useQuery<InstructionPreviewV3>({
+    queryKey: ['instruction-preview', scope, book, genreId, length, debounced],
+    enabled: Boolean(book) || genreId !== null,
     placeholderData: (prev) => prev,
     staleTime: 0,
     queryFn: () => {
-      const req: InstructionPreviewRequest = { book, genre, role, harness: harnessId as never, drafts: debounced };
-      return post<InstructionPreview>('/api/admin/instructions/preview', req);
+      const req: InstructionPreviewV3Request = book ? { book, drafts: debounced } : { genre: genreId as string, length, drafts: debounced };
+      return post<InstructionPreviewV3>('/api/admin/instructions/preview', req);
     },
   });
   const p = q.data;
@@ -227,178 +225,68 @@ function PreviewPanel({ scope, book, genre, drafts }: { scope: string; book?: st
     <section className="bg-panel border border-line rounded-lg">
       <header className="flex flex-wrap items-end justify-between gap-3 px-4 py-3 border-b border-line">
         <div>
-          <h2 className="text-sm font-semibold">编译预览：agent 实际看到的内容</h2>
-          <p className="text-xs text-faint mt-0.5">未保存的修改也算在内；这里的 nonce 是占位值。</p>
+          <h2 className="text-sm font-semibold">预览：作者看到的根 AGENTS.md</h2>
+          <p className="text-xs text-faint mt-0.5">未保存的修改也算在内。{book ? '按这本书的题材和篇幅。' : ''}</p>
         </div>
-        <div className="flex gap-2">
-          <Field label="角色">
-            <Select value={role} onChange={(e) => setRole(e.target.value as RoleId)}>
-              {ROLE_IDS.map((r) => (
-                <option key={r} value={r}>
-                  {ROLE_LABEL[r]}（{r}）
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <Field label="Harness">
-            <Select value={harnessId ?? ''} onChange={(e) => setPicked(e.target.value)}>
-              {harness.data?.map((h) => (
-                <option key={h.id} value={h.id}>
-                  {h.displayName}
-                  {h.installed ? '' : '（未安装）'}
-                </option>
-              ))}
-            </Select>
-          </Field>
-        </div>
+        {!book && (
+          <div className="flex gap-2">
+            {!genre && (
+              <Field label="题材包">
+                <Select value={genreId ?? ''} onChange={(e) => setPickedGenre(e.target.value)} aria-label="预览用的题材包">
+                  {genres.data?.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            )}
+            <Field label="篇幅">
+              <Select value={length} onChange={(e) => setLength(e.target.value as V3Length)} aria-label="预览用的篇幅">
+                {V3_LENGTHS.map((l) => (
+                  <option key={l} value={l}>
+                    {V3_LENGTH_LABEL[l]}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+        )}
       </header>
-      <div className="p-4">
+      <div className="p-4 space-y-3">
         {q.error && !p && <ErrorBox error={q.error} retry={() => void q.refetch()} />}
-        {!p && !q.error && <Loading text="编译中…" />}
+        {!p && !q.error && (genreId !== null || book ? <Loading text="渲染中…" /> : <Empty>没有可用的题材包。</Empty>)}
         {p && (
           <>
-            {!p.budget.ok && (
-              <div className="mb-3">
-                <Notice tone="danger">
-                  该 profile 不可承载：指令 {fmtBytes(p.budget.bytes)}，上限 {p.budget.limit === null ? '未知' : fmtBytes(p.budget.limit)}。{p.budget.reason ?? '请压缩该层或换 harness。'}
-                </Notice>
-              </div>
-            )}
-            <Tabs<PreviewTab>
-              value={tab}
-              onChange={setTab}
-              tabs={[
-                { id: 'system', label: 'System 通道' },
-                { id: 'workspace', label: '工作区文档' },
-                { id: 'files', label: `物化文件（${p.materialized.files.length}）` },
-                { id: 'argv', label: '命令与环境' },
-                { id: 'gates', label: `生效 Gate（${p.effectiveGates.length}）` },
-                { id: 'layers', label: '层与预算' },
-              ]}
-            />
-            {tab === 'system' && <Pre className="max-h-[60vh]">{p.systemMd || '（空）'}</Pre>}
-            {tab === 'workspace' && <Pre className="max-h-[60vh]">{p.workspaceDoc || '（空）'}</Pre>}
-            {tab === 'files' && (
-              <div className="space-y-3">
-                {p.materialized.files.map((f) => (
-                  <div key={f.path}>
-                    <code className="text-xs">{f.path}</code>
-                    <Pre className="mt-1 max-h-72">{f.content}</Pre>
-                  </div>
-                ))}
-                {p.materialized.files.length === 0 && <Empty>该 harness 不需要额外文件。</Empty>}
-              </div>
-            )}
-            {tab === 'argv' && (
-              <div className="space-y-3">
-                <Pre>{p.materialized.argv.join(' \\\n  ')}</Pre>
-                <Pre>{Object.entries(p.materialized.env).map(([k, v]) => `${k}=${v}`).join('\n') || '（无额外环境变量）'}</Pre>
-              </div>
-            )}
-            {tab === 'gates' && <GateTable gates={p.effectiveGates} />}
-            {tab === 'layers' && (
-              <div className="space-y-2">
-                <p className="text-sm text-sub">
-                  总计 {fmtBytes(p.budget.bytes)}
-                  {p.budget.limit !== null && ` / 上限 ${fmtBytes(p.budget.limit)}`}；最后一层作者块：<code className="text-xs">{p.lastAuthorBlock}</code>
-                </p>
-                {p.replaced.length > 0 && (
-                  <p className="text-sm text-sub">
-                    已被替换、不生效的层：
-                    {p.replaced.map((l) => (
-                      <code key={l.id} className="text-xs ml-1" title={l.source}>
-                        {l.id}
-                      </code>
-                    ))}
-                  </p>
-                )}
-                <div className="overflow-x-auto">
-                  <table className="tbl">
-                    <thead>
-                      <tr>
-                        <th>层</th>
-                        <th>来源</th>
-                        <th>模式</th>
-                        <th className="text-right">字节</th>
-                        <th className="text-right">Token</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {p.layers.map((l) => (
-                        <tr key={l.id}>
-                          <td>
-                            {l.id} <span className="text-xs text-faint">{l.label}</span>
-                          </td>
-                          <td>
-                            <code className="text-xs">{l.source}</code>
-                          </td>
-                          <td>{l.mode === 'replace' ? '替换' : '继承'}</td>
-                          <td className="text-right tabular-nums">{fmtBytes(l.bytes)}</td>
-                          <td className="text-right tabular-nums">{fmtNum(l.tokens)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
+            <p className={cx('text-sm tabular-nums', p.over ? 'text-danger' : 'text-sub')}>
+              共 {fmtBytes(p.bytes)} / 上限 {fmtBytes(p.limit)}
+              {p.over ? '：超过了，请精简全局、题材或本书指令' : ''}
+            </p>
+            {p.over && <Notice tone="danger">AGENTS.md 超过 {fmtBytes(p.limit)}，有的 harness 会截断或拒绝启动。</Notice>}
+            <div className="overflow-x-auto">
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th>层</th>
+                    <th className="text-right">字节</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {p.layers.map((l) => (
+                    <tr key={l.id}>
+                      <td>
+                        {l.label} <code className="text-xs text-faint">{l.id}</code>
+                      </td>
+                      <td className="text-right tabular-nums">{fmtNum(l.bytes)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <Pre className="max-h-[60vh]">{p.text || '（空）'}</Pre>
           </>
         )}
       </div>
     </section>
   );
 }
-
-function GateTable({ gates }: { gates: InstructionPreview['effectiveGates'] }) {
-  const [only, setOnly] = useState<string>('');
-  const sources = [...new Set(gates.map((g) => g.source))];
-  const shown = only ? gates.filter((g) => g.source === only) : gates;
-  return (
-    <div className="space-y-2">
-      <div className="flex flex-wrap gap-1.5">
-        <button type="button" onClick={() => setOnly('')} className={cx('text-xs rounded px-2 py-0.5 border border-line', only === '' && 'bg-panel2')}>
-          全部
-        </button>
-        {sources.map((s) => (
-          <button key={s} type="button" onClick={() => setOnly(s)} className={cx('text-xs rounded px-2 py-0.5', GATE_SOURCE[s]?.cls, only === s && 'ring-1 ring-current')}>
-            {GATE_SOURCE[s]?.label ?? s}
-          </button>
-        ))}
-      </div>
-      <div className="overflow-x-auto">
-        <table className="tbl">
-          <thead>
-            <tr>
-              <th>规则</th>
-              <th>类别</th>
-              <th>级别</th>
-              <th>来源</th>
-              <th>参数</th>
-            </tr>
-          </thead>
-          <tbody>
-            {shown.map((g) => (
-              <tr key={g.rule}>
-                <td>
-                  <code className="text-xs">{g.rule}</code>
-                </td>
-                <td>{g.family === 'contract' ? '契约' : '手艺'}</td>
-                <td>
-                  <Badge tone={g.level === 'hard' ? 'danger' : g.level === 'soft' ? 'warn' : 'neutral'}>{g.level}</Badge>
-                </td>
-                <td>
-                  <span className={cx('text-xs rounded px-1.5 py-0.5', GATE_SOURCE[g.source]?.cls)}>{GATE_SOURCE[g.source]?.label ?? g.source}</span>
-                </td>
-                <td className="text-xs text-sub">
-                  {Object.keys(g.params).length > 0 && <code>{JSON.stringify(g.params)}</code>}
-                  {g.allow.length > 0 && <span> 允许：{g.allow.join('、')}</span>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-

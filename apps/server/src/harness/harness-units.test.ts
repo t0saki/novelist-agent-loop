@@ -2,6 +2,7 @@
  * harness 层其余模块的单测：classify、util、isolation、home、login、shim、probe、install。不调真实 CLI。
  */
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -15,7 +16,7 @@ import { accountHome, createMemorySecretStore, resolveAccount, syncBackCredentia
 import { planInstall, writeLockEntry } from './install.js';
 import { _resetIsolationCache, isAllowed, mountPlanFor, postRunAudit, probeIsolation, wrapInvocation } from './isolation.js';
 import { createLoginManager, type LoginResult } from './login.js';
-import { defaultCapabilities, runProbe } from './probe.js';
+import { defaultCapabilities, runDirectoryCanary, runProbe } from './probe.js';
 import { getAdapter } from './registry.js';
 import { shimScriptPath } from './runner.js';
 import type { ShimExit, ShimSpec } from './shim/spec.js';
@@ -180,10 +181,11 @@ describe('isolation', () => {
     expect(isAllowed('disableable', 'pi', 'bwrap').ok).toBe(true);
   });
 
-  it('mountPlanFor：book/in 只读，out/log/home 可写，$DATA 被遮蔽', () => {
+  it('mountPlanFor：in 只读，书快照/out/log/home 可写（目录契约），$DATA 被遮蔽', () => {
     const p = mountPlanFor(spec, ['/data/accounts/a/home'], ['/opt/h']);
-    expect(p.ro).toEqual(expect.arrayContaining([spec.bookDir, spec.inDir, '/opt/h']));
-    expect(p.rw).toEqual(expect.arrayContaining([spec.outDir, spec.logDir, '/data/accounts/a/home']));
+    expect(p.ro).toEqual(expect.arrayContaining([spec.inDir, '/opt/h']));
+    expect(p.ro).not.toContain(spec.bookDir);
+    expect(p.rw).toEqual(expect.arrayContaining([spec.bookDir, spec.outDir, spec.logDir, '/data/accounts/a/home']));
     expect(p.mask).toEqual(['/data']);
   });
 
@@ -222,17 +224,15 @@ describe('isolation', () => {
     _resetIsolationCache();
   });
 
-  it('postRunAudit：多余文件、配置被改', async () => {
+  it('postRunAudit：只查 home 配置被改（out/ 清单不再审计）', async () => {
     const d = await mkTmp();
-    await fs.mkdir(path.join(d, 'out/m'), { recursive: true });
-    await fs.writeFile(path.join(d, 'out/m/c1.md'), 'x');
-    await fs.writeFile(path.join(d, 'out/stray.txt'), 'x');
     const cfg = path.join(d, 'cfg');
     await fs.writeFile(cfg, 'after');
-    const r = await postRunAudit({ outDir: path.join(d, 'out'), declaredGlobs: ['m/*.md', 'receipt.json'], homeConfigHashes: { [cfg]: 'deadbeef', [path.join(d, 'gone')]: 'x' } });
-    expect(r.ok).toBe(false);
-    expect(r.extraFiles).toEqual(['stray.txt']);
-    expect(r.tamperedConfig).toEqual([cfg, path.join(d, 'gone')]);
+    const r = await postRunAudit({ homeConfigHashes: { [cfg]: 'deadbeef', [path.join(d, 'gone')]: 'x' } });
+    expect(r).toEqual({ ok: false, extraFiles: [], tamperedConfig: [cfg, path.join(d, 'gone')] });
+    const same = path.join(d, 'same');
+    await fs.writeFile(same, 'x');
+    expect(await postRunAudit({ homeConfigHashes: { [same]: createHash('sha256').update('x').digest('hex') } })).toEqual({ ok: true, extraFiles: [], tamperedConfig: [] });
   });
 });
 
@@ -523,19 +523,41 @@ describe('probe / install', () => {
     expect(await detectBin(['definitely-not-a-binary-xyz'], d)).toBeNull();
   });
 
-  it('runProbe(live) 用 fake 跑 canary：写文件 + receipt + 首尾 nonce', async () => {
+  it('runProbe(live) 用 fake 跑目录探测：照 ORDER.md 写 canary.txt，带回 AGENTS.md 的暗号', async () => {
     const dataRoot = await mkTmp();
     const f = await makeRunFixture({ dataRoot });
     const caps = await runProbe(getAdapter('fake'), f.prepared.install, f.prepared.account, { isolation: 'container', scratchDir: path.join(dataRoot, 'scratch'), live: true, fixturesDir: path.join(dataRoot, 'fx') });
     const step = (n: string) => caps.probeSteps.find((s) => s.step === n);
     expect(step('canary.run')?.ok).toBe(true);
     expect(step('canary.write')?.ok).toBe(true);
-    expect(step('canary.receipt')?.ok).toBe(true);
-    expect(step('canary.nonce')?.ok).toBe(true);
-    expect(step('canary.audit')?.ok).toBe(true);
+    expect(step('canary.agents')?.ok).toBe(true);
+    expect(step('canary.receipt')).toBeUndefined();
+    expect(step('canary.nonce')).toBeUndefined();
+    expect(caps.workspaceDocLoaded).toBe(true);
     expect(caps.tailNonceSurvives).toBe(true);
     expect(caps.eventTypesSeen).toContain('result');
     expect(await fs.readdir(path.join(dataRoot, 'fx'))).toHaveLength(1);
+  });
+
+  it('runDirectoryCanary：fake 不带暗号（{canary:"skipAgents"}）→ canary.agents 失败，能力记为没读到指令', async () => {
+    const dataRoot = await mkTmp();
+    const f = await makeRunFixture({ dataRoot });
+    const base = getAdapter('fake');
+    // fake.json 放在 launch.md 旁边：包一层 buildInvocation 在 $RUN/in 写好场景文件
+    const adapter = {
+      ...base,
+      buildInvocation: (...a: Parameters<typeof base.buildInvocation>) => {
+        writeFileSync(path.join(a[0].inDir, 'fake.json'), JSON.stringify({ canary: 'skipAgents' }));
+        return base.buildInvocation(...a);
+      },
+    };
+    const caps0 = defaultCapabilities('fake', f.prepared.install.version, 'container');
+    const { caps, result } = await runDirectoryCanary(adapter, f.prepared.install, f.prepared.account, { isolation: 'container', scratchDir: path.join(dataRoot, 'scratch'), live: true }, caps0);
+    expect(result).toMatchObject({ ok: false, wroteFile: true, honouredAgents: false });
+    expect(result.toolSteps).toBeGreaterThan(0);
+    expect(caps.probeSteps.find((s) => s.step === 'canary.agents')?.ok).toBe(false);
+    expect(caps.workspaceDocLoaded).toBe(false);
+    expect(caps.tailNonceSurvives).toBe(false);
   });
 
   it('defaultCapabilities 标记 unverified', () => {

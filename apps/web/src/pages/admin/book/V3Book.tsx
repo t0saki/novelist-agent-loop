@@ -4,7 +4,7 @@
  */
 import { useMemo, useState } from 'react';
 import { Link } from '@tanstack/react-router';
-import { V3_LENGTHS, type BookOverview, type ChapterRow, type Effort, type Ok, type V3ActionResult, type V3BookView, type V3DraftRow, type V3Settings } from '@novelist/shared';
+import { V3_LENGTHS, type BookOverview, type ChapterRow, type Effort, type Ok, type Profile, type V3ActionResult, type V3BookView, type V3DraftRow, type V3Settings } from '@novelist/shared';
 import { enc, post, put } from '../../../api/client';
 import { useAction, useApi, useInvalidate, usePaged } from '../../../api/hooks';
 import { InstructionWorkbench } from '../../../components/admin/InstructionWorkbench';
@@ -106,6 +106,11 @@ function V3OverviewTab({ book: b, view: v }: { book: BookOverview; view: V3BookV
             {b.status === 'paused' && (
               <Button variant="primary" busy={bookAct.isPending} onClick={() => bookAct.mutate('resume')}>
                 继续
+              </Button>
+            )}
+            {(b.status === 'active' || b.status === 'planning' || b.status === 'paused') && v.accepted > 0 && (
+              <Button busy={bookAct.isPending} onClick={() => bookAct.mutate('write_now')} title="存稿满了也写这一批（只多写一批）；暂停中的书会一并恢复">
+                立即写下一批
               </Button>
             )}
             {b.status === 'archived' && (
@@ -582,20 +587,36 @@ const EFFORTS: Effort[] = ['low', 'medium', 'high'];
 const EFFORT_ROWS: { id: keyof V3Settings['effort']; label: string }[] = [
   { id: 'open', label: '开书' },
   { id: 'write', label: '写作' },
-  { id: 'finale', label: '收尾阶段与结局批' },
+  { id: 'closing', label: '收尾阶段的写作' },
+  { id: 'finale', label: '结局批' },
   { id: 'retro', label: '复盘' },
 ];
 
+/** 预算输入：空 = 不设上限 */
+const capText = (v: number | null) => (v === null ? '' : String(v));
+const capValue = (s: string): number | null | undefined => {
+  if (s.trim() === '') return null;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+};
+
 function V3SettingsTab({ slug, view: v }: { slug: string; view: V3BookView }) {
   const [s, setS] = useState<V3Settings>(v.settings);
+  const [usd, setUsd] = useState(capText(v.settings.budgets.monthly_usd_cap));
+  const [util, setUtil] = useState(capText(v.settings.budgets.max_window_util_pct));
+  const profiles = useApi<Profile[]>('/api/admin/profiles');
   const invalidate = useInvalidate();
-  const save = useAction(() => put<V3BookView>(`${viewPath(slug)}/settings`, s), {
+  const usdV = capValue(usd);
+  const utilV = capValue(util);
+  const budgetErr = usdV === undefined || utilV === undefined || (utilV !== null && utilV > 100);
+  const save = useAction(() => put<V3BookView>(`${viewPath(slug)}/settings`, { ...s, budgets: { ...s.budgets, monthly_usd_cap: usdV ?? null, max_window_util_pct: utilV ?? null } }), {
     ok: '已保存',
     onDone: () => void invalidate(`/api/admin/books/${enc(slug)}`, '/api/admin/books'),
   });
   const num = (x: string, fallback: number) => (x === '' || Number.isNaN(Number(x)) ? fallback : Math.floor(Number(x)));
   const bufferErr = s.publish.max_buffer < 2 * s.batch ? '存稿上限要至少是每批章数的 2 倍' : undefined;
   const pub = (p: Partial<V3Settings['publish']>) => setS({ ...s, publish: { ...s.publish, ...p } });
+  const knownWriter = s.writer_profile === null || (profiles.data ?? []).some((p) => p.id === s.writer_profile);
   return (
     <div className="space-y-4">
       <Card title="篇幅与写法">
@@ -612,8 +633,21 @@ function V3SettingsTab({ slug, view: v }: { slug: string; view: V3BookView }) {
           </Field>
         </div>
       </Card>
-      <Card title="effort">
-        <div className="grid sm:grid-cols-4 gap-3">
+      <Card title="模型与 effort">
+        <div className="grid sm:grid-cols-2 gap-3 mb-3">
+          <Field label="写作用的模型" hint="覆盖“模型与账号”页上写作位置的主用；备用照旧">
+            <Select value={s.writer_profile ?? ''} aria-label="写作用的模型" onChange={(e) => setS({ ...s, writer_profile: e.target.value === '' ? null : e.target.value })}>
+              <option value="">跟随写作位置</option>
+              {!knownWriter && <option value={s.writer_profile as string}>{s.writer_profile}（已不存在）</option>}
+              {profiles.data?.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.id} · {p.label || p.model}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
           {EFFORT_ROWS.map((r) => (
             <Field key={r.id} label={r.label}>
               <Select value={s.effort[r.id]} onChange={(e) => setS({ ...s, effort: { ...s.effort, [r.id]: e.target.value as Effort } })}>
@@ -650,11 +684,31 @@ function V3SettingsTab({ slug, view: v }: { slug: string; view: V3BookView }) {
           </Field>
         </div>
       </Card>
+      <Card title="预算">
+        <div className="grid sm:grid-cols-3 gap-3">
+          <Field label="优先级" hint="多本书抢一个账号时，数大的先写">
+            <Input type="number" value={s.budgets.priority} onChange={(e) => setS({ ...s, budgets: { ...s.budgets, priority: num(e.target.value, s.budgets.priority) } })} />
+          </Field>
+          <Field label="每月花费上限（美元）" hint="空 = 不设上限；只算按量计费的账号" error={usdV === undefined ? '需为非负数' : undefined}>
+            <Input type="number" min={0} step="any" value={usd} onChange={(e) => setUsd(e.target.value)} />
+          </Field>
+          <Field label="额度窗口用到多少就停（%）" hint="空 = 不设上限" error={utilV === undefined || (utilV !== null && utilV > 100) ? '0–100' : undefined}>
+            <Input type="number" min={0} max={100} value={util} onChange={(e) => setUtil(e.target.value)} />
+          </Field>
+        </div>
+      </Card>
       <div className="flex justify-end gap-2">
-        <Button variant="ghost" onClick={() => setS(v.settings)}>
+        <Button
+          variant="ghost"
+          onClick={() => {
+            setS(v.settings);
+            setUsd(capText(v.settings.budgets.monthly_usd_cap));
+            setUtil(capText(v.settings.budgets.max_window_util_pct));
+          }}
+        >
           还原
         </Button>
-        <Button variant="primary" disabled={bufferErr !== undefined} busy={save.isPending} onClick={() => save.mutate()}>
+        <Button variant="primary" disabled={bufferErr !== undefined || budgetErr} busy={save.isPending} onClick={() => save.mutate()}>
           保存
         </Button>
       </div>

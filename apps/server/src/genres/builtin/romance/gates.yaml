@@ -1,3 +1,0 @@
-# 继承 generic。在 rules 下按规则 id 覆盖，例如：dialogue_ratio: { level: off }
-schema: nv.gates/1
-rules: {}

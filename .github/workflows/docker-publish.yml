@@ -43,7 +43,7 @@ jobs:
       - run: pnpm -r build
 
       - name: End-to-end against real Postgres 16
-        run: pnpm --filter @novelist/server exec vitest run test/e2e.fake
+        run: pnpm --filter @novelist/server exec vitest run test/e2e.restart
         env:
           NOVELIST_E2E_DATABASE_URL: postgresql://novelist:ci-only-password@127.0.0.1:5432/novelist2_e2e
 

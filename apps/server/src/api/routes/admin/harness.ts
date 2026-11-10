@@ -5,11 +5,11 @@ import path from 'node:path';
 import { and, count, desc, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import type { Account, Capabilities, HarnessInstall, HarnessStatus, HarnessId } from '@novelist/shared';
-import { zAccount } from '@novelist/shared';
+import { zAccount, zProfile } from '@novelist/shared';
 import type { AppDeps } from '../../../app.js';
-import { accounts, capabilities, circuitBreakers, harnessInstalls, importJobs } from '../../../db/schema.js';
+import { accounts, capabilities, harnessInstalls, importJobs, profiles } from '../../../db/schema.js';
 import { detectInstalls, getAdapter, installHarness, isValidHarnessVersion, listAdapters, PINNED_VERSIONS, planInstall, probeIsolation, resolveAccount, runProbe } from '../../../harness/index.js';
-import { accountFromRow, loadSystemSettings } from '../../../orchestrator/index.js';
+import { accountFromRow, loadSlots, loadSystemSettings } from '../../../orchestrator/index.js';
 import { audit, domain } from '../../helpers.js';
 import { badRequest, conflict, notFound } from '../../problem.js';
 
@@ -25,12 +25,9 @@ async function statusOf(deps: AppDeps, installs: HarnessInstall[], id: HarnessId
   const adapter = getAdapter(id);
   const inst = installs.find((i) => i.id === id) ?? null;
   let caps: Capabilities | null = null;
-  let circuit: HarnessStatus['circuit'] = { state: 'closed', reason: null, effectiveAt: null };
   if (inst) {
     const rows = await deps.db.select().from(capabilities).where(and(eq(capabilities.harness, id), eq(capabilities.version, inst.version), eq(capabilities.isolation, isolation))).limit(1);
     caps = (rows[0]?.body as Capabilities | undefined) ?? null;
-    const br = await deps.db.select().from(circuitBreakers).where(and(eq(circuitBreakers.harness, id), eq(circuitBreakers.version, inst.version), eq(circuitBreakers.isolation, isolation))).limit(1);
-    if (br[0]) circuit = { state: br[0].state as HarnessStatus['circuit']['state'], reason: br[0].reason, effectiveAt: br[0].effectiveAt };
   }
   const acctRows = await deps.db.select({ n: count() }).from(accounts).where(eq(accounts.harness, id));
   let installHint = '';
@@ -49,11 +46,20 @@ async function statusOf(deps: AppDeps, installs: HarnessInstall[], id: HarnessId
     versionDetected: inst?.version ?? null,
     supportedVersions: adapter.supportedVersions,
     capabilities: caps,
-    circuit,
     authMethods: adapter.authMethods(),
     accounts: Number(acctRows[0]?.n ?? 0),
     installHint,
   };
+}
+
+/** live 探测用的模型：杂活位置的 profile 正好是这个 harness 时用它的模型和 effort，否则 adapter 默认 */
+export async function probeModelFor(deps: AppDeps, harness: HarnessId): Promise<{ model?: string; effort?: string }> {
+  const id = (await loadSlots(deps.db)).utility.primary;
+  if (!id) return {};
+  const row = (await deps.db.select().from(profiles).where(eq(profiles.id, id)).limit(1))[0];
+  const p = row ? zProfile.safeParse({ ...row.body, id: row.id, harness: row.harness, enabled: row.enabled }) : null;
+  if (!p?.success || p.data.harness !== harness) return {};
+  return { model: p.data.model, ...(p.data.effort ? { effort: p.data.effort } : {}) };
 }
 
 /** 探测 / 列模型用的账号：指定 id，否则该 harness 首个启用账号，否则空账号 */
@@ -91,7 +97,10 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const acct = await resolveAccount(await accountForProbe(deps, harness, req.query.accountId), deps.paths, deps.secrets);
     const scratchDir = await fs.mkdtemp(path.join(deps.paths.tmp, `probe-${harness}-`));
     try {
-      const caps = await domain(() => runProbe(adapter, inst, acct, { isolation, scratchDir, live: req.query.live === '1', fixturesDir: path.join(deps.paths.harness, 'fixtures', harness, inst.version) }));
+      const live = req.query.live === '1';
+      // live = 目录探测（runDirectoryCanary）：模型取杂活位置的 profile（同一个 harness 时），否则 adapter 默认
+      const pm = live ? await probeModelFor(deps, harness) : {};
+      const caps = await domain(() => runProbe(adapter, inst, acct, { isolation, scratchDir, live, ...pm, fixturesDir: path.join(deps.paths.harness, 'fixtures', harness, inst.version) }));
       const now = new Date().toISOString();
       await deps.db.insert(capabilities).values({ harness, version: inst.version, isolation, body: caps as unknown as Record<string, unknown>, verifiedAt: now }).onConflictDoUpdate({ target: [capabilities.harness, capabilities.version, capabilities.isolation], set: { body: caps as unknown as Record<string, unknown>, verifiedAt: now } });
       await deps.db

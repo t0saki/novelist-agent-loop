@@ -1,17 +1,16 @@
 /**
- * lane A 测试夹具：搭一个最小 $DATA/runs/… 目录 + work order + system.md + fake 账号/安装/能力，
- * 让 E/F/G 的测试能直接 startRun(fake)。Owner: lane A。只在测试中使用。
+ * harness 测试夹具：搭一个最小 $DATA/runs/… 目录（目录契约：书快照里有 AGENTS.md / CLAUDE.md / ORDER.md，$RUN/in/launch.md 是启动语）
+ * + fake 账号/安装/能力，让测试能直接 startRun(fake)。只在测试中使用。
  */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { Capabilities, HarnessId, HarnessInstall, RoleId, TaskKind } from '@novelist/shared';
-import { toJsonSchema, zReceipt } from '@novelist/shared';
-import { stringify as yamlStringify } from 'yaml';
-import type { CompiledInstructions } from '../instructions/types.js';
+import type { Capabilities, HarnessId, HarnessInstall, RoleId } from '@novelist/shared';
+import { V3_LAUNCH_PROMPT } from '@novelist/shared';
+import { V3_CLAUDE_MD } from '../instructions/v3.js';
 import { FAKE_VERSION } from './adapters/fake.js';
-import type { FakeArtifactDecl, FakeScenario } from './fake/fake-harness.js';
+import type { FakeScenario } from './fake/fake-harness.js';
 import { defaultCapabilities } from './probe.js';
 import { getAdapter } from './registry.js';
 import type { PreparedRun } from './runner.js';
@@ -22,18 +21,19 @@ export interface RunFixtureOptions {
   dataRoot?: string;
   harness?: HarnessId;
   model?: string;
-  kind?: TaskKind;
+  kind?: string;
   role?: RoleId;
-  target?: string;
   bookSlug?: string | null;
-  artifacts?: FakeArtifactDecl[];
-  /** 写进 frontmatter.fake */
+  /** 书快照根的 ORDER.md（默认：新写第 1–1 章，每章不少于 300 字） */
+  order?: string;
+  /** 书快照根的 AGENTS.md */
+  agentsMd?: string;
+  /** 书快照里另放的文件（相对路径 → 内容） */
+  files?: Record<string, string>;
+  /** 写进 $RUN/in/fake.json（与 scenarioFile 合并，后者优先） */
   fake?: FakeScenario;
-  /** 写进 $RUN/in/fake.json（覆盖 frontmatter.fake） */
+  /** 写进 $RUN/in/fake.json */
   scenarioFile?: FakeScenario;
-  inputs?: { path: string; kind: string; description?: string }[];
-  body?: string;
-  systemMd?: string;
   limits?: Partial<RunLimits>;
   account?: Partial<ResolvedAccount>;
   isolation?: Capabilities['isolation'];
@@ -46,22 +46,7 @@ export interface RunFixture {
   cleanup(): Promise<void>;
 }
 
-const DEFAULT_ARTIFACTS: FakeArtifactDecl[] = [
-  { path: 'manuscript/c00001.md', kind: 'chapter_draft', length: { min: 240, target: 300, max: 360, count_mode: 'han' } },
-  { path: 'receipt.json', kind: 'receipt', schema: 'nv.receipt/1' },
-];
-
-export function compiledFromSystem(systemMd: string): CompiledInstructions {
-  return {
-    systemMd,
-    mirrorMd: systemMd.replace(/NV-[A-Za-z0-9]+-(HEAD|TAIL)-[A-Za-z0-9]+/g, ''),
-    layers: [],
-    nonces: {},
-    stackHash: 'test',
-    bytes: Buffer.byteLength(systemMd),
-    lastAuthorLayerId: 'L3',
-  };
-}
+export const DEFAULT_FIXTURE_ORDER = '# 任务单\n\n任务：新写第 1–1 章（共 1 章）\n\n进度：已写 0 章；计划共 3 章。每章不少于 300 字，不设上限。\n';
 
 export async function makeRunFixture(o: RunFixtureOptions = {}): Promise<RunFixture> {
   const own = !o.dataRoot;
@@ -75,33 +60,23 @@ export async function makeRunFixture(o: RunFixtureOptions = {}): Promise<RunFixt
   const outDir = path.join(bookDir, 'work', taskId, 'attempt-1', 'out');
   for (const d of [inDir, logDir, outDir]) await fs.mkdir(d, { recursive: true });
   const harness = o.harness ?? 'fake';
-  const fm: Record<string, unknown> = {
-    schema: 'nv.workorder/1',
-    task_id: taskId,
-    run_id: runId,
-    kind: o.kind ?? 'chapter.write',
-    role: o.role ?? 'writer',
-    book: o.bookSlug === undefined ? 'demo' : o.bookSlug,
-    target: o.target ?? 'c00001',
-    out_dir: outDir,
-    inputs: o.inputs ?? [],
-    artifacts: o.artifacts ?? DEFAULT_ARTIFACTS,
-    ...(o.fake ? { fake: o.fake } : {}),
-  };
-  const workOrderFile = path.join(inDir, 'workorder.md');
-  await fs.writeFile(workOrderFile, `---\n${yamlStringify(fm)}---\n\n${o.body ?? '# 测试任务\n\n- id: b1\n- id: b2\n- id: b3\n'}`);
-  if (o.scenarioFile) await fs.writeFile(path.join(inDir, 'fake.json'), JSON.stringify(o.scenarioFile));
-  const systemMd = o.systemMd ?? 'NV-C-HEAD-AAAAAAAAAAAA\n# 契约\nNV-B-HEAD-BBBBBBBBBBBB\n书层指令\nNV-B-TAIL-CCCCCCCCCCCC\n';
-  const systemFile = path.join(inDir, 'system.md');
-  await fs.writeFile(systemFile, systemMd);
-  const receiptSchemaFile = path.join(inDir, 'receipt.lenient.json');
-  await fs.writeFile(receiptSchemaFile, JSON.stringify(toJsonSchema(zReceipt, 'lenient')));
+  await fs.writeFile(path.join(bookDir, 'AGENTS.md'), o.agentsMd ?? '# 写作指令\n\n测试用的书房约定。\n');
+  await fs.writeFile(path.join(bookDir, 'CLAUDE.md'), V3_CLAUDE_MD);
+  await fs.writeFile(path.join(bookDir, 'ORDER.md'), o.order ?? DEFAULT_FIXTURE_ORDER);
+  for (const [rel, content] of Object.entries(o.files ?? {})) {
+    await fs.mkdir(path.dirname(path.join(bookDir, rel)), { recursive: true });
+    await fs.writeFile(path.join(bookDir, rel), content);
+  }
+  const workOrderFile = path.join(inDir, 'launch.md');
+  await fs.writeFile(workOrderFile, V3_LAUNCH_PROMPT);
+  const scenario = o.fake || o.scenarioFile ? { ...(o.fake ?? {}), ...(o.scenarioFile ?? {}) } : null;
+  if (scenario) await fs.writeFile(path.join(inDir, 'fake.json'), JSON.stringify(scenario));
   const spec: RunSpec = {
     runId,
     taskId,
     attempt: 1,
     role: o.role ?? 'writer',
-    taskKind: o.kind ?? 'chapter.write',
+    taskKind: o.kind ?? 'book.write',
     harness,
     profileId: `${harness}-test`,
     accountId: 'acc-test',
@@ -112,14 +87,11 @@ export async function makeRunFixture(o: RunFixtureOptions = {}): Promise<RunFixt
     inDir,
     logDir,
     workOrderFile,
-    systemFile,
-    receiptSchemaFile,
     model: o.model ?? 'fake-model',
     limits: { wallMs: 60_000, idleMs: 30_000, maxTurns: 10, ...o.limits },
     session: { mode: 'fresh', id: runId },
     persistSession: false,
     egress: { allow: [] },
-    subagents: false,
     extraArgs: [],
   };
   const home = path.join(dataRoot, 'accounts', 'acc-test', 'home');
@@ -155,7 +127,7 @@ export async function makeRunFixture(o: RunFixtureOptions = {}): Promise<RunFixt
     status: 'active',
   };
   const caps = defaultCapabilities(harness, install.version, o.isolation ?? 'container');
-  const prepared: PreparedRun = { spec, adapter, account, install, caps, isolation: o.isolation ?? 'container', compiled: compiledFromSystem(systemMd) };
+  const prepared: PreparedRun = { spec, adapter, account, install, caps, isolation: o.isolation ?? 'container' };
   return {
     dataRoot,
     spec,

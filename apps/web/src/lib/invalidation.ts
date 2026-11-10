@@ -14,11 +14,11 @@ export function invalidationsFor(e: SseEvent): string[] {
       return ['/api/admin/inbox'];
     case 'chapter_accepted':
     case 'chapter_published':
-      return ['/api/admin/books', '/api/admin/schedule'];
+      return ['/api/admin/books'];
     case 'circuit_changed':
       return ['/api/admin/harness'];
     case 'book_changed':
-      return ['/api/admin/books', '/api/admin/schedule'];
+      return ['/api/admin/books'];
     default:
       return [];
   }

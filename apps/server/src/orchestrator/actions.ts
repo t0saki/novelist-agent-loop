@@ -1,26 +1,20 @@
 /**
- * 错误类 → 动作固定表（DESIGN §7.6）。纯函数，便于表驱动测试。Owner: lane F。
+ * 基础设施错误类 → 动作固定表（DESIGN §8.2）。纯函数，便于表驱动测试。
+ * v3 的判定（flow/judge.ts#classifyV3Run）只对 INFRA_CLASSES 调用这里；其余错误类由判定表自己处理。
  *
- * 约定：waiting = 不消耗 attempt（配额/限流/瞬时错误/认证）；retry = 消耗一次 attempt；
- * blocked = 需人工（发 Inbox）；failed = 不再重试。
+ * 约定：waiting = 不消耗 attempt（配额/限流/瞬时错误/认证/模型下架）；retry = 消耗一次 attempt。
  */
-import type { ErrorClass, Outcome, TaskKind } from '@novelist/shared';
-import type { InboxInput, TaskResult } from '../pipeline/types.js';
+import type { ErrorClass, Outcome } from '@novelist/shared';
+import type { InboxInput, TaskResult } from '../runtime/types.js';
 import type { OrchTaskState } from './orch-state.js';
 
 export interface FailureContext {
   taskId: string;
-  kind: TaskKind;
   bookId: string | null;
   outcome: Outcome;
   orch: OrchTaskState;
   profile: string;
   accountId: string | null;
-  vendor: string;
-  /** book.yaml policy.refusal_retry_other_vendor */
-  refusalRetryOtherVendor: boolean;
-  /** outDir 内是否有 denial（产物缺失时区分 permission_denied / output_contract，§3.3） */
-  denialInOutDir: boolean;
   now: Date;
 }
 
@@ -30,6 +24,8 @@ export interface FailurePlan {
   sleep?: { accountId: string; until: string; reason: string };
   /** 账号认证失效 */
   authBad?: { accountId: string; detail: string };
+  /** profile 冷却（model_unavailable，D8）：到点前路由跳过它，有备用走备用 */
+  profileDown?: { profileId: string; until: string; reason: string };
   inbox?: InboxInput[];
   /** 合并进 tasks.params._orch */
   orchPatch: Partial<OrchTaskState>;
@@ -41,6 +37,8 @@ const TRANSIENT_BASE_MS = 60_000;
 const TRANSIENT_CAP = 12;
 const TRANSIENT_MAX_DELAY_MS = 15 * 60_000;
 const WEEKLY_THRESHOLD_MS = 12 * 3600_000;
+/** 模型下架 / 不可用：这个 profile 冷却 30 分钟 */
+export const MODEL_DOWN_MS = 30 * 60_000;
 
 export const INFRA_CLASSES: ReadonlySet<ErrorClass> = new Set(['auth', 'quota', 'rate_limit', 'overloaded', 'billing', 'model_unavailable', 'network']);
 
@@ -51,7 +49,6 @@ function plus(ms: number, now: Date): string {
 export function planFailure(cls: ErrorClass, ctx: FailureContext): FailurePlan {
   const { orch, profile, accountId, outcome, now } = ctx;
   const counts = { ...(orch.classCounts ?? {}), [cls]: (orch.classCounts?.[cls] ?? 0) + 1 };
-  const n = counts[cls] as number;
   const msg = outcome.message ?? cls;
   const base = { errorClass: cls, message: msg } as const;
 
@@ -64,7 +61,7 @@ export function planFailure(cls: ErrorClass, ctx: FailureContext): FailurePlan {
         : [];
       return {
         result: { ...base, status: 'waiting', retryAfter: plus(10 * 60_000, now) },
-        orchPatch: { ...patch, avoidProfiles: orch.avoidProfiles ?? [] },
+        orchPatch: patch,
         ...(accountId ? { authBad: { accountId, detail: msg } } : {}),
         inbox,
       };
@@ -96,57 +93,12 @@ export function planFailure(cls: ErrorClass, ctx: FailureContext): FailurePlan {
       const delay = Math.min(TRANSIENT_MAX_DELAY_MS, TRANSIENT_BASE_MS * 2 ** (t - 1));
       return { result: { ...base, status: 'waiting', retryAfter: plus(delay, now) }, orchPatch: { ...patch, transient: t } };
     }
-    case 'model_unavailable':
-      return { result: { ...base, status: 'retry', avoidProfile: profile, retryAfter: now.toISOString() }, orchPatch: patch };
-    case 'timeout_wall':
-    case 'timeout_idle':
-      return { result: { ...base, status: 'retry', ...(n >= 2 ? { avoidProfile: profile } : {}) }, orchPatch: patch };
-    case 'refusal': {
-      if (!ctx.refusalRetryOtherVendor) {
-        return {
-          result: { ...base, status: 'blocked' },
-          orchPatch: patch,
-          inbox: [
-            {
-              kind: 'block',
-              bookId: ctx.bookId,
-              title: `任务 ${ctx.kind} 被模型拒绝`,
-              body: { taskId: ctx.taskId, detail: msg },
-              actions: [
-                { id: 'retry', label: '重试' },
-                { id: 'dismiss', label: '忽略' },
-              ],
-              dedupeKey: `refusal:${ctx.taskId}`,
-              relatedTaskId: ctx.taskId,
-            },
-          ],
-        };
-      }
-      return { result: { ...base, status: 'retry', retryAfter: now.toISOString() }, orchPatch: { ...patch, avoidVendors: [...new Set([...(orch.avoidVendors ?? []), ctx.vendor])] } };
+    case 'model_unavailable': {
+      const until = plus(MODEL_DOWN_MS, now);
+      return { result: { ...base, status: 'waiting', retryAfter: until }, orchPatch: patch, profileDown: { profileId: profile, until, reason: msg } };
     }
-    case 'context_overflow':
-      return { result: { ...base, status: 'retry', avoidProfile: profile }, orchPatch: patch };
-    case 'max_turns':
-      return { result: { ...base, status: n >= 2 ? 'failed' : 'retry', ...(n >= 2 ? {} : { avoidProfile: profile }) }, orchPatch: patch };
-    case 'budget':
-      return {
-        result: { ...base, status: 'blocked' },
-        orchPatch: patch,
-        inbox: [{ kind: 'notice', bookId: ctx.bookId, title: `任务 ${ctx.kind} 超出预算上限`, body: { taskId: ctx.taskId, detail: msg }, actions: [{ id: 'retry', label: '提高上限后重试' }, { id: 'dismiss', label: '忽略' }], dedupeKey: `budget:${ctx.taskId}`, relatedTaskId: ctx.taskId }],
-      };
-    case 'permission_denied':
-    case 'sandbox':
-    case 'config':
-    case 'drift':
-      return { result: { ...base, status: 'retry', avoidProfile: profile }, orchPatch: patch };
-    case 'harness_crash':
-      return { result: { ...base, status: 'retry', ...(n > 2 ? { avoidProfile: profile } : {}) }, orchPatch: patch };
-    case 'output_contract': {
-      const failures = { ...(orch.contractFailures ?? {}), [profile]: (orch.contractFailures?.[profile] ?? 0) + 1 };
-      return { result: { ...base, status: 'retry', ...((failures[profile] as number) >= 2 ? { avoidProfile: profile } : {}) }, orchPatch: { ...patch, contractFailures: failures } };
-    }
-    case 'unknown':
     default:
+      // v3 不会走到这里（judgeRunV3 只对 INFRA_CLASSES 调用）
       return { result: { ...base, status: 'retry' }, orchPatch: patch };
   }
 }

@@ -3,19 +3,20 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
-import type { Capabilities, HarnessId, InstructionFileEntry, InstructionPreview, Ok, RepoFile, RoleId } from '@novelist/shared';
-import { ROLE_IDS, V3_LENGTHS, zInstructionPreviewRequest, zInstructionScope, zPutRepoFile } from '@novelist/shared';
+import type { InstructionFileEntry, InstructionPreviewV3, Ok, RepoFile, RoleId } from '@novelist/shared';
+import { ROLE_IDS, V3_LENGTHS, zInstructionPreviewV3, zInstructionScope, zPutRepoFile } from '@novelist/shared';
 import type { V3Length } from '@novelist/shared';
-import { and, desc, eq, ne, sql } from 'drizzle-orm';
+import { and, ne, sql } from 'drizzle-orm';
 import type { AppDeps } from '../../../app.js';
 import { bookFiles, ensureGitRepo, gitBlobSha, NothingToCommitError, openRepo, P, pathOwner, TRAILER } from '../../../book/index.js';
-import { books, capabilities } from '../../../db/schema.js';
-import { BUILTIN_INSTRUCTIONS_DIR, previewInstructions } from '../../../instructions/index.js';
+import { books } from '../../../db/schema.js';
+import { BUILTIN_INSTRUCTIONS_DIR } from '../../../instructions/index.js';
+import { previewInstructionsV3 } from '../../../services/instructions-preview.js';
 import { V3_AGENTS_SOFT_LIMIT, renderAgentsMdV3 } from '../../../instructions/v3.js';
 import { genreExists, listGenres, loadGenre } from '../../../genres/index.js';
 import { loadSystemSettings } from '../../../orchestrator/routing.js';
 import { saveRepoFile } from '../../../services/repo-files.js';
-import { audit, bookBySlug, bookDir, domain, parseBody, requireRel } from '../../helpers.js';
+import { audit, bookBySlug, bookDir, parseBody, requireRel } from '../../helpers.js';
 import { HttpProblem, badRequest, conflict, forbidden, notFound } from '../../problem.js';
 
 type ScopeQuery = { Querystring: { scope?: string; path?: string } };
@@ -185,7 +186,7 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
         scope: req.query.scope ?? 'global',
         path: f.path,
         size: f.size,
-        layer: root.kind === 'builtin' && f.path === 'contract.md' ? ('S0' as const) : root.layer,
+        layer: root.kind === 'builtin' && f.path === 'v3/contract.md' ? ('S0' as const) : root.layer,
         role: roleOf(f.path),
       }))
       .sort((a, b) => a.path.localeCompare(b.path));
@@ -239,18 +240,7 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     return { ok: true };
   });
 
-  app.post('/api/admin/instructions/preview', async (req): Promise<InstructionPreview> => {
-    const body = parseBody(zInstructionPreviewRequest, req.body);
-    return domain(() =>
-      previewInstructions(body, {
-        paths: deps.paths,
-        bookDir: async (slug) => ((await bookBySlug(deps, slug).catch(() => null)) ? bookDir(deps, slug) : null),
-        caps: async (harness: HarnessId) => {
-          const rows = await deps.db.select().from(capabilities).where(eq(capabilities.harness, harness)).orderBy(desc(capabilities.verifiedAt)).limit(1);
-          return (rows[0]?.body as Capabilities | undefined) ?? null;
-        },
-      }),
-    );
-  });
+  /** 根 AGENTS.md 预览（按书，或按题材包 + 篇幅；services/instructions-preview.ts） */
+  app.post('/api/admin/instructions/preview', async (req): Promise<InstructionPreviewV3> => previewInstructionsV3(deps, parseBody(zInstructionPreviewV3, req.body)));
 
 }

@@ -1,4 +1,4 @@
-/** 管理端布局：分组侧栏（手机为抽屉）、全局 SSE、Inbox 计数、明暗切换。Owner: lane H。 */
+/** 管理端布局：五项导航（手机为抽屉）、全局 SSE、待办计数、明暗切换。 */
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, Outlet, useRouterState } from '@tanstack/react-router';
 import type { InboxItem, MeResponse, Page as ApiPage, SseEvent } from '@novelist/shared';
@@ -10,40 +10,13 @@ import { publishAdminEvent } from '../lib/adminEvents';
 import { invalidationsFor } from '../lib/invalidation';
 import { Button, cx, Notice } from './ui';
 
-const NAV: { group: string; items: { to: string; label: string; badge?: 'inbox' }[] }[] = [
-  {
-    group: '工作台',
-    items: [
-      { to: '/admin', label: '仪表盘' },
-      { to: '/admin/inbox', label: 'Inbox', badge: 'inbox' },
-      { to: '/admin/runs', label: '运行' },
-    ],
-  },
-  {
-    group: '创作',
-    items: [
-      { to: '/admin/books', label: '书' },
-      { to: '/admin/instructions', label: '全局指令' },
-      { to: '/admin/genres', label: '题材包' },
-    ],
-  },
-  {
-    group: '接入',
-    items: [
-      { to: '/admin/harness', label: 'Harness 与账号' },
-      { to: '/admin/routing', label: '路由与 Profile' },
-      { to: '/admin/quota', label: '配额与用量' },
-    ],
-  },
-  {
-    group: '运营',
-    items: [
-      { to: '/admin/schedule', label: '发布排期' },
-      { to: '/admin/readers', label: '读者' },
-      { to: '/admin/settings', label: '系统与 Doctor' },
-      { to: '/admin/import', label: 'v1 导入' },
-    ],
-  },
+/** 导航只有五项（docs/v3/DESIGN.md §9）；待办数挂在首页上 */
+export const NAV: { to: string; label: string; badge?: 'inbox' }[] = [
+  { to: '/admin', label: '首页', badge: 'inbox' },
+  { to: '/admin/new', label: '开书' },
+  { to: '/admin/genres', label: '题材与指令' },
+  { to: '/admin/models', label: '模型与账号' },
+  { to: '/admin/system', label: '系统' },
 ];
 
 function useAdminStream(): StreamStatus {
@@ -78,19 +51,16 @@ function useAdminStream(): StreamStatus {
 
 function NavBody({ inboxCount, onNavigate }: { inboxCount: number; onNavigate?: () => void }) {
   return (
-    <nav className="space-y-4 text-sm">
-      {NAV.map((g) => (
-        <div key={g.group}>
-          <div className="text-xs text-faint px-2 mb-1">{g.group}</div>
-          <div className="space-y-0.5">
-            {g.items.map((n) => (
-              <Link key={n.to} to={n.to} onClick={onNavigate} className="flex items-center justify-between rounded-md px-2 py-1.5 text-sub hover:bg-panel2 hover:text-ink" activeOptions={{ exact: n.to === '/admin' }} activeProps={{ className: 'bg-panel2 !text-ink font-medium' }}>
-                {n.label}
-                {n.badge === 'inbox' && inboxCount > 0 && <span className="bg-accent text-on-accent rounded-full text-xs px-1.5 min-w-5 text-center">{inboxCount}</span>}
-              </Link>
-            ))}
-          </div>
-        </div>
+    <nav className="space-y-0.5 text-sm" aria-label="管理端导航">
+      {NAV.map((n) => (
+        <Link key={n.to} to={n.to} onClick={onNavigate} className="flex items-center justify-between rounded-md px-2 py-1.5 text-sub hover:bg-panel2 hover:text-ink" activeOptions={{ exact: n.to === '/admin' }} activeProps={{ className: 'bg-panel2 !text-ink font-medium' }}>
+          {n.label}
+          {n.badge === 'inbox' && inboxCount > 0 && (
+            <span className="bg-accent text-on-accent rounded-full text-xs px-1.5 min-w-5 text-center" title="待办">
+              {inboxCount}
+            </span>
+          )}
+        </Link>
       ))}
     </nav>
   );
@@ -148,8 +118,8 @@ export function AdminLayout() {
           ☰ 菜单
         </Button>
         <span className="font-serif font-semibold">Novelist</span>
-        <Link to="/admin/inbox" className="text-sm text-sub px-2">
-          Inbox{inboxCount > 0 && <span className="ml-1 bg-accent text-on-accent rounded-full text-xs px-1.5">{inboxCount}</span>}
+        <Link to="/admin" className="text-sm text-sub px-2">
+          待办{inboxCount > 0 && <span className="ml-1 bg-accent text-on-accent rounded-full text-xs px-1.5">{inboxCount}</span>}
         </Link>
       </header>
 

@@ -11,12 +11,12 @@
  */
 import path from 'node:path';
 import type { AuthMethodSpec, NEvent, NEventBody } from '@novelist/shared';
-import { RISK_NOTES } from '@novelist/shared';
+import { RISK_NOTES, V3_LAUNCH_PROMPT } from '@novelist/shared';
 import { buildOutcome, classifyText } from '../classify.js';
 import { arr, errorEvent, ndjsonParser, num, obj, optNum, str } from '../events.js';
 import { runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, StreamParser } from '../types.js';
-import { buildEnv, detectBin, effortOf, filterExtraArgs, invocation, launchPrompt, materializeVia, minimalEnv, standardProbe, toolCallEvent, toolKindOf } from './common.js';
+import { buildEnv, detectBin, effortOf, filterExtraArgs, invocation, minimalEnv, standardProbe, toolCallEvent, toolKindOf } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'none',
@@ -212,18 +212,16 @@ export const piAdapter: HarnessAdapter = {
       env: { HOME: acct.home, PI_CODING_AGENT_DIR: AD, PI_TELEMETRY: '0', PI_SKIP_VERSION_CHECK: '1', PI_OFFLINE: '1' },
     };
   },
-  materialize: (spec, compiled, caps, ctx) => materializeVia('pi', spec, compiled, caps, ctx?.home),
-  buildInvocation(spec, _caps, home, mat, acct, inst) {
+  buildInvocation(spec, _caps, home, acct, inst) {
     const argv = [inst.binPath, '--mode', 'json', '--approve', '--model', spec.model];
     const eff = effortOf(spec, EFFORTS);
     if (eff) argv.push('--thinking', eff);
     if (spec.session.mode === 'fork') argv.push('--fork', spec.session.id, '--session-id', `nv-${spec.runId}`);
     else argv.push('--session-id', spec.session.mode === 'resume' ? spec.session.id : `nv-${spec.session.id || spec.runId}`);
     argv.push('--tools', 'read,write,edit,grep,find,ls', '--no-mcp');
-    argv.push(...mat.argv);
     argv.push(...filterExtraArgs(spec.extraArgs, DENY_EXTRA));
-    argv.push(launchPrompt(spec, `阅读并执行工作单 ${spec.workOrderFile}（先完整读取该文件）。Read ${spec.workOrderFile} and execute it.`));
-    const env = buildEnv(spec, inst, acct.secretEnv, home.env, mat.env);
+    argv.push(V3_LAUNCH_PROMPT);
+    const env = buildEnv(spec, inst, acct.secretEnv, home.env);
     return invocation(spec, argv, env, 'devnull', [
       { signal: 'SIGINT', graceMs: 10_000 },
       { signal: 'SIGTERM', graceMs: 10_000 },

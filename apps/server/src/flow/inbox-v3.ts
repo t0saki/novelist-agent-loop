@@ -11,7 +11,7 @@ import type { ExecEnv } from '../orchestrator/executor.js';
 import { resolveInboxAuto, upsertOpenInbox } from '../orchestrator/inbox.js';
 import { nextSlots } from '../orchestrator/publisher.js';
 import { loadSystemSettings } from '../orchestrator/routing.js';
-import type { InboxInput } from '../pipeline/types.js';
+import type { InboxInput } from '../runtime/types.js';
 import { readZeroDiff } from './accounts.js';
 import { readV3Meta } from './state.js';
 import { fmtWhen } from './status.js';

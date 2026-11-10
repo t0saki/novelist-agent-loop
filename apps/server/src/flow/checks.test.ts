@@ -161,7 +161,7 @@ describe('checks: review fixes', () => {
   it('a chapter ending on the ellipsis variant ⋯⋯ is not truncated (v3 only; the old-flow gate is unchanged)', async () => {
     const body = `${prose(3200, 21).replace(/。$/u, '')}⋯⋯`;
     expect(checkNewChapter(body, [], 3000)).toEqual({ ok: true, short: false });
-    const { checkTruncation } = await import('../validators/truncation.js');
+    const { checkTruncation } = await import('./truncation.js');
     expect(checkTruncation(body, { sentence: true }).ok).toBe(false);
   });
   it('a chapter that re-quotes a 320-char letter from an earlier chapter is accepted', () => {

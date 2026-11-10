@@ -1,0 +1,11 @@
+schema: nv.volume/1
+id: v02
+title: 第二卷 风起
+detail: skeleton
+goal: ""
+novelty: []
+milestones_due: []
+chapters:
+  - c00031
+  - c00060
+arcs: []

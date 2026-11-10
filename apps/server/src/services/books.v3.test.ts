@@ -11,7 +11,6 @@ import { bookEvents, books, chapters, tasks } from '../db/schema.js';
 import { bookDir } from '../api/helpers.js';
 import { commitOwnerEdit } from '../orchestrator/index.js';
 import { createTestApp, TEST_ADMIN_PASSWORD, type TestApp } from '../testing.js';
-import { nameAutoBooks } from './auto-start.js';
 import { collectManuscripts, createBook, reindexBook } from './books.js';
 import { estimateImpact, saveRepoFile } from './repo-files.js';
 
@@ -52,7 +51,10 @@ describe('createBook flow v3', () => {
     const dir = bookDir(t.deps, 'v3-a');
     const y = await yamlOf('v3-a');
     expect(y.flow).toBe('v3');
-    expect(y.v3).toEqual({ length: 'medium', target_cjk: 60_000, planned_chapters: 15, planned_chapters_initial: 15, batch: 5, min_chapter_cjk: 3000, auto_title: false });
+    // effort 来自全站默认值（settings.v3.effortDefaults，初始值与以前的 book.yaml 缺省一样，closing = finale = high）
+    expect(y.v3).toEqual({ length: 'medium', target_cjk: 60_000, planned_chapters: 15, planned_chapters_initial: 15, batch: 5, min_chapter_cjk: 3000, auto_title: false, effort: { open: 'medium', write: 'medium', closing: 'high', finale: 'high', retro: 'medium' } });
+    // 档位已删除：book.yaml 不再写 tier（P3 D5）
+    expect(y.tier).toBeUndefined();
     expect(y.publish).toMatchObject({ mode: 'scheduled', cadence: '0 8 * * *', timezone: 'Asia/Shanghai', per_slot: 2, lag: 0, min_lag: 0, require_audited: false, max_buffer: 15, resume_buffer: 10 });
     expect(await fs.readFile(path.join(dir, 'seed.md'), 'utf8')).toBe('一个关于雨夜的故事。\n');
     const ignore = (await fs.readFile(path.join(dir, '.gitignore'), 'utf8')).split('\n');
@@ -65,7 +67,6 @@ describe('createBook flow v3', () => {
     const log = await openRepo(dir).log({ limit: 1 });
     expect(log.items[0]?.trailers['Novelist-Task']).toBe('book.init');
     const row = await rowOf('v3-a');
-    expect(row.tier).toBe('lite');
     expect(row.status).toBe('draft');
     expect((row.meta as { v3: unknown }).v3).toEqual({ hints: [], noChapterStreak: 0, emptyStreak: 0, finaleNoMarker: 0, lastBatchFrom: null, lastBatchAt: null, hintedShort: [], locked: [], pending: null });
     const ev = await t.deps.db.select().from(bookEvents).where(and(eq(bookEvents.bookId, row.id), eq(bookEvents.kind, 'book.created')));
@@ -91,28 +92,80 @@ describe('createBook flow v3', () => {
     expect(y.v3.auto_title).toBe(true);
   });
 
-  it('nameAutoBooks ignores v3 placeholder books', async () => {
-    const b = await createBook(t.deps, { title: '', genre: 'xianxia', flow: 'v3', start: false });
-    const row = await rowOf(b.slug);
-    // 即使书库里有一个看起来像书名的 premise，nameAutoBooks 也不碰 v3 的占位书名
-    await commitOwnerEdit(t.deps.db, openRepo(bookDir(t.deps, b.slug)), row.id, { files: [{ path: P.premise, content: '# 《雪夜》\n' }], message: 'test', baseSha: null });
-    await nameAutoBooks(t.deps);
-    expect((await rowOf(b.slug)).title).toBe(b.title);
+
+  it('every new book is v3: a request without flow, with flow v2 or with a tier still makes a v3 book; an empty title is fine', async () => {
+    const res = await admin('POST', '/api/admin/books', { title: '', genre: 'xianxia', start: false });
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ flow: 'v3', legacy: false });
+    expect(res.json().title.startsWith(V3_TITLE_PLACEHOLDER)).toBe(true);
+    // 空白书名：和 v3 的空书名一样走随机 slug
+    const blank = await createBook(t.deps, { title: ' ', genre: 'xianxia', start: false });
+    expect(blank.slug.startsWith('book-')).toBe(true);
+    // 不带 flow 的请求：book.yaml 也是 v3，仓库是 v3 布局（根 AGENTS.md 不入库）
+    await createBook(t.deps, { title: '旧请求', slug: 'v2-a', genre: 'xianxia', start: false });
+    const y = await yamlOf('v2-a');
+    expect(y.flow).toBe('v3');
+    expect(y.v3).toBeDefined();
+    expect((await rowOf('v2-a')).meta).toMatchObject({ v3: expect.any(Object) });
+    expect(await exists(path.join(bookDir(t.deps, 'v2-a'), 'AGENTS.md'))).toBe(false);
+    // 旧客户端发 flow: 'v2' 和 tier：照样是 v3，tier 不写；P2 形状的缺省值（中篇、种子为空）保留
+    const old = await admin('POST', '/api/admin/books', { title: '旧客户端', slug: 'v2-old-client', genre: 'xianxia', flow: 'v2', tier: 'standard', interview: true, start: false });
+    expect(old.statusCode).toBe(201);
+    const yo = await yamlOf('v2-old-client');
+    expect(yo).toMatchObject({ flow: 'v3', v3: { length: 'medium' } });
+    expect(yo.tier).toBeUndefined();
+    expect(await fs.readFile(path.join(bookDir(t.deps, 'v2-old-client'), 'seed.md'), 'utf8')).toBe('');
+    // P2 的嵌套 v3 形状再收一个版本
+    const nested = await admin('POST', '/api/admin/books', { title: '嵌套', slug: 'v3-nested', genre: 'xianxia', flow: 'v3', v3: { length: 'long', batch: 4 }, start: false });
+    expect(nested.statusCode).toBe(201);
+    expect((await yamlOf('v3-nested')).v3).toMatchObject({ length: 'long', batch: 4 });
   });
 
-  it('empty title rejected for v2', async () => {
-    const res = await admin('POST', '/api/admin/books', { title: '', genre: 'xianxia', start: false });
-    expect(res.statusCode).toBe(400);
-    await expect(createBook(t.deps, { title: '', genre: 'xianxia', start: false })).rejects.toThrow('书名不能为空');
-    // 旧流程和原来一样只要求非空串：空白书名照收（slug 走原来的 slugifyName，不是 v3 的随机 slug）
-    const blank = await createBook(t.deps, { title: ' ', genre: 'xianxia', start: false });
-    expect(blank.slug.startsWith('book-')).toBe(false);
-    // 不带 flow 的书：book.yaml 没有 flow 键（= v2）
-    await createBook(t.deps, { title: '旧流程', slug: 'v2-a', genre: 'xianxia', start: false });
-    const y = await yamlOf('v2-a');
-    expect(y.flow).toBeUndefined();
-    expect(y.v3).toBeUndefined();
-    expect(await exists(path.join(bookDir(t.deps, 'v2-a'), 'AGENTS.md'))).toBe(true);
+  it('the new form: genre, length, a one-line idea; the server builds the seed from the pack plus the idea', async () => {
+    const res = await admin('POST', '/api/admin/books', { genre: 'xianxia', length: 'long', idea: '一个灯塔看守人发现海底有一座城', target_cjk: 90_000, batch: 4, min_chapter_cjk: 2800, start: false });
+    expect(res.statusCode, res.body).toBe(201);
+    const slug = res.json().slug as string;
+    expect((await yamlOf(slug)).v3).toMatchObject({ length: 'long', target_cjk: 90_000, batch: 4, min_chapter_cjk: 2800, auto_title: true });
+    const seed = await fs.readFile(path.join(bookDir(t.deps, slug), 'seed.md'), 'utf8');
+    expect(seed).toContain('题材：');
+    expect(seed).toContain('主人的想法：一个灯塔看守人发现海底有一座城');
+    // 给了完整的种子就原样用
+    const own = await admin('POST', '/api/admin/books', { genre: 'xianxia', length: 'short', seed: '我自己的完整种子。', idea: '不会用到', start: false });
+    expect(await fs.readFile(path.join(bookDir(t.deps, own.json().slug), 'seed.md'), 'utf8')).toBe('我自己的完整种子。');
+    // 想法最多 300 字；题材不存在 → 400
+    expect((await admin('POST', '/api/admin/books', { genre: 'xianxia', idea: '长'.repeat(301), start: false })).statusCode).toBe(400);
+    const unknown = await admin('POST', '/api/admin/books', { genre: 'no-such', start: false });
+    expect(unknown.statusCode).toBe(400);
+    expect(unknown.json().code).toBe('unknown_genre');
+  });
+
+  it('genre random picks a visible pack; length random follows the length mix', async () => {
+    const packs = (await admin('GET', '/api/admin/genres')).json() as { id: string }[];
+    // 只留一个可见的包：随机一定选它
+    for (const p of packs) if (p.id !== 'urban') await admin('POST', `/api/admin/genres/${p.id}/visibility`, { hidden: true });
+    try {
+      const res = await admin('POST', '/api/admin/books', { genre: 'random', length: 'random', start: false });
+      expect(res.statusCode, res.body).toBe(201);
+      expect(res.json().genre).toBe('urban');
+      // 没有自动开过的书时，分布里占比最大的一档（短篇 40%）缺口最大
+      expect((await yamlOf(res.json().slug)).v3.length).toBe('short');
+    } finally {
+      for (const p of packs) await admin('POST', `/api/admin/genres/${p.id}/visibility`, { hidden: false });
+    }
+  });
+
+  it('new books take the effort table and the publish defaults from the system settings', async () => {
+    const cur = (await admin('GET', '/api/admin/settings')).json();
+    const put = await admin('PUT', '/api/admin/settings', { baseUpdatedAt: cur.updatedAt, v3: { effortDefaults: { write: 'high', closing: 'medium' }, publishDefaults: { per_slot: 3, cadence: '0 9 * * *', max_buffer: 20 } } });
+    expect(put.statusCode, put.body).toBe(200);
+    try {
+      await createBook(t.deps, { title: '默认值', slug: 'v3-defaults', genre: 'xianxia', length: 'medium', start: false });
+      const y = await yamlOf('v3-defaults');
+      expect(y.v3.effort).toEqual({ open: 'medium', write: 'high', closing: 'medium', finale: 'high', retro: 'medium' });
+      expect(y.publish).toMatchObject({ mode: 'scheduled', cadence: '0 9 * * *', per_slot: 3, max_buffer: 20, resume_buffer: 15, lag: 0, require_audited: false });
+    } finally {
+      await admin('PUT', '/api/admin/settings', { v3: { effortDefaults: { write: 'medium', closing: 'high' }, publishDefaults: { per_slot: 2, cadence: '0 8 * * *', max_buffer: 15 } } });
+    }
   });
 
   it('start enqueues book.open', async () => {
@@ -175,39 +228,35 @@ describe('v3 index and manuscripts', () => {
     expect(ch?.title).toBe('夜雨归人');
   });
 
-  it('v3 publish settings: max_buffer below 2 × batch is rejected on both save paths; v2 books unchanged', async () => {
-    await createBook(t.deps, { title: '存稿', slug: 'v3-buf', genre: 'xianxia', flow: 'v3', v3: { batch: 5 }, start: false });
-    const low = await admin('PUT', '/api/admin/books/v3-buf/publish', { max_buffer: 9, resume_buffer: 4 });
+  it('v3 publish settings: max_buffer below 2 × batch is rejected on both save paths (book page settings, raw book.yaml)', async () => {
+    await createBook(t.deps, { title: '存稿', slug: 'v3-buf', genre: 'xianxia', length: 'medium', batch: 5, start: false });
+    const s = (await admin('GET', '/api/admin/books/v3-buf/v3')).json().settings;
+    const low = await admin('PUT', '/api/admin/books/v3-buf/v3/settings', { ...s, publish: { ...s.publish, max_buffer: 9 } });
     expect(low.statusCode).toBe(400);
     expect(low.json().code).toBe('invalid_publish');
-    expect((await admin('PUT', '/api/admin/books/v3-buf/publish', { max_buffer: 10, resume_buffer: 5 })).statusCode).toBe(200);
+    expect((await admin('PUT', '/api/admin/books/v3-buf/v3/settings', { ...s, publish: { ...s.publish, max_buffer: 10 } })).statusCode).toBe(200);
     // 直接改 book.yaml 把每批章数调大
-    const doc = await admin('GET', '/api/admin/books/v3-buf/config');
-    const raw = (doc.json() as { raw: string; sha: string }).raw.replace(/batch: 5/, 'batch: 8');
-    const put = await admin('PUT', '/api/admin/books/v3-buf/config', { raw, baseSha: (doc.json() as { sha: string }).sha });
+    const doc = (await admin('GET', '/api/admin/books/v3-buf/file?path=book.yaml')).json() as { content: string; sha: string };
+    const put = await admin('PUT', '/api/admin/books/v3-buf/file', { path: 'book.yaml', content: doc.content.replace(/batch: 5/, 'batch: 8'), baseSha: doc.sha });
     expect(put.statusCode).toBe(400);
     expect(put.json().code).toBe('invalid_publish');
-    // 旧流程的书：同样的存稿上限照收
-    await createBook(t.deps, { title: '旧存稿', slug: 'v2-buf', genre: 'xianxia', start: false });
-    const v2 = await admin('PUT', '/api/admin/books/v2-buf/publish', { max_buffer: 4, resume_buffer: 2, mode: 'immediate' });
-    expect(v2.statusCode).toBe(200);
   });
 
-  it('estimateImpact for v3 has no ledger cascade note', async () => {
+  it('estimateImpact has no ledger cascade note (v3 and every other book)', async () => {
     const impact = await estimateImpact(t.deps, await rowOf('v3-idx'), openRepo(bookDir(t.deps, 'v3-idx')), P.manuscript(2));
     expect(impact.affectedChapters).toBeNull();
     expect(impact.affectedDeltas).toBe(0);
     expect(impact.estimatedRuns).toBe(0);
     expect(impact.needsConfirm).toBe(false);
     expect(impact.notes.some((n) => n.includes('账本'))).toBe(false);
-    // v2 书仍然有级联说明
+    // 账本已删除：哪本书都没有级联说明
     await addChapters('v2-a', { 1: `# 第一章\n\n${PROSE}\n` });
-    const v2 = await estimateImpact(t.deps, await rowOf('v2-a'), openRepo(bookDir(t.deps, 'v2-a')), P.manuscript(1));
-    expect(v2.affectedChapters).toEqual([1, 1]);
-    expect(v2.notes.some((n) => n.includes('账本'))).toBe(true);
+    const other = await estimateImpact(t.deps, await rowOf('v2-a'), openRepo(bookDir(t.deps, 'v2-a')), P.manuscript(1));
+    expect(other.affectedChapters).toBeNull();
+    expect(other.notes.some((n) => n.includes('账本'))).toBe(false);
   });
 
-  it('v3 chapter actions: rewrite needs a note and records a waiting request; repair/reextract still 409; rewind to 0 succeeds', async () => {
+  it('v3 chapter actions: rewrite needs a note and records a waiting request; repair/reextract are gone (400); rewind to 0 succeeds', async () => {
     const bare = await admin('POST', '/api/admin/books/v3-idx/chapters/1/actions', { action: 'rewrite', confirm: true });
     expect(bare.statusCode).toBe(400);
     const withNote = await admin('POST', '/api/admin/books/v3-idx/chapters/1/actions', { action: 'rewrite', note: '开头太慢' });
@@ -217,9 +266,8 @@ describe('v3 index and manuscripts', () => {
     // 主人要求改写的章解锁
     expect(m.v3.locked).not.toContain(1);
     for (const action of ['repair', 'reextract']) {
-      const res = await admin('POST', '/api/admin/books/v3-idx/chapters/1/actions', { action, confirm: true });
-      expect(res.statusCode, action).toBe(409);
-      expect(res.json().code, action).toBe('v3_unsupported');
+      const res = await admin('POST', '/api/admin/books/v3-idx/chapters/1/actions', { action });
+      expect(res.statusCode, action).toBe(400);
     }
     const rewind = await admin('POST', '/api/admin/books/v3-idx/actions', { action: 'rewind', to: 0, confirm: true });
     expect(rewind.statusCode).toBe(200);

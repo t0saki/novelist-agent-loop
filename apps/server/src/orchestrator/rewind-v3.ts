@@ -160,17 +160,21 @@ export async function batchBaseFor(repo: BookRepo, meta: Pick<V3BookMeta, 'batch
 }
 
 /** 书页给出的回退点：0（还没发布过时）和每一批的结尾（≥ 已发布、< 已写），新的在前 */
-export function rewindPoints(meta: Pick<V3BookMeta, 'batchLog'>, publishedThrough: number, accepted: number): { to: number; label: string }[] {
+/** floor：接手的旧书不能退到接手之前（= takeover.from − 1；没接手过 = 0，行为不变） */
+export function rewindPoints(meta: Pick<V3BookMeta, 'batchLog'>, publishedThrough: number, accepted: number, floor = 0): { to: number; label: string }[] {
   const out: { to: number; label: string }[] = [];
   const seen = new Set<number>();
   for (const e of [...meta.batchLog].reverse()) {
-    if (e.to < publishedThrough || e.to >= accepted || seen.has(e.to)) continue;
+    if (e.to < publishedThrough || e.to < floor || e.to >= accepted || seen.has(e.to)) continue;
     seen.add(e.to);
     out.push({ to: e.to, label: `第 ${e.to} 章（第 ${e.from}–${e.to} 章这一批写完时）` });
   }
-  if (publishedThrough === 0 && accepted > 0) out.push({ to: 0, label: '回到开头（设定和大纲保留）' });
+  if (publishedThrough === 0 && accepted > 0 && floor === 0) out.push({ to: 0, label: '回到开头（设定和大纲保留）' });
   return out;
 }
+
+/** 回退下限（P3 D16）：接手的旧书 = 接手前的最后一章；其余 0 */
+export const rewindFloor = (meta: Pick<V3BookMeta, 'takeover'>): number => (meta.takeover ? Math.max(0, meta.takeover.from - 1) : 0);
 
 /** p2-plan §5.6 rewound */
 export function rewoundHints(r: { to: number; dir: string; notesFrom: number | null; notesKnown: boolean; note?: string | undefined }, at: string): V3Hint[] {
@@ -202,6 +206,7 @@ export async function rewindV3(env: ExecEnv, bookId: string, to: number, opts: {
       if (activeTask || meta.pending || meta.rewinding) throw busy();
       // 归档的书不会再写：退回去的章节进了 drafts/ 却采用不回来（书页也不给这个操作）
       if (row.status === 'archived') throw v3Finished(row.status);
+      if (to < rewindFloor(meta)) throw new HttpProblem(409, 'before_takeover', `这本书是从第 ${rewindFloor(meta) + 1} 章接手的，不能退到接手之前`);
       if (to < row.publishedThrough) throw new HttpProblem(400, 'bad_request', '不能退到已发布的章节之前');
       if (to >= row.acceptedThrough) throw new HttpProblem(400, 'bad_request', `已经在第 ${row.acceptedThrough} 章`);
       return { patch: { rewinding: { to, ts, at, ...(opts.note?.trim() ? { note: opts.note.trim() } : {}) } }, result: { slug: row.slug, accepted: row.acceptedThrough, meta } };

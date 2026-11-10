@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { IsolationBackend, IsolationPreference, IsolationProbe } from '@novelist/shared';
 import type { Invocation, RunSpec } from './types.js';
-import { globToRegExp, listFilesRecursive, sha256FileImpl } from './util.js';
+import { sha256FileImpl } from './util.js';
 
 export interface MountPlan {
   /** 只读绑定（bwrap）/ 只读集合 */
@@ -148,9 +148,8 @@ export function mountPlanFor(spec: RunSpec, homeStateDirs: string[], extraRo: st
   };
   const liveGit = liveGitDirOf(spec.bookDir);
   if (liveGit) ro.add(liveGit);
-  // v3：整个书快照归作者使用（收割走快照目录）；live .git 与 $RUN/in 仍只读
-  if (spec.contract === 'v3') rw.add(spec.bookDir);
-  else ro.add(spec.bookDir);
+  // 整个书快照归作者使用（收割走快照目录）；live .git 与 $RUN/in 仍只读
+  rw.add(spec.bookDir);
   ro.add(spec.inDir);
   for (const p of extraRo) {
     ro.add(p);
@@ -209,15 +208,9 @@ export function isAllowed(harnessShellTool: 'disableable' | 'always', harness: s
   return { ok: true };
 }
 
-/** run 后审计（§3.6）：out/ 清单 ⊆ 声明；home 配置 hash 不变 */
-export async function postRunAudit(input: {
-  outDir: string;
-  declaredGlobs: string[];
-  homeConfigHashes: Record<string, string>;
-}): Promise<{ ok: boolean; extraFiles: string[]; tamperedConfig: string[] }> {
-  const res = input.declaredGlobs.map(globToRegExp);
-  const files = await listFilesRecursive(input.outDir);
-  const extraFiles = files.filter((f) => !res.some((r) => r.test(f)));
+/** run 后审计（§3.6）：home 配置 hash 不变（旧契约的“out/ 清单 ⊆ 声明”已删除，extraFiles 恒为 []） */
+export async function postRunAudit(input: { homeConfigHashes: Record<string, string> }): Promise<{ ok: boolean; extraFiles: string[]; tamperedConfig: string[] }> {
+  const extraFiles: string[] = [];
   const tamperedConfig: string[] = [];
   for (const [p, h] of Object.entries(input.homeConfigHashes)) {
     try {
@@ -226,7 +219,7 @@ export async function postRunAudit(input: {
       tamperedConfig.push(p);
     }
   }
-  return { ok: extraFiles.length === 0 && tamperedConfig.length === 0, extraFiles, tamperedConfig };
+  return { ok: tamperedConfig.length === 0, extraFiles, tamperedConfig };
 }
 
 /** 测试用：清空探测缓存 */

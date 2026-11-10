@@ -445,8 +445,9 @@ function bookYamlText(config: Record<string, unknown>): string {
  * book.yaml 只写调用方显式给出的键（加 schema），默认值不固化。
  * layout 'v3'（p1-plan §3 WP-C）：.gitignore 另加 AGENTS.md/CLAUDE.md/ORDER.md（每次运行前生成，不入库），种子写 seed.md；
  * 不写根 AGENTS.md 占位、.agents/skills、.claude/skills 软链和 state/overrides.jsonl；磁盘上只建 manuscript/、notes/、drafts/。
+ * layout 'legacy'：旧书（v1 导入）的布局，约 130 本已有的导入书都是这个样子；新书一律 'v3'。
  */
-export async function initBookRepo(dir: string, init: { config: BookConfigInput; premise: string; layout?: 'v3' }): Promise<{ repo: BookRepo; commit: string }> {
+export async function initBookRepo(dir: string, init: { config: BookConfigInput; premise: string; layout: 'v3' | 'legacy' }): Promise<{ repo: BookRepo; commit: string }> {
   const parsed = zBookConfig.safeParse(init.config);
   if (!parsed.success) throw new Error(`invalid book config: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   const abs = path.resolve(dir);

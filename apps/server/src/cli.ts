@@ -5,18 +5,18 @@
  *   novelist supervise -- serve         容器内 tini 唯一子进程：拉起 serve 并在崩溃后重启
  *   novelist migrate                    只跑数据库迁移
  *   novelist doctor [--fix-hints]       隔离探测、DB、工具、harness
- *   novelist book new --title … --genre … [--seed file] [--tier …] [--no-start]
- *   novelist book status <slug>
+ *   novelist book new --genre <id|random> [--length short|medium|long|epic|random] [--idea …] [--title …] [--seed file] [--no-start]
+ *   novelist book status [<slug>]
  *   novelist book run <slug> [--until-idle]
- *   novelist import-v1 [--pg url] [--novels all|1,2] [--no-readers] [--bootstrap-extract]
+ *   novelist book takeover <slug> [--length …] [--target 字数] [--no-start]   接手旧书（缺省值来自 GET /takeover）
+ *   novelist import-v1 [--pg url] [--novels all|1,2] [--no-readers]
  *   novelist harness install <id> [--version v]
  *   novelist harness probe <id> [--account id] [--live]
- *   novelist routing check [<slug>]
+ *   novelist routing slots              写作 / 杂活两个路由位置的主备与当前状态
  *   novelist reindex <slug>
  *   novelist secrets rotate-master-key | export-master-key --yes
  *   novelist backup [--out file]        打包 $DATA 书库 + 数据库逻辑导出（不含 harness/runs/主密钥）
  *   novelist restore <backup.tar.gz> --yes
- *   novelist migrate-book <slug>
  * 远程模式：--url + --token（PAT，~/.config/novelist/token）走 HTTP API；默认本地直连 DB（进程内调用同一套路由）。
  */
 import { spawn } from 'node:child_process';
@@ -32,7 +32,6 @@ import { sha256hex } from './api/auth.js';
 import { buildServer } from './api/server.js';
 import { loadConfig } from './config/index.js';
 import { createBackup, restoreBackup } from './services/backup.js';
-import { bookBySlug } from './api/helpers.js';
 import { migrate, openDb } from './db/client.js';
 import { pats } from './db/schema.js';
 import { createLogger, silentLogger } from './log.js';
@@ -47,7 +46,9 @@ interface Flags {
   title?: string;
   genre?: string;
   seed?: string;
-  tier?: string;
+  length?: string;
+  idea?: string;
+  target?: string;
   slug?: string;
   pg?: string;
   novels?: string;
@@ -59,8 +60,21 @@ interface Flags {
   'no-start'?: boolean;
   'until-idle'?: boolean;
   'fix-hints'?: boolean;
-  'bootstrap-extract'?: boolean;
   out?: string;
+}
+
+/** book new 的请求体（POST /api/admin/books）。seed 是文件内容（读好了再传进来） */
+export function newBookBody(flags: Pick<Flags, 'genre' | 'length' | 'idea' | 'title' | 'slug'> & { 'no-start'?: boolean }, seed?: string): Record<string, unknown> {
+  if (!flags.genre) throw new Error('book new 需要 --genre <题材包 id 或 random>');
+  return {
+    genre: flags.genre,
+    length: flags.length ?? 'random',
+    idea: flags.idea ?? '',
+    title: flags.title ?? '',
+    ...(flags.slug ? { slug: flags.slug } : {}),
+    ...(seed !== undefined ? { seed } : {}),
+    start: !flags['no-start'],
+  };
 }
 
 interface Api {
@@ -201,11 +215,22 @@ async function cmdBook(sub: string | undefined, positional: string[], flags: Fla
   switch (sub) {
     case 'new':
       return withApi(flags, async (api) => {
-        if (!flags.title || !flags.genre) throw new Error('book new 需要 --title 和 --genre');
-        const seed = flags.seed ? await fs.readFile(flags.seed, 'utf8') : '';
-        print(await api.call('POST', '/api/admin/books', { title: flags.title, genre: flags.genre, seed, ...(flags.slug ? { slug: flags.slug } : {}), ...(flags.tier ? { tier: flags.tier } : {}), start: !flags['no-start'] }));
+        const seed = flags.seed ? await fs.readFile(flags.seed, 'utf8') : undefined;
+        print(await api.call('POST', '/api/admin/books', newBookBody(flags, seed)));
         return 0;
       });
+    case 'takeover': {
+      const slug = positional[0];
+      if (!slug) throw new Error('book takeover 需要 <slug>');
+      return withApi(flags, async (api) => {
+        const url = `/api/admin/books/${encodeURIComponent(slug)}/takeover`;
+        const d = await api.call<{ length: string; target_cjk: number; batch: number; min_chapter_cjk: number }>('GET', url);
+        const target = flags.target ? Number(flags.target) : d.target_cjk;
+        if (!Number.isInteger(target) || target <= 0) throw new Error('--target 要是正整数（全书字数下限）');
+        print(await api.call('POST', url, { length: flags.length ?? d.length, target_cjk: target, batch: d.batch, min_chapter_cjk: d.min_chapter_cjk, start: !flags['no-start'] }));
+        return 0;
+      });
+    }
     case 'status': {
       const slug = positional[0];
       return withApi(flags, async (api) => {
@@ -221,8 +246,8 @@ async function cmdBook(sub: string | undefined, positional: string[], flags: Fla
       try {
         const { bookBySlug } = await import('./api/helpers.js');
         const book = await bookBySlug(deps, slug);
-        if (book.status === 'draft') await deps.orchestrator.startBook(book.id, { interview: false });
-        else if (book.status === 'paused') await deps.orchestrator.bookAction(book.id, { action: 'resume', confirm: false });
+        if (book.status === 'draft') await deps.orchestrator.startBook(book.id);
+        else if (book.status === 'paused') await deps.orchestrator.bookAction(book.id, { action: 'resume' });
         if (flags['until-idle']) {
           await deps.orchestrator.runUntilIdle();
           print('空闲（没有更多可执行任务）');
@@ -236,14 +261,14 @@ async function cmdBook(sub: string | undefined, positional: string[], flags: Fla
       }
     }
     default:
-      throw new Error('用法：novelist book new|status|run');
+      throw new Error('用法：novelist book new|status|run|takeover');
   }
 }
 
 async function cmdImport(flags: Flags): Promise<number> {
   return withApi(flags, async (api) => {
     const novels = !flags.novels || flags.novels === 'all' ? 'all' : flags.novels.split(',').map(Number);
-    const job = await api.call<{ id: string; state: string }>('POST', '/api/admin/import-v1', { ...(flags.pg ? { databaseUrl: flags.pg } : {}), novels, readers: !flags['no-readers'], bootstrapExtract: !!flags['bootstrap-extract'] });
+    const job = await api.call<{ id: string; state: string }>('POST', '/api/admin/import-v1', { ...(flags.pg ? { databaseUrl: flags.pg } : {}), novels, readers: !flags['no-readers'] });
     let printed = 0;
     for (;;) {
       const cur = await api.call<{ state: string; log: string[]; report: unknown }>('GET', `/api/admin/import-v1/jobs/${job.id}`);
@@ -308,19 +333,6 @@ async function cmdRestore(file: string | undefined, flags: Flags): Promise<numbe
   }
 }
 
-async function cmdMigrateBook(slug: string | undefined): Promise<number> {
-  if (!slug) throw new Error('用法：novelist migrate-book <slug>');
-  const deps = await bootstrap(loadConfig(), { log: silentLogger });
-  try {
-    const row = await bookBySlug(deps, slug);
-    await deps.orchestrator.bookAction(row.id, { action: 'migrate', confirm: false });
-    print(`已提交迁移任务：${slug}`);
-    return 0;
-  } finally {
-    await shutdownDeps(deps);
-  }
-}
-
 async function cmdSecrets(sub: string | undefined, flags: Flags): Promise<number> {
   const config = loadConfig();
   if (sub === 'export-master-key') {
@@ -364,7 +376,9 @@ export async function main(argv: string[]): Promise<number> {
       title: { type: 'string' },
       genre: { type: 'string' },
       seed: { type: 'string' },
-      tier: { type: 'string' },
+      length: { type: 'string' },
+      idea: { type: 'string' },
+      target: { type: 'string' },
       slug: { type: 'string' },
       pg: { type: 'string' },
       novels: { type: 'string' },
@@ -376,7 +390,6 @@ export async function main(argv: string[]): Promise<number> {
       'no-start': { type: 'boolean' },
       'until-idle': { type: 'boolean' },
       'fix-hints': { type: 'boolean' },
-      'bootstrap-extract': { type: 'boolean' },
       out: { type: 'string' },
     },
   });
@@ -398,9 +411,16 @@ export async function main(argv: string[]): Promise<number> {
     case 'harness':
       return cmdHarness(sub, rest, flags);
     case 'routing': {
-      if (sub !== 'check') throw new Error('用法：novelist routing check [<slug>]');
+      if (sub !== 'slots') throw new Error('用法：novelist routing slots（旧的 routing check 已删除：路由只剩写作 / 杂活两个位置）');
       return withApi(flags, async (api) => {
-        print(await api.call('POST', `/api/admin/routing/check${rest[0] ? `?book=${encodeURIComponent(rest[0])}` : ''}`));
+        const v = await api.call<{ slots: Record<string, { primary: string | null; fallback: string | null }>; forced: boolean; status: Record<string, { profile: string | null; usedFallback: boolean; waitUntil: string | null; reason: string | null }> }>('GET', '/api/admin/routing/slots');
+        for (const id of ['writer', 'utility'] as const) {
+          const s = v.slots[id];
+          const st = v.status[id];
+          const state = st?.profile ? `可用：${st.profile}${st.usedFallback ? '（备用）' : ''}` : `不可用${st?.waitUntil ? `，约 ${st.waitUntil} 恢复` : ''}${st?.reason ? `：${st.reason}` : ''}`;
+          print(`${id === 'writer' ? '写作' : '杂活'}  主用 ${s?.primary ?? '（未设）'}  备用 ${s?.fallback ?? '（无）'}  ${state}`);
+        }
+        if (v.forced) print('fake 模式：两个位置都强制用 fake');
         return 0;
       });
     }
@@ -421,10 +441,8 @@ export async function main(argv: string[]): Promise<number> {
       return cmdBackup(flags);
     case 'restore':
       return cmdRestore(sub, flags);
-    case 'migrate-book':
-      return cmdMigrateBook(sub);
     default:
-      console.error('用法：novelist serve|supervise|migrate|doctor|book|import-v1|harness|routing|reindex|secrets|backup|restore|migrate-book');
+      console.error('用法：novelist serve|supervise|migrate|doctor|book|import-v1|harness|routing|reindex|secrets|backup|restore');
       return 2;
   }
 }

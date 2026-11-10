@@ -3,17 +3,14 @@
  * 错峰、退避、跨书按优先级与存稿分配订阅窗口；leader 选举 用 settings 行租约（PGlite 单进程直接是 leader）。Owner: lane F。
  */
 import { and, count, eq, inArray, or, sql } from 'drizzle-orm';
-import { books, inbox, settings, tasks } from '../db/schema.js';
+import { books, settings, tasks } from '../db/schema.js';
+import { V3_BOOK_SQL, isV3Meta } from '../book/legacy.js';
 import type { SystemSettings, TaskState } from '@novelist/shared';
-import type { BookHandle, PipelineContext, TaskRow, TaskResult, TaskSpec } from '../pipeline/types.js';
-import type { BookRuntimeState } from '../pipeline/next.js';
-import { advanceCircuits, takePendingCanaries } from './circuit.js';
+import type { BookHandle, PipelineContext, TaskRow, TaskResult, TaskSpec } from '../runtime/types.js';
 import { drainAllOutbox, enqueueSpec, execEnv, executeTask, finishTask, leaseMs, reattachedTaskIds, type ExecEnv, type ExecutorDeps } from './executor.js';
-import { clearInboxFollowups, createInboxItem, expireInboxTimeouts, pendingInboxFollowups } from './inbox.js';
 import { orchOf, withOrch } from './orch-state.js';
 import { publishTick } from './publisher.js';
 import { ACTIVE_STATES, LIVE_STATES, advancePending, claimNext, reapExpiredLeases, renewLease } from './queue.js';
-import { expireReservations } from './quota.js';
 import { reconcileRuns, recoverStuckPromotes } from './recovery.js';
 import { recoverRewinds } from './rewind-v3.js';
 import { gcRetention } from './retention.js';
@@ -55,30 +52,6 @@ export async function acquireLeader(env: ExecEnv): Promise<boolean> {
     await tx.update(settings).set({ value, updatedAt: now.toISOString() }).where(eq(settings.key, LEADER_KEY));
     return true;
   });
-}
-
-/** 组装 lane E 的 BookRuntimeState */
-export async function bookRuntimeState(env: ExecEnv, book: BookHandle): Promise<BookRuntimeState> {
-  const [activeRows, bookRows, approvals] = await Promise.all([
-    // 已 done 但 outbox 未投递的任务也算活跃：它的 Inbox（审批 / 访谈）还没建，此刻派发后续会越过审批门
-    env.db.select({ id: tasks.id, kind: tasks.kind, target: tasks.target, lane: tasks.lane, state: tasks.state }).from(tasks).where(and(eq(tasks.bookId, book.id), or(inArray(tasks.state, LIVE_STATES), sql`${tasks.params}->'_orch'->>'outbox' = 'true'`))),
-    env.db.select().from(books).where(eq(books.id, book.id)).limit(1),
-    // 审批门 + 开书访谈；已处理但 followups（打回重做 / 访谈答案）还没入队的也继续拦
-    env.db
-      .select({ id: inbox.id, dedupeKey: inbox.dedupeKey, kind: inbox.kind, state: inbox.state })
-      .from(inbox)
-      .where(and(eq(inbox.bookId, book.id), or(and(eq(inbox.state, 'open'), inArray(inbox.kind, ['approval', 'question'])), sql`${inbox.resolution}->>'followupsPending' = 'true'`))),
-  ]);
-  const b = bookRows[0];
-  return {
-    active: activeRows,
-    acceptedThrough: b?.acceptedThrough ?? 0,
-    cardsThrough: b?.cardsThrough ?? 0,
-    publishedThrough: b?.publishedThrough ?? 0,
-    auditedThrough: b?.auditedThrough ?? 0,
-    productionPaused: b?.pausedReason === 'max_buffer',
-    openApprovals: approvals.filter((a) => a.state !== 'open' || a.kind === 'approval' || (a.dedupeKey ?? '').startsWith('interview:')).map((a) => a.dedupeKey ?? a.id),
-  };
 }
 
 export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; maxConcurrent?: number }): Scheduler {
@@ -142,8 +115,7 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
     const ctx: PipelineContext = { deps: env.pdeps, book: handle };
     let specs: TaskSpec[];
     try {
-      const state = await bookRuntimeState(env, handle);
-      specs = await env.pipe.nextTasks(ctx, state);
+      specs = await env.pipe.nextTasks(ctx);
     } catch (err) {
       env.log.warn({ err: (err as Error).message, bookId: book.id }, 'nextTasks failed');
       return 0;
@@ -165,33 +137,8 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
     await reconcileRuns(env, reattached, { excludeTasks: own });
     await recoverStuckPromotes(env, { excludeTasks: own });
     await reapExpiredLeases(env.db, now, own);
-    await expireReservations(env.db, now);
-    await expireInboxTimeouts(env.db, env.bus, now);
     await advancePending(env.db);
     await drainAllOutbox(env);
-    for (const item of await pendingInboxFollowups(env.db)) {
-      const bookId = item.followups[0]?.bookId ?? null;
-      try {
-        const book = bookId ? await env.pipe.openBook(env.pdeps, bookId) : null;
-        const ctx: PipelineContext = { deps: env.pdeps, book };
-        for (const f of item.followups) if ((await enqueueSpec(env, ctx, f)).created) enq += 1;
-        await clearInboxFollowups(env.db, item.id);
-      } catch (err) {
-        env.log.warn({ err: (err as Error).message, inbox: item.id }, 'inbox followups failed');
-      }
-    }
-    // 熔断：到点生效 + canary
-    const { opened, halfOpen } = await advanceCircuits(env.db, now);
-    for (const c of opened) env.bus.publish({ type: 'circuit_changed', harness: c.harness as never, version: c.version, state: 'open', reason: c.reason });
-    const canaries = [...(await takePendingCanaries(env.db)), ...halfOpen.map((c) => ({ ...c, reason: 'half_open' }))];
-    for (const c of canaries) {
-      try {
-        const r = await enqueueSpec(env, { deps: env.pdeps, book: null }, { kind: 'harness.canary', bookId: null, target: `${c.harness}@${c.version}:${c.isolation}`, lane: 'system', params: { harness: c.harness, version: c.version, isolation: c.isolation, reason: c.reason, instance: now.toISOString() } });
-        if (r.created) enq += 1;
-      } catch (err) {
-        env.log.warn({ err: (err as Error).message }, 'canary enqueue failed');
-      }
-    }
     // 发布：每分钟一次（测试 tickMs 很小时也按实际时间节流）
     if (now.getTime() - lastPublishTick >= PUBLISH_INTERVAL_MS) {
       lastPublishTick = now.getTime();
@@ -228,7 +175,8 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
     if (canEnqueue() && (await acquireLeader(env))) {
       enqueued += await housekeeping(now, settingsNow);
       if (settingsNow.schedulerEnabled && env.config.schedulerEnabled !== false) {
-        const bookRows = await env.db.select({ id: books.id }).from(books).where(inArray(books.status, ['active', 'planning', 'completed']));
+        // 只看 v3 书（旧书什么都不提议，也不进 tick；P3 D1）
+        const bookRows = await env.db.select({ id: books.id }).from(books).where(and(inArray(books.status, ['active', 'planning', 'completed']), V3_BOOK_SQL));
         for (const b of bookRows) enqueued += await bookTick(b);
         if (leaderHook) {
           await leaderHook(now, settingsNow).catch((err: Error) => env.log.error({ err: err.message }, 'leader hook failed'));
@@ -316,59 +264,20 @@ export function createScheduler(deps: ExecutorDeps, opts?: { tickMs?: number; ma
   };
 }
 
-function chapterInArc(range: readonly [string, string] | string[], no: number): boolean {
-  const from = Number((range[0] ?? '').replace(/\D/g, ''));
-  const to = Number((range[1] ?? '').replace(/\D/g, ''));
-  return from > 0 && no >= from && no <= to;
-}
-
-function arcSize(range: readonly [string, string] | string[]): number {
-  const from = Number((range[0] ?? '').replace(/\D/g, ''));
-  const to = Number((range[1] ?? '').replace(/\D/g, ''));
-  return from > 0 && to >= from ? to - from + 1 : 0;
-}
-
 function publisherIo(env: ExecEnv): Parameters<typeof publishTick>[2] {
   return {
     loadConfig: async (bookId) => {
+      // 旧书不再发布（P3 D13）：先按数据库判定，book.yaml 坏了也不打开
+      const row = (await env.db.select({ meta: books.meta }).from(books).where(eq(books.id, bookId)).limit(1))[0];
+      if (!row || !isV3Meta(row.meta)) return 'skip';
       const book = await env.pipe.openBook(env.pdeps, bookId);
-      if (book.config.flow === 'v3') return { cfg: book.config.publish, arcLength: 0, v3Cap: await v3PublishCap(env.db, bookId, env.nowFn(), book.config.v3.publish_after_hours) };
-      let arcLength = 0;
-      try {
-        const rows = await env.db.select({ cursor: books.cursor }).from(books).where(eq(books.id, bookId)).limit(1);
-        const cursor = rows[0]?.cursor ?? 1;
-        const arcs = await book.files.arcs();
-        const current = arcs.find((a) => chapterInArc(a.chapters, cursor)) ?? arcs.at(-1);
-        arcLength = current ? arcSize(current.chapters) : 0;
-      } catch {
-        arcLength = 0; // 规划未完成时没有弧信息：lag 用 min_lag
-      }
-      return { cfg: book.config.publish, arcLength };
+      if (book.config.flow !== 'v3') return 'skip';
+      return { cfg: book.config.publish, v3Cap: await v3PublishCap(env.db, bookId, env.nowFn(), book.config.v3.publish_after_hours) };
     },
     enqueue: async ({ bookId, through, slot }) => {
       const book = await env.pipe.openBook(env.pdeps, bookId);
       const ctx: PipelineContext = { deps: env.pdeps, book };
       return (await enqueueSpec(env, ctx, { kind: 'publish', bookId, target: `through-${through}`, lane: 'system', params: { through, slot } })).created;
-    },
-    lowBuffer: async ({ bookId, bufferDays }) => {
-      await createInboxItem(env.db, env.bus, {
-        kind: 'quota',
-        bookId,
-        title: `存稿仅够发布 ${bufferDays.toFixed(1)} 天`,
-        body: { bufferDays },
-        actions: [{ id: 'dismiss', label: '知道了' }],
-        dedupeKey: `low_buffer:${bookId}`,
-      });
-    },
-    bufferBlocked: async ({ bookId, buffer, lag, audited, published }) => {
-      await createInboxItem(env.db, env.bus, {
-        kind: 'notice',
-        bookId,
-        title: `存稿已到 ${buffer} 章（超过上限），但当前没有可发布的章节，继续写作`,
-        body: { buffer, lag, audited, published, detail: '发布被 lag 或审计前沿卡住，暂停生产只会造成互等。请检查发布滞后（lag）与审计进度；到弧末审计前进后会自动恢复正常。' },
-        actions: [{ id: 'dismiss', label: '知道了' }],
-        dedupeKey: `buffer_blocked:${bookId}`,
-      });
     },
     productionChanged: async ({ bookId, paused, buffer }) => {
       const rows = await env.db.select({ slug: books.slug }).from(books).where(eq(books.id, bookId)).limit(1);

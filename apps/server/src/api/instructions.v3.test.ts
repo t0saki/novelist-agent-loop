@@ -7,6 +7,7 @@ import { openRepo, P } from '../book/index.js';
 import { createGenre } from '../genres/index.js';
 import { V3_AGENTS_SOFT_LIMIT } from '../instructions/v3.js';
 import { createBook } from '../services/books.js';
+import { createLegacyBook } from '../book/testing-legacy.js';
 import { createTestApp, TEST_ADMIN_PASSWORD, type TestApp } from '../testing.js';
 import { bookDir } from './helpers.js';
 
@@ -23,7 +24,8 @@ beforeAll(async () => {
   const r = await t.app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: TEST_ADMIN_PASSWORD } });
   cookie = String(r.headers['set-cookie'] ?? '').split(';')[0] ?? '';
   await createBook(t.deps, { title: '新', slug: 'iv3', genre: 'xianxia', flow: 'v3', start: false });
-  await createBook(t.deps, { title: '旧', slug: 'iv2', genre: 'xianxia', start: false });
+  // 旧书（P3）：不做 v3 的指令体积检查
+  await createLegacyBook(t.deps.db, t.deps.paths, 'iv2', { title: '旧' });
 }, 60_000);
 
 afterAll(async () => {
@@ -140,7 +142,7 @@ describe('v2-only install: global saves are not size-checked (WP-3)', () => {
     try {
       const r = await t2.app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: TEST_ADMIN_PASSWORD } });
       const c2 = String(r.headers['set-cookie'] ?? '').split(';')[0] ?? '';
-      await createBook(t2.deps, { title: '旧', slug: 'only-v2', genre: 'xianxia', start: false });
+      await createLegacyBook(t2.deps.db, t2.deps.paths, 'only-v2', { title: '旧' });
       const res = await t2.app.inject({ method: 'PUT', url: '/api/admin/instructions/file', headers: { cookie: c2 }, payload: { scope: 'global', path: 'AGENTS.md', content: BIG, baseSha: null } });
       expect(res.statusCode).toBe(200);
       expect(await fs.readFile(path.join(t2.deps.paths.instructionsGlobal, 'AGENTS.md'), 'utf8')).toBe(BIG);
@@ -180,6 +182,48 @@ describe('global / genre / book saves only reject what the save itself breaks (b
       await t3.close();
     }
   }, 60_000);
+});
+
+describe('instruction preview (v3, P3 WP-3)', () => {
+  const preview = (payload: unknown) => t.app.inject({ method: 'POST', url: '/api/admin/instructions/preview', headers: { cookie }, payload: payload as object });
+
+  it('by book: the same AGENTS.md the run gets (genre chain, length, book layer), with layer sizes; drafts override the disk', async () => {
+    const res = await preview({ book: 'iv3' });
+    expect(res.statusCode, res.body).toBe(200);
+    const p = res.json() as { text: string; bytes: number; limit: number; over: boolean; layers: { id: string; bytes: number }[] };
+    expect(p.limit).toBe(V3_AGENTS_SOFT_LIMIT);
+    expect(p.over).toBe(false);
+    expect(p.bytes).toBe(Buffer.byteLength(p.text, 'utf8'));
+    expect(p.layers.map((l) => l.id)).toEqual(expect.arrayContaining(['S0', 'S1', 'L3']));
+    expect(p.text).toContain('篇幅要领');
+    const drafted = (await preview({ book: 'iv3', drafts: { 'book:iv3:instructions/AGENTS.md': '本书草稿：多写海边的雾。' } })).json();
+    expect(drafted.text).toContain('本书草稿：多写海边的雾。');
+    expect(drafted.layers.find((l: { id: string }) => l.id === 'L3')?.bytes).toBe(Buffer.byteLength('本书草稿：多写海边的雾。'));
+    // 草稿只是预览：书库没变
+    expect(await openRepo(bookDir(t.deps, 'iv3')).readFile(P.instructionsAgents)).not.toContain('海边的雾');
+    const big = (await preview({ book: 'iv3', drafts: { 'book:iv3:instructions/AGENTS.md': BIG } })).json();
+    expect(big.over).toBe(true);
+  });
+
+  it('by genre + length (an empty book directory); a genre draft shows up; legacy book → 409; neither book nor genre → 400', async () => {
+    const p = (await preview({ genre: 'xianxia', length: 'epic', drafts: { 'genre:xianxia:AGENTS.md': '题材草稿：修炼体系要自洽。' } })).json();
+    expect(p.text).toContain('超长');
+    expect(p.text).toContain('题材草稿：修炼体系要自洽。');
+    expect(p.layers.map((l: { id: string }) => l.id)).toContain('L2:xianxia');
+    const legacy = await preview({ book: 'iv2' });
+    expect(legacy.statusCode).toBe(409);
+    expect(legacy.json().code).toBe('legacy_book');
+    expect((await preview({})).statusCode).toBe(400);
+    expect((await preview({ genre: 'no-such' })).statusCode).toBe(404);
+  });
+
+  it('the builtin scope is the read-only viewer of the length layer', async () => {
+    const files = (await t.app.inject({ method: 'GET', url: '/api/admin/instructions/files?scope=builtin', headers: { cookie } })).json() as { path: string }[];
+    expect(files.map((f) => f.path)).toEqual(expect.arrayContaining(['v3/contract.md', 'v3/length-short.md', 'v3/length-medium.md', 'v3/length-long.md', 'v3/length-epic.md', 'roles/writer.md']));
+    expect((await t.app.inject({ method: 'GET', url: '/api/admin/instructions/file?scope=builtin&path=v3/length-long.md', headers: { cookie } })).statusCode).toBe(200);
+    const w = await t.app.inject({ method: 'PUT', url: '/api/admin/instructions/file', headers: { cookie }, payload: { scope: 'builtin', path: 'v3/length-long.md', content: 'x', baseSha: null } });
+    expect(w.statusCode).toBe(403);
+  });
 });
 
 describe('overLimit', () => {

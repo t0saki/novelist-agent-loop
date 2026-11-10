@@ -7,7 +7,7 @@ import { createOrchestrator } from '../orchestrator/index.js';
 import { collectRunChanges } from '../book/harvest.js';
 import { createRunSnapshot } from '../book/worktree.js';
 import { TRAILER } from '../book/trailers.js';
-import type { BookHandle, HarvestedRun, PipelineContext, RunContext, TaskRow, TaskSpec } from '../pipeline/types.js';
+import type { BookHandle, HarvestedRun, PipelineContext, RunContext, TaskRow, TaskSpec } from '../runtime/types.js';
 import { promoteV3 } from '../orchestrator/committer.js';
 import { enqueueSpec, execEnv, finishTask, markRunLost, type ExecEnv } from '../orchestrator/executor.js';
 import { createScheduler } from '../orchestrator/scheduler.js';
@@ -68,7 +68,7 @@ describe('prepareV3 skip rules', () => {
     const r = await prepareV3(b.ctx, task, run);
     expect(r.kind).toBe('run');
     if (r.kind !== 'run') return;
-    expect(r.plan.contract).toBe('v3');
+    expect(Object.keys(r.plan).sort()).toEqual(['effort', 'limits', 'v3']);
     expect(r.plan.effort).toBe('medium');
     expect(r.plan.v3?.orderMd).toMatch(/^任务：开书，并写第 1–5 章/m);
     expect(r.plan.v3?.claudeMd).toBe('@AGENTS.md\n');
@@ -225,6 +225,43 @@ describe('finalizeV3', () => {
     const out = await promoteV3(t.db, b.book.repo, task, res.promote as never, {});
     expect(out.landed).toEqual([6, 7]);
     expect((await t.db.select().from(books).where(eq(books.id, b.id)))[0]?.acceptedThrough).toBe(7);
+  });
+
+  it('takeover order (P3): new chapters land → v3.batch args carry takeoverDone and meta.v3.takeover becomes done; notes only → stays pending', async () => {
+    const b = await bookCtx('ftk', { chapters: 5, meta: { takeover: { at: '2026-11-10T00:00:00.000Z', from: 6, status: 'pending' } } });
+    // 只补了笔记、没有新章：接手还没做完，下一张任务单还是接手任务单
+    const t1 = await taskFor(b.ctx, writeSpec(b.id, 6, 2));
+    const snap1 = path.join(t.paths.runs, 'test', 'run-ftk1', 'book');
+    await createRunSnapshot(b.dir, b.head, snap1);
+    const run1 = await runCtx(snap1, b.head, 'run-ftk1');
+    expect((await prepareV3(b.ctx, t1, run1)).kind).toBe('run');
+    const order1 = JSON.parse(await fs.readFile(path.join(run1.inDir, 'order.json'), 'utf8')) as OrderSpec;
+    expect(order1.takeover?.lastChapters).toEqual([3, 4, 5]);
+    await fs.writeFile(path.join(snap1, 'notes/cast.md'), '人物：甲。\n');
+    const ch1 = await collectRunChanges({ snapshotDir: snap1, baseCommit: b.head, liveBookDir: b.dir, taskId: t1.id, runId: run1.runId });
+    const r1 = await finalizeV3(b.ctx, t1, { run: run1, outcome: { status: 'completed' }, v3: { manifestFile: ch1.manifestFile, lost: false, stderrTail: '', trailerKey: `${t1.id}@run-ftk1`, ownerCancelled: false } } as unknown as HarvestedRun);
+    expect((r1.promote?.effect?.args as { takeoverDone?: boolean } | undefined)?.takeoverDone).toBeUndefined();
+    await promoteV3(t.db, b.book.repo, t1, r1.promote as never, {});
+    expect(readV3Meta((await t.db.select().from(books).where(eq(books.id, b.id)))[0]?.meta).takeover?.status).toBe('pending');
+
+    // 新章入库：接手做完
+    const book2 = await env.pipe.openBook(env.pdeps, b.id);
+    const ctx2 = { deps: env.pdeps, book: book2 };
+    const t2 = await taskFor(ctx2, { ...writeSpec(b.id, 6, 2), params: { mode: 'write', from: 6, count: 2, instance: 'y' } });
+    const snap2 = path.join(t.paths.runs, 'test', 'run-ftk2', 'book');
+    await createRunSnapshot(b.dir, book2.headCommit, snap2);
+    const run2 = await runCtx(snap2, book2.headCommit, 'run-ftk2');
+    expect((await prepareV3(ctx2, t2, run2)).kind).toBe('run');
+    for (const no of [6, 7]) await fs.writeFile(path.join(snap2, `manuscript/c0000${no}.md`), chapterText(no, 3300, `新${no}`, no + 70));
+    await fs.appendFile(path.join(snap2, 'notes/chapters.md'), '第6章：新。\n第7章：新。\n');
+    await fs.writeFile(path.join(snap2, 'notes/progress.md'), '写到第 7 章。\n');
+    const ch2 = await collectRunChanges({ snapshotDir: snap2, baseCommit: book2.headCommit, liveBookDir: b.dir, taskId: t2.id, runId: run2.runId });
+    const r2 = await finalizeV3(ctx2, t2, { run: run2, outcome: { status: 'completed' }, v3: { manifestFile: ch2.manifestFile, lost: false, stderrTail: '', trailerKey: `${t2.id}@run-ftk2`, ownerCancelled: false } } as unknown as HarvestedRun);
+    expect((r2.promote?.effect?.args as { takeoverDone?: boolean }).takeoverDone).toBe(true);
+    await promoteV3(t.db, book2.repo, t2, r2.promote as never, {});
+    const row = (await t.db.select().from(books).where(eq(books.id, b.id)))[0];
+    expect(row?.acceptedThrough).toBe(7);
+    expect(readV3Meta(row?.meta).takeover).toEqual({ at: '2026-11-10T00:00:00.000Z', from: 6, status: 'done' });
   });
 
   it('empty change set → waiting, no promote', async () => {
@@ -874,7 +911,7 @@ describe('WP-2: owner message, owner rewrite requests, rewrite_from (scheduler +
     await createScheduler(t.deps).runUntilIdle({ maxTicks: 1 });
     expect((await rowOf(b.id)).acceptedThrough).toBe(8);
     const orch = createOrchestrator(t.deps);
-    await orch.chapterAction(b.id, 7, { action: 'rewrite_from', note: '第 7 章起换个方向', confirm: false });
+    await orch.chapterAction(b.id, 7, { action: 'rewrite_from', note: '第 7 章起换个方向' });
     const row = await rowOf(b.id);
     expect(row.acceptedThrough).toBe(6);
     const m = readV3Meta(row.meta);
@@ -884,6 +921,6 @@ describe('WP-2: owner message, owner rewrite requests, rewrite_from (scheduler +
     const md = await nextOrderMd(b.id);
     expect(md).toMatch(/^任务：新写第 7–9 章/m);
     expect(md).toContain('主人的意见：第 7 章起换个方向');
-    await expect(orch.chapterAction(b.id, 6, { action: 'rewrite', confirm: false })).rejects.toMatchObject({ status: 400 });
+    await expect(orch.chapterAction(b.id, 6, { action: 'rewrite' })).rejects.toMatchObject({ status: 400 });
   }, 120_000);
 });

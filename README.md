@@ -1,65 +1,24 @@
-# 书阁 · Novelist 2.0
+# 书阁 · Novelist
 
-自托管的超长篇网文工厂兼阅读室。Novelist 不直接调用模型 API，而是驱动 Claude Code、Codex 等 agent harness 写作，目标是无人值守地写到百万字以上，同时保证设定和情节前后一致。写好的章节在自带的网页阅读器里连载。
+自托管的网文写作机兼阅读室。Novelist 不直接调用模型 API，而是驱动 Claude Code、Codex、Antigravity CLI 等 agent harness 写书；写好的章节在自带的网页阅读器里连载。
 
-当前版本是 `2.0.0-alpha`。v1（直接调用 OpenAI 兼容接口的 FastAPI 版）已移到 [`legacy/v1/`](./legacy/v1)，只作参考，导入方法见 [从 v1 迁移](#从-v1-迁移)。
+**书的目录就是作者的书房。** 每次运行是作者干的一班活：读自己需要的文件，写下一批章节，更新自己的笔记。服务器只做六件事：排班、递任务单、收稿、数字数、提交、发布。设计见 [`docs/v3/DESIGN.md`](./docs/v3/DESIGN.md)。
 
-## 主要特点
+v1（直接调用 OpenAI 兼容接口的 FastAPI 版）在 [`legacy/v1/`](./legacy/v1)，只作参考，导入方法见 [旧书与导入](#旧书与导入)。
 
-- **多 harness**：同一条流水线可以跑在 Claude Code、Codex、Antigravity CLI、Grok Build、DeepSeek Harness、pi 上，每个角色单独路由。
-- **配置都在网页上**：账号、路由、质量档位、规模、吞吐、预算都在 Web UI 里设置，不需要事先写配置文件。
-- **指令归你所有**：全局、题材、书三层自定义 `AGENTS.md`，Novelist 不改写、不过滤，书层永远最后加载、优先级最高。
-- **输出只认文件**：agent 把产物写到文件，stdout 只作遥测。校验器按文件验收，通过后由编排器统一提交。
-- **每本书一个 git 仓库**：正文、设定、大纲、状态账本都在仓库里，可以审计、回滚，也可以手改。
-- **任何时刻崩溃都能恢复**：任务按内容 hash 幂等，提交走两阶段协议，最多丢失正在跑的那一个 run。
-- **存稿后定时发布**：默认保留约一个弧的存稿（最少 15 章），审计通过才发布，存稿超过 60 章暂停生产。
+## 运行只有三种
 
-## 架构概览
-
-```
-浏览器（阅读器 / 管理台）
-        │ HTTP + SSE
-        ▼
-┌────────────────── Novelist 容器 ──────────────────┐
-│  web（Fastify API + React SPA）                   │
-│  orchestrator（调度、路由、配额、唯一 committer） │
-│  pipeline（决定做什么、怎么验收）                 │
-│  validators（确定性 gate、delta.check）           │
-│  runner → nv-shim → harness CLI（detached）       │
-└───────┬───────────────────────────┬───────────────┘
-        ▼                           ▼
-   Postgres（任务、运行、      $DATA/books/<slug>/
-   账号、读者、配额账本）      每本书一个 git 仓库（正典）
-```
-
-一章的流程：
-
-1. `ctx.build` 把卡片、前文、状态账本编译成一个 context pack。
-2. harness 在固定于 `base_commit` 的 git worktree 快照里运行，只往 `out/` 写文件。
-3. 校验器检查 I/O 契约和工艺 gate，不通过就重试或修订。
-4. 模型抽取状态变化（delta），确定性规则核对引文和设定。
-5. 默认的 `standard` 档再跑一次评审。
-6. 编排器 stale check 后提交，并把 commit trailer 作为崩溃恢复的依据。
-
-技术栈：TypeScript（ESM、strict）、Node 24、Fastify 5、drizzle（Postgres；开发和测试用 PGlite）、React 19、Vite 8、Tailwind 4、TanStack Router/Query、CodeMirror 6，pnpm workspace。
-
-隔离档位：`container`（默认）以 Novelist 容器为边界，越界写入随 run 快照丢弃，只收割 `out/`；`bwrap` 仅在启动探测通过时使用；`degraded` 兜底。
-
-## 支持的 harness
-
-| harness | CLI | 认证方式 |
+| 运行 | 何时 | 作者做什么 |
 |---|---|---|
-| Claude Code（`claude-code`） | `claude` | 订阅 OAuth token；自定义 API（`ANTHROPIC_BASE_URL` 加 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`，模型名自定义） |
-| Codex（`codex`） | `codex` | ChatGPT 登录（device-code）；上传 `auth.json`；API key；自定义 provider |
-| Antigravity CLI（`agy`） | `agy` | Google 账号登录；上传 OAuth token 文件；Gemini API key；ADC / Vertex；自定义 Gemini 兼容端点 |
-| Grok Build（`grok`） | `grok` | SuperGrok / X Premium+ 登录（device-code）；上传 `auth.json`；`XAI_API_KEY` |
-| DeepSeek Harness（`dsh`） | `dsh` | `DEEPSEEK_API_KEY` |
-| pi（`pi`） | `pi` | 各家 provider 的 API key；登录后复用 `auth.json` |
-| fake（`fake`） | 内置 | 只用于测试，不调用模型 |
+| **开书** | 新书 | 读种子；写设定（`bible.md`）、全书大纲（`outline.md`，写明结局和计划章数）、笔记，然后直接写正文。短篇一次写完整本，其他篇幅写第一批 |
+| **写作** | 书没写完、存稿没满 | 读笔记和上一章，连续写完一批（默认 5 章，可调 1–8），批末更新笔记。最后一批是结局批 |
+| **复盘** | 长篇和超长篇，每写完 4 批一次 | 通读最近几批，修正笔记和大纲，标出未收线索 |
 
-harness 不打进镜像，在“Harness 与账号”页一键安装到 `/data/harness`。
-
-使用订阅账号时，UI 会显示各家的条款风险说明（例如 agy 的 consumer 订阅），是否使用由你决定。
+- 篇幅四档：短篇（≥1.5 万字）、中篇（≥6 万字）、长篇（≥20 万字）、超长篇（≥50 万字）。字数只是下限，写多了照收；每章不少于 3000 字（可调）。
+- **先收稿，后判断**：运行不管怎么结束（正常、超时、被杀、限流），都先把写好的东西收下；每章一个提交并打标签。
+- 服务器只做数得出来的检查：字数、截断、大段重复、文件在不在。不审稿，不拦内容。
+- 主人运行期间改过的文件以主人为准；主人直接改过的章节会锁定，作者不能再覆盖。
+- 存稿到上限就暂停写这本书；章节入库后满 24 小时（或后面又有章节入库、全书完结）才可发布，按节奏放出。
 
 ## 快速开始（docker compose）
 
@@ -102,58 +61,117 @@ harness 不打进镜像，在“Harness 与账号”页一键安装到 `/data/ha
    cat > .env <<EOF
    NOVELIST_PG_PASSWORD=$(openssl rand -hex 16)
    NOVELIST_MASTER_KEY=$(openssl rand -hex 32)
-   NOVELIST_ADMIN_PASSWORD=换成你自己的密码
+   NOVELIST_ADMIN_PASSWORD=<password>
    EOF
-   mkdir -p data2 && sudo chown -R 10001:10001 data2   # compose 挂载 ./data2:/data；不要动 v1 正在用的 ./data
+   mkdir -p data2 && sudo chown -R 10001:10001 data2   # compose 挂载 ./data2:/data
    docker compose pull
    docker compose up -d
    ```
 
    `novelist2` 数据库不存在时会自动创建。`NOVELIST_ADMIN_PASSWORD` 留空时，首次启动会生成随机密码并打印到日志。**`NOVELIST_MASTER_KEY` 要单独备份**，丢失后已加密的账号凭据无法解密。
 
-3. 打开 `http://<主机>:${NOVELIST_PORT:-8199}`（默认 8199，容器内仍监听 8000），用管理员密码登录，进入 `/admin`：
+3. 打开 `http://<主机>:${NOVELIST_PORT:-8199}`（容器内监听 8000），用管理员密码登录，进入 `/admin`：
+   1. **模型与账号 → Harness 与账号**：安装要用的 harness，添加账号（填 env、上传凭据文件，或者在网页上交互登录）。
+   2. **模型与账号 → 位置与 effort**：确认“写作用的模型”的主用 profile（默认 `agy-argon`，agy + Gemini 4 Argon；模型 slug 以 `agy models` 的列表为准），可选配一个备用；点“试跑”确认能写文件、读到 AGENTS.md。
+   3. **开书**：选题材（或随机）、篇幅（或随机），写一句话想法（可空），点“开书”。
 
-   1. **Harness 与账号**：安装要用的 harness，添加账号（填 env、上传凭据文件，或者用网页交互登录）。
-   2. **路由与 Profile**：确认路由 preset。默认是 `agy-argon`，全部角色走 agy + Gemini 4 Argon。先在这里核对模型 slug（列表来自 `agy models`）。如果只用 Claude Code 接自己的网关，切到 `cc-only` 并改模型名。
-   3. **系统与 Doctor**：查看隔离档和各项探测结果。
-   4. **书 → 新建**：选题材包，设定规模和质量档位，写种子设定，开书。
-   5. **Inbox**：审批总纲和第一卷，之后写作 lane 自动运行。
+## 控制台
 
-## 配置（Web UI）
+导航只有五项：
 
-| 页面 | 配置内容 |
+| 页面 | 内容 |
 |---|---|
-| Harness 与账号 | 安装和探测 harness；账号的 env 变量、凭据文件、网页交互登录；风险说明 |
-| 路由与 Profile | 模型 profile；角色链；preset；开书前的路由可行性检查 |
-| 配额与用量 | 各账号窗口占用率、重置时间、用量账本 |
-| 全局指令 / 题材包 | 全局层和题材层的指令、gates、lexicon、节奏 |
-| 书（新建 / 设置） | 规模（目标字数、卷数、每卷章数、单章长度）；质量档位；路由覆盖；发布计划；预算；opt-in 机制 |
-| 发布排期 | 定时发布、存稿、发布前沿 |
-| 读者 | 只读密码（各自保留阅读进度） |
-| 系统与 Doctor | 隔离档、环境探测、系统设置 |
-| v1 导入 | 从 v1 数据库导入 |
+| 首页 | 待办（平时为空：账号登录失效、harness 不可用、连续空跑、额度长时间耗尽、某本书连续写不出正文……条件消失自动关闭）；每本书一行：书名、题材、篇幅、已写/计划、一句状态、存稿/已发布、累计花费。默认只列在写的书，已完结和旧书另有筛选 |
+| 开书 | 开书表单；自动开书面板（开关、未完结书上限、每日上限、篇幅分布、各篇幅档目标字数、各题材的参与与权重） |
+| 题材与指令 | 每个题材包的自动开书设置（参与、权重、关键词、篇幅倾向）和指令编辑器；全局层编辑器；篇幅档（内置，只读）；根 AGENTS.md 预览 |
+| 模型与账号 | 两个位置（写作 / 杂活）的主备；effort 表；harness 安装、登录、探测；profile；用量 |
+| 系统 | 默认发布节奏与存稿上限、失控兜底、并发、时限、隔离、保留期、读者账号、通知、v1 导入、密码与令牌、Doctor |
 
-书级设置写入该书的 `book.yaml`，合并顺序是书 > 题材 > 全局 > 内置。
+另有书页（概览、章节、故事资料、草稿、花费、指令、设置）、章节页（读、直接改、带意见重写、从这里起重写、立即发布）和运行日志页。书页上的“给作者的话”只用一次，下次运行读到后会标出在哪一批读的。
 
-**路由 preset**：
+系统设置每张卡片只保存自己那一节；别处改过设置时保存会被拒绝，页面重新读取后再改即可。
 
-| preset | 内容 |
-|---|---|
-| `agy-argon`（默认） | 全部角色走 agy + Gemini 4 Argon，模型 slug 可改 |
-| `cc-only` | 全部角色走 Claude Code（订阅或自建网关） |
-| `codex-only` | 全部角色走 Codex |
-| `mixed` | cc 主笔，codex 校验，评审要求与写手不同厂商 |
-| `dev-cheap`、`fake` | 只用于开发测试，不要用来正式写书 |
+## 无人值守
 
-**质量档位**（按书选择）：
+**自动开书默认关闭**，只有主人在开书页上打开开关才会启用。打开后：未完结的书少于上限、写手真的闲着（所有书存稿已满，没有账号在等额度或故障冷却）、没超每日上限时开一本；题材按“自动开过的书数 ÷ 权重”挑，篇幅按分布补缺口。带成人标记的题材包，种子里会保留“所有角色都是成年人”的声明。
 
-| 档位 | 内容 | 每章 run 数（约） |
+出错与等待：有结构化限流信号的 harness 睡到恢复时间，其余按阶梯等待；运行失败又什么都没改的算在账号头上（同一账号连续两次暂停该账号并进待办）；运行正常结束却没写正文的算在书头上（按 10 分钟、30 分钟、2 小时、6 小时、之后每天重试，连续 5 次进待办）。主用 profile 不可用且没有备用时，任务就等。
+
+## 旧书与导入
+
+旧书指导入的书和旧流程写的书（`book.yaml` 里没有 `flow: v3`）。它们**只读**：可以在控制台和阅读器里读（按卷分组，带卷标题）、导出 TXT / EPUB、直接改正文、在 `notes/` 下写批注、删除（移到回收站），不会被排进任何运行，也不会再发布新章。
+
+想续写某一本时，在书页上点 **“接手续写”**：选篇幅、目标字数、每批章数、每章下限。接手只改 `book.yaml`（加上新流程的设置，旧键原样保留），不移动、不删除任何文件；第一次写作先读最后三章和旧设定、补出新流程的笔记，再从下一章接着写。已有章节不会被改写，也不能回退到接手之前；已发布的章节不会重发，新章按新流程的节奏接着发布。
+
+从 v1 导入：
+
+1. 在容器上设置 `NOVELIST_V1_DATABASE_URL=postgresql://novelist:<password>@postgres:5432/novelist`（v1 的库只读，不修改）。
+2. 打开 **系统 → v1 导入**，预览后导入；也可以用 CLI：`novelist import-v1`。
+3. 确认无误后再停掉 v1。
+
+导入内容：题材转成题材包；已完成的章节转入书仓库（卷标题当场回填）；读者密码和阅读进度保留。导入的书都是旧书，不排任何任务。导入可以重复执行，已导入的内容会跳过；上一次没导完的残留目录会移到回收站。
+
+## 升级到这一版（P3）的说明
+
+- **开机迁移**：serve 启动时（只在带 orchestrator 角色的进程里）跑一次迁移，结果写进日志的 `p3 boot migration` 一行，也存在设置 `migration.p3` 里：
+  - 统计新流程的书和旧书；`book.yaml` 和数据库对不上的只列出来，不自动改；
+  - 取消旧种类的任务和旧书的任务，关闭旧流程留下的待办（审批、暂扣、熔断……）；
+  - 从旧路由 preset 换算出两个位置（写作 / 杂活）；旧 preset 里已经不存在的 profile 会被丢掉，并在模型与账号页上提示。旧 preset 的写手是“粘住、不可用就等”的，所以写作位置不会自动配上备用（需要的话在模型与账号页上自己配）；
+  - 给旧书的章节回填卷标题（从 `plan/volumes/*.yaml`）；仓库读不出来的书下次启动再试；
+  - 之后（崩溃恢复完成后）把升级前就是新流程的书上旧的写作模型覆盖搬进 `book.yaml` 的 `routing.writer_profile`；当时正在写的书等这一批写完再搬（每分钟重试），在那之前照旧用原来的写手。接手过来的旧书不搬：旧流程留下的写手不算主人的选择。
+
+  迁移不删任何行、文件或设置，也不碰自动开书开关。
+- **删书进回收站**：删除的书目录移到 `$DATA/trash/books/<slug>-<时间>/`，里面的 `.novelist-trash.json` 记着删除时间和数据库里原来的样子；回收站从不自动清理。要恢复，把目录移回 `$DATA/books/<slug>/`，按墓碑里的信息重建这本书的数据库行，再执行 `novelist reindex <slug>` 重建章节索引。
+- **书级预算**（优先级、每月花费上限、额度窗口上限）照旧生效，现在在新流程书页的“设置”里改。
+- **账号的“配额预留 %”和“周用量上限 %”已删除**（随配额预留一起），页面上不再出现，存着的值不再起作用；账号的每月美元上限照旧生效。要限制用量，用书级预算的额度窗口上限。
+- **篇幅档的内置指引在这一版只能查看、不能改**（题材与指令 → 篇幅档）。想给某一档加要求，写在能改的层里：题材包的 `AGENTS.md`，或者某本书的 `instructions/AGENTS.md`（例如“本书是长篇：……”）；全局层对所有篇幅都生效。让篇幅档可编辑需要在指令栈里多加一层，留待主人决定。
+- **回滚**：上一版镜像可以直接对同一个数据库启动（这一版只加列、加设置行，不删表、不删列；运行中的会话两版都读得懂）。上一版不认识两个位置，会继续按旧的 `routing.active` 路由；它运行期间如果又给旧书建了任务或待办，再换回这一版时开机迁移会重新取消、关闭。
+
+## 书房结构
+
+每本书是 `$DATA/books/<slug>/` 下的一个 git 仓库：
+
+```
+<slug>/
+├── AGENTS.md            服务器拼出的指令（每次运行前生成，不入库）
+├── ORDER.md             本次任务单（不入库）
+├── book.yaml            服务器配置：篇幅档、目标字数、计划章数、每章下限、每批章数、发布、模型覆盖
+├── seed.md              种子
+├── bible.md             设定：书名、一句话、标签；人物、世界、文风、结局方向
+├── outline.md           全书骨架（写明结局）、计划章数、接下来几章的细纲
+├── notes/               progress.md、chapters.md（每章一行）、cast.md、threads.md、from-owner.md、retro.md、archive/
+├── instructions/        你的本书指令（AGENTS.md）
+├── drafts/              没写完的残稿、作者擅自改写的旧章（可在书页一键采用）
+└── manuscript/          正文：c00001.md …
+```
+
+旧书保留它们原来的目录（`bible/`、`plan/`、`notes/v1/` 等），接手后也原样留着。
+
+## 指令分层
+
+服务器把各层按顺序拼成书房根目录的 `AGENTS.md`：内置约定 → 篇幅档的写作要领 → 全局（`$DATA/instructions/global/AGENTS.md`）→ 题材（`$DATA/genres/<id>/AGENTS.md`）→ 本书（`<book>/instructions/AGENTS.md`）。后面的优先，本书层最高。Claude Code 另有一行 `@AGENTS.md` 的 `CLAUDE.md`。
+
+指令内容归你所有：Novelist 只拼接，不改写、不过滤。总长上限 16 KB，保存超了直接拒绝并显示各层字数，运行时绝不截断。可以用独占一行的 `<!-- nv:include relative/path.md -->` 引入其他文件。启动命令只有一句“阅读 AGENTS.md 和 ORDER.md 并执行”。
+
+## 支持的 harness
+
+| harness | CLI | 认证方式 |
 |---|---|---|
-| `lean` / `lite` | 写手 + 确定性 gates + 一次 check | 2.3–2.5 |
-| `standard`（默认） | 写手 + 抽取 + 评审 + 修订 + 摘要 | 4–5 |
-| `key` | 完整评审 panel，一般只给关键章开 | 10–14 |
+| Claude Code（`claude-code`） | `claude` | 订阅 OAuth token；自定义 API（`ANTHROPIC_BASE_URL` 加 `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`，模型名自定义） |
+| Codex（`codex`） | `codex` | ChatGPT 登录（device-code）；上传 `auth.json`；API key；自定义 provider |
+| Antigravity CLI（`agy`） | `agy` | Google 账号登录；上传 OAuth token 文件；Gemini API key；ADC / Vertex；自定义 Gemini 兼容端点 |
+| Grok Build（`grok`） | `grok` | SuperGrok / X Premium+ 登录（device-code）；上传 `auth.json`；`XAI_API_KEY` |
+| DeepSeek Harness（`dsh`） | `dsh` | `DEEPSEEK_API_KEY` |
+| pi（`pi`） | `pi` | 各家 provider 的 API key；登录后复用 `auth.json` |
+| fake（`fake`） | 内置 | 只用于测试，不调用模型 |
 
-少量启动参数仍然走环境变量：
+harness 不打进镜像，在“模型与账号”页一键安装到 `/data/harness`。使用订阅账号时，UI 会显示各家的条款风险说明，是否使用由你决定。
+
+隔离档位：`container`（默认）以 Novelist 容器为边界；`bwrap` 仅在启动探测通过时使用；`degraded` 兜底。每次运行在书仓库当前版本的一份独立副本里进行。
+
+## 环境变量
+
+配置都在网页上，少量启动参数走环境变量：
 
 | 变量 | 说明 |
 |---|---|
@@ -165,49 +183,7 @@ harness 不打进镜像，在“Harness 与账号”页一键安装到 `/data/ha
 | `NOVELIST_ISOLATION` | `auto`（默认）、`container`、`bwrap`、`landlock`、`degraded` |
 | `NOVELIST_TRUST_PROXY` | 信任的反向代理网段（CIDR 或别名，逗号分隔），默认 `loopback,uniquelocal`；`1`/`true` 等同默认值，`0`/`false` 关闭 |
 | `NOVELIST_INSECURE_COOKIES` | 局域网 http 访问时设为 `true` |
-
-完整列表见 [`docs/v2/IMPL.md`](./docs/v2/IMPL.md) §7。
-
-## 指令分层
-
-指令文件完全由你掌控，Novelist 只加载，不改写、不过滤、不做摘要。每个角色（包括评审）都加载全部作者层。
-
-| 序 | 层 | 位置 |
-|---|---|---|
-| S0 | 内置 I/O 契约（只讲文件机制） | 内置 |
-| S1 | 内置角色人设（可覆盖的默认值） | 内置 |
-| L1 | 全局 | `$DATA/instructions/global/AGENTS.md`、`roles/<role>.md`、`tasks/<kind>.md` |
-| L2 | 题材包 | `$DATA/genres/<id>/AGENTS.md`、`roles/<role>.md` |
-| L3 | 书 | `<book>/instructions/AGENTS.md`、`roles/<role>.md`、`tasks/<kind>.md` |
-| L3.9 | 本章笔记、Inbox 重写笔记 | 卡片 `notes`、Inbox |
-
-- 后出现的层覆盖先出现的，**最后一个作者块永远来自书层或本章笔记**，有 golden test 保证。
-- 角色文件以 `@extends` 开头表示追加，否则替换下层的同名角色。
-- 用独占一行的 `<!-- nv:include relative/path.md -->` 引入其他文件。
-- 每层带首尾 nonce，验证指令被完整加载。
-- 管理台可以按 harness 预览 agent 实际看到的内容。
-
-**agent 始终把产物写到文件**（`out/` 下的正文、delta、receipt），stdout 只作遥测。文件机制（S0）是唯一不可覆盖的部分；长度、标记、重复、lexicon 等工艺规则都定义在题材层和书层，可以逐条关闭或调整。
-
-## 书库结构
-
-每本书是 `$DATA/books/<slug>/` 下的一个 git 仓库：
-
-```
-<slug>/
-├── book.yaml            书的配置：题材、规模、档位、路由覆盖、发布计划
-├── instructions/        你的书层指令（AGENTS.md、roles/、tasks/、skills/）
-├── style/               文风：voice.md、samples/、lexicon.yaml
-├── bible/               设定：premise、世界观、实体、秘密
-├── plan/                规划：compass、volumes/、arcs/、cards/
-├── state/               正典：ledger/（每章 delta）、overrides.jsonl
-├── manuscript/          正文：c00421.md
-├── summaries/           弧、卷、全书摘要
-├── reviews/  audits/    评审与审计结果
-└── work/ views/ .index/ 中间产物、派生视图和索引（不入库，可重建）
-```
-
-根目录的 `AGENTS.md` 由 Novelist 生成，你的指令写在 `instructions/AGENTS.md`。完整结构见 [DESIGN §4](./docs/v2/DESIGN.md#4-书库布局)。
+| `NOVELIST_FAKE_HARNESS` | 开发用：两个位置都走 fake harness，不调用模型 |
 
 ## 开发
 
@@ -219,43 +195,32 @@ pnpm --filter @novelist/server dev   # 后端，默认用 PGlite，不需要 Pos
 pnpm --filter @novelist/web dev      # 前端 http://localhost:5173，/api 代理到 8000
 ```
 
-没有 harness 时，设 `NOVELIST_FAKE_HARNESS=1`，全部角色都会走 fake adapter，可以不调用模型跑通整个流程（fake 账号和路由会自动配置）。
+没有 harness 时设 `NOVELIST_FAKE_HARNESS=1`：fake harness 照任务单改目录（带故障开关：空跑、短章、截断、放错目录、改旧章、不记笔记、写一半被杀），可以不调用模型跑通整个流程。
 
 ```
-apps/server/      后端：api、orchestrator、pipeline、harness、validators、book、state、context、instructions、genres
+apps/server/      后端：api、orchestrator、runtime、flow（决定下一步、任务单、收稿与检查）、harness、book、instructions、genres、boot
 apps/web/         前端：阅读器与管理台
-packages/shared/  zod schema、类型、API DTO、内置 preset
+packages/shared/  zod schema、类型、API DTO、内置 profile
 legacy/v1/        v1 代码，只读参考
 ```
 
-CLI：`novelist serve | migrate | doctor | book new/status/run | import-v1 | harness install/probe | routing check | reindex`。
+CLI：`novelist serve | migrate | doctor | book new/status/run/takeover | import-v1 | harness install/probe | routing slots | reindex | secrets | backup | restore`。
 
 ## 测试
 
 ```bash
 pnpm -r typecheck
 pnpm -r test                               # 全部测试
-pnpm --filter @novelist/server test        # 只跑后端
+pnpm --filter @novelist/server test        # 只跑后端（含 test/e2e.*：进程内的流程、结局、旧书接手，和真实 serve 子进程的崩溃恢复）
 npx biome lint .
 ```
 
-测试只用 fake harness 和内存 PGlite，不需要 Postgres，也不调用模型。设 `NOVELIST_LIVE_TESTS=1` 时才会调用真实 CLI，并且只允许用测试用的廉价模型（`claude-haiku-5-5`、`gpt-6-luna`、`gemini-3.8-flash-low`）。这些廉价模型不是任何正式 preset 的默认值。
-
-## 从 v1 迁移
-
-v2 和 v1 可以共用一个 Postgres：v2 用新库 `novelist2`，v1 的库 `novelist` 只读取，不修改。
-
-1. 在 v2 容器上设置 `NOVELIST_V1_DATABASE_URL=postgresql://novelist:<密码>@postgres:5432/novelist`。
-2. 打开 `/admin/import`，预览后导入，也可以用 CLI：`novelist import-v1`。
-3. 确认无误后再停掉 v1。
-
-导入内容：题材转成题材包；已完成的章节转入书仓库；读者密码和阅读进度保留（读者首次登录时重新计算密码 hash）。已完结的书归档只读，未完结的书暂停。未完成的章节默认丢弃，并在报告里列出。导入可以重复执行，已导入的内容会跳过。
+测试只用 fake harness 和内存 PGlite，不需要 Postgres，也不调用模型。设 `NOVELIST_LIVE_TESTS=1` 时才会调用真实 CLI，并且只允许用测试用的廉价模型（`claude-haiku-5-5`、`gpt-6-luna`、`gemini-3.8-flash-low`）。
 
 ## 文档
 
-- [`docs/v2/DESIGN.md`](./docs/v2/DESIGN.md)：架构设计与用户决策记录
-- [`docs/v2/IMPL.md`](./docs/v2/IMPL.md)：实现契约、模块归属、环境变量、API 路由
-- [`docs/v2/research/`](./docs/v2/research)：各 harness 调研
+- [`docs/v3/DESIGN.md`](./docs/v3/DESIGN.md)：现行设计（流程与交互）
+- [`docs/v2/`](./docs/v2)：Novelist 2 的历史文档（旧流水线），只作参考
 
 ## License
 

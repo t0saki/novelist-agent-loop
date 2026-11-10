@@ -2,8 +2,8 @@
  * v3 逐章检查（docs/v3/DESIGN.md §3.3；p1-plan §2.7）。纯函数：只做数得出来的检查——空、截断、和别的章大段逐字重复、字数下限。
  */
 import { countCjk, parseChapterHeading } from '@novelist/shared';
-import { checkTruncation } from '../validators/truncation.js';
-import { stripForRepeat } from '../validators/util.js';
+import { checkTruncation } from './truncation.js';
+import { stripForRepeat } from './repeat.js';
 import { END_MARKER_RE } from './contract.js';
 
 export type ChapterFail = 'empty' | 'truncated' | 'duplicate';

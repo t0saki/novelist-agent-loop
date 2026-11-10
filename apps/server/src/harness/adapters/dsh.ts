@@ -17,7 +17,7 @@ import { stringify as yamlStringify } from 'yaml';
 import { buildOutcome, classifyText } from '../classify.js';
 import { errorEvent, ndjsonParser, num, obj, optNum, str } from '../events.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, RunSpec, StreamParser } from '../types.js';
-import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, standardProbe, toolCallEvent, toolKindOf } from './common.js';
+import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, standardProbe, toolCallEvent, toolKindOf } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'none',
@@ -45,14 +45,14 @@ const EFFORTS = ['off', 'low', 'high', 'max'];
 const DENY_EXTRA = [/^--permission-mode/, /^--approval-policy/, /^--add-dir/, /^--profile/];
 
 /** adapter 自己的 patch 层：模型、关闭 session-log 上传、关闭子代理/团队/workflow（行名取自 base bundle） */
-export function dshAdapterPatch(spec: Pick<RunSpec, 'model' | 'effort' | 'subagents'>): string {
+export function dshAdapterPatch(spec: Pick<RunSpec, 'model' | 'effort'>): string {
   const rows: Record<string, unknown>[] = [];
   const modelCfg: Record<string, unknown> = { provider: 'deepseek-official', model: spec.model };
   const eff = spec.effort && EFFORTS.includes(spec.effort) ? spec.effort : undefined;
   if (eff) modelCfg.reasoningEffort = eff;
   rows.push({ id: 'agent-default-model', config: modelCfg });
   rows.push({ id: 'session-log-deepseek', disabled: true });
-  if (!spec.subagents) for (const id of ['tool-subagent', 'tool-subagent-fork', 'tool-agent-team', 'tool-workflow']) rows.push({ id, disabled: true });
+  for (const id of ['tool-subagent', 'tool-subagent-fork', 'tool-agent-team', 'tool-workflow']) rows.push({ id, disabled: true });
   return `# Novelist 每 run 生成（dsh adapter 层）\n${yamlStringify(rows)}`;
 }
 
@@ -183,18 +183,17 @@ export const dshAdapter: HarnessAdapter = {
       env: { HOME: acct.home, DSH_HOME: DH, DSH_TELEMETRY_MODE: 'DISABLED', npm_config_offline: 'true' },
     };
   },
-  materialize: (spec, compiled, caps, ctx) => materializeVia('dsh', spec, compiled, caps, ctx?.home),
-  buildInvocation(spec, _caps, home, mat, acct, inst) {
+  buildInvocation(spec, _caps, home, acct, inst) {
     if (!acct.secretEnv.DEEPSEEK_API_KEY) throw authConfigError('dsh 需要 DEEPSEEK_API_KEY（在账号页配置）');
     void effortOf;
     const adapterPatch = home.configFiles.find((f) => f.path.endsWith('dsh.adapter.patch.yml'))!;
-    // 启动器 flag 在前：--profile、--patch（adapter 层先，lane C 的 persona 层后 → 后者优先）
-    const argv = [inst.binPath, '--profile', 'headless', '--patch', adapterPatch.path, ...mat.argv];
+    // 启动器 flag 在前：--profile、--patch（adapter 层）；指令在 cwd 的 AGENTS.md
+    const argv = [inst.binPath, '--profile', 'headless', '--patch', adapterPatch.path];
     argv.push('--json', '--permission-mode', 'danger-full-access', '--approval-policy', 'never');
     if (spec.session.mode === 'resume') argv.push('--session-id', spec.session.id);
     argv.push(...filterExtraArgs(spec.extraArgs, DENY_EXTRA));
     argv.push('-');
-    const env = buildEnv(spec, inst, acct.secretEnv, home.env, mat.env);
+    const env = buildEnv(spec, inst, acct.secretEnv, home.env);
     return invocation(spec, argv, env, { file: spec.workOrderFile }, [
       { signal: 'SIGINT', graceMs: 15_000 },
       { signal: 'SIGTERM', graceMs: 15_000 },

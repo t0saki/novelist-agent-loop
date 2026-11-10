@@ -1,6 +1,6 @@
 /**
  * 真实 CLI 冒烟测试（opt-in）：NOVELIST_REAL_HARNESS=1 或 NOVELIST_LIVE_TESTS=1 时才运行。
- * 每个 harness 用最便宜的 dev 模型跑一次 canary：写一个文件 + 一个 receipt。
+ * 每个 harness 用最便宜的 dev 模型跑一次目录探测（runDirectoryCanary）：照 ORDER.md 写 canary.txt，并带回 AGENTS.md 里的暗号。
  *
  * 凭据取本机已登录的 CLI，绝不打印：
  * - claude：access token 作为 CLAUDE_CODE_OAUTH_TOKEN 传入临时 home（不刷新、不碰 ~/.claude）；cc 用 --setting-sources project 隔离用户 hooks。
@@ -8,7 +8,7 @@
  * - codex：adapter 每 run 重写 config.toml，所以不能软链 ~/.codex；用 custom_api 模式，
  *   base_url 取自 ~/.codex/config.toml 的当前 provider，key 取自 ~/.codex/auth.json。
  *
- * 走真实的 materializeFor（system.md → 各 harness 的系统通道）。
+ * 指令走书快照根的 AGENTS.md / CLAUDE.md（目录契约），不走任何系统通道。
  * 用法（必须经 safe-run，逐个跑）：NOVELIST_REAL_HARNESS=1 vitest run src/harness/real.test.ts -t claude-code
  */
 import fs from 'node:fs/promises';
@@ -95,16 +95,13 @@ describe.skipIf(!ENABLED)('真实 harness canary', () => {
     ['agy', true],
   ] as [HarnessId, boolean][])(
     '%s',
-    async (harness, expectNonces) => {
+    async (harness, expectAgents) => {
       const caps = await canary(harness);
       const text = report(caps);
       const step = (n: string) => caps.probeSteps.find((s) => s.step === n);
       expect(step('canary.run')?.ok, text).toBe(true);
       expect(step('canary.write')?.ok, text).toBe(true);
-      expect(step('canary.receipt')?.ok, text).toBe(true);
-      // 真实模型可能多写文件，这里要求 home 配置未被改动
-      expect(step('canary.audit')?.detail, text).not.toContain('改动：/');
-      if (expectNonces) expect(step('canary.nonce')?.ok, text).toBe(true);
+      if (expectAgents) expect(step('canary.agents')?.ok, text).toBe(true);
       expect(caps.eventTypesSeen).toEqual(expect.arrayContaining(['init', 'result']));
       expect(caps.models.length).toBeGreaterThan(0);
     },

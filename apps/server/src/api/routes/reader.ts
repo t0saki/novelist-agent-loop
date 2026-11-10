@@ -9,7 +9,7 @@ import type { AppDeps } from '../../app.js';
 import { bookFiles, openRepo } from '../../book/index.js';
 import { books, chapters, readers, readingProgress } from '../../db/schema.js';
 import { collectManuscripts } from '../../services/books.js';
-import { buildEpub, buildTxt, collectExport } from '../../services/export.js';
+import { assertBookDir, buildEpub, buildTxt, collectExport } from '../../services/export.js';
 import { loadSystemSettings } from '../../orchestrator/index.js';
 import { bookBySlug, bookDir, type BookRow, parseBody } from '../helpers.js';
 import { HttpProblem, badRequest, notFound } from '../problem.js';
@@ -103,13 +103,12 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const card = cards[0];
     if (!card) throw notFound(`书 ${book.slug} `);
     const rows = await deps.db.select().from(chapters).where(and(eq(chapters.bookId, book.id), isNotNull(chapters.publishedAt))).orderBy(asc(chapters.no));
-    const volumes = await bookFiles(openRepo(bookDir(deps, book.slug))).volumes().catch(() => []);
-    const titles = new Map(volumes.map((v) => [v.id, v.title]));
+    // 卷标题来自 chapters.volume_title（旧书在开机迁移 / 导入时从 plan/volumes 回填）；没有标题就显示卷 id
     const grouped: ReaderVolume[] = [];
     for (const c of rows) {
       let g = grouped[grouped.length - 1];
       if (!g || g.id !== c.volume) {
-        g = { id: c.volume, title: titles.get(c.volume) ?? c.volume, chapters: [] };
+        g = { id: c.volume, title: c.volumeTitle || c.volume, chapters: [] };
         grouped.push(g);
       }
       g.chapters.push({ no: c.no, id: c.chapterId, title: c.title, cjk: c.cjk, publishedAt: c.publishedAt as string });
@@ -124,6 +123,7 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const rows = await deps.db.select().from(chapters).where(and(eq(chapters.bookId, book.id), eq(chapters.no, no))).limit(1);
     const row = rows[0];
     if (!row?.publishedAt) throw notFound(`第 ${no} 章`);
+    await assertBookDir(deps, book.slug);
     const repo = openRepo(bookDir(deps, book.slug));
     // v3 书的首行是“# 第N章 标题”（标题另有字段），读者端去掉；v2 和导入的书保持原样
     const v3 = (await bookFiles(repo).config().catch(() => null))?.config.flow === 'v3';
@@ -131,13 +131,12 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     if (text === undefined) throw notFound(`第 ${no} 章正文`);
     const neighbors = await deps.db.select({ no: chapters.no }).from(chapters).where(and(eq(chapters.bookId, book.id), isNotNull(chapters.publishedAt))).orderBy(asc(chapters.no));
     const idx = neighbors.findIndex((n) => n.no === no);
-    const volume = row.volume ? await bookFiles(openRepo(bookDir(deps, book.slug))).volume(row.volume).catch(() => null) : null;
     return {
       slug: book.slug,
       no,
       id: row.chapterId,
       title: row.title,
-      volumeTitle: volume?.title ?? row.volume,
+      volumeTitle: row.volumeTitle || row.volume,
       text,
       cjk: row.cjk,
       publishedAt: row.publishedAt,

@@ -8,7 +8,6 @@
  * config.toml 的 `memories.enabled` 是未知字段（--strict-config 报错，不写）；`agents.enabled`、`web_search`、`[features] multi_agent` 合法。
  * 事件：thread.started / turn.started / item.{started,updated,completed} / turn.completed{usage} / turn.failed / error。
  */
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { AuthMethodSpec, NEvent, NEventBody } from '@novelist/shared';
 import { RISK_NOTES } from '@novelist/shared';
@@ -18,7 +17,7 @@ import { arr, errorEvent, ndjsonParser, num, obj, str } from '../events.js';
 import { runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, RunSpec, StreamParser } from '../types.js';
 import { isInside } from '../util.js';
-import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, minimalEnv, standardProbe, toolCallEvent, wantsSchema } from './common.js';
+import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, minimalEnv, standardProbe, toolCallEvent } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'native',
@@ -72,45 +71,6 @@ export function codexConfigToml(acctEnv: Record<string, string>, authMode: strin
   }
   cfg.features = { image_generation: false };
   return `# Novelist 每 run 生成；run 后 hash 校验，请勿手改\n${tomlStringify(cfg)}\n`;
-}
-
-/** 严格模式不接受的关键字（本机自定义 provider 实测 propertyNames 报 invalid_json_schema） */
-const STRICT_UNSUPPORTED = ['$schema', 'propertyNames', 'patternProperties', 'unevaluatedProperties', 'minProperties', 'maxProperties', 'default'];
-
-function isFreeFormObject(n: Record<string, unknown>): boolean {
-  const type = n.type;
-  const isObj = type === 'object' || (Array.isArray(type) && type.includes('object'));
-  const ap = n.additionalProperties;
-  return isObj && n.properties === undefined && (ap === true || (typeof ap === 'object' && ap !== null));
-}
-
-function strictNode(node: unknown): unknown {
-  if (Array.isArray(node)) return node.map(strictNode);
-  if (typeof node !== 'object' || node === null) return node;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(node)) if (!STRICT_UNSUPPORTED.includes(k)) out[k] = k === 'properties' ? v : strictNode(v);
-  if (isFreeFormObject(out)) return { ...out, properties: {}, required: [], additionalProperties: false };
-  if (out.properties && typeof out.properties === 'object') {
-    const props: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(out.properties as Record<string, unknown>)) {
-      // 自由键的 record 在严格模式下无法表达：从 schema 中去掉（receipt.json 文件才是权威产物，这里只是遥测）
-      if (typeof v === 'object' && v !== null && isFreeFormObject(v as Record<string, unknown>)) continue;
-      props[k] = strictNode(v);
-    }
-    out.properties = props;
-    out.required = Object.keys(props);
-    out.additionalProperties = false;
-  }
-  return out;
-}
-
-/** 把 receipt schema 收窄成 codex --output-schema 能接受的严格子集；非法 JSON 返回 null */
-export function codexOutputSchema(raw: string): string | null {
-  try {
-    return JSON.stringify(strictNode(JSON.parse(raw)), null, 2);
-  } catch {
-    return null;
-  }
 }
 
 export function createCodexParser(spec: Pick<RunSpec, 'outDir'>): StreamParser {
@@ -306,40 +266,33 @@ export const codexAdapter: HarnessAdapter = {
   async prepareHome(acct, _inst, spec): Promise<HomeLayout> {
     const H = acct.home;
     const CH = path.join(H, '.codex');
-    // v3 没有回执 schema
-    const rawSchema = spec.contract === 'v3' ? null : await fs.readFile(spec.receiptSchemaFile, 'utf8').catch(() => null);
-    const schema = rawSchema === null ? null : codexOutputSchema(rawSchema);
     return {
       home: H,
-      configFiles: [{ path: path.join(CH, 'config.toml'), content: codexConfigToml(acct.secretEnv, acct.authMode) }, ...(schema ? [{ path: path.join(spec.inDir, 'receipt.codex.json'), content: schema }] : [])],
+      configFiles: [{ path: path.join(CH, 'config.toml'), content: codexConfigToml(acct.secretEnv, acct.authMode) }],
       stateDirs: [CH],
       env: { HOME: H, CODEX_HOME: CH },
     };
   },
-  materialize: (spec, compiled, caps, ctx) => materializeVia('codex', spec, compiled, caps, ctx?.home),
-  buildInvocation(spec, caps, home, mat, acct, inst) {
+  buildInvocation(spec, _caps, home, acct, inst) {
     checkAuthEnv(acct.authMode, acct.secretEnv);
     // resume/fork 子命令没有 --color/-C：flag 放在子命令之后（研究文档实测形态），cwd 由 Invocation.cwd 保证
     const sub = spec.session.mode === 'fresh' ? null : spec.session.mode === 'fork' ? 'fork' : 'resume';
     const opts: string[] = ['--json', '--skip-git-repo-check', '-m', spec.model];
     if (!sub) opts.push('--color', 'never', '-C', spec.bookDir);
-    // 每 run 的配置差异：工作目录信任 + 子 agent 开关（config.toml 账号级共享，不能放那里）
+    // 每 run 的配置差异：工作目录信任 + 关掉子 agent（config.toml 账号级共享，不能放那里）
     // -c 的键路径按 . 切分且不识别引号（实测 0.165.0：projects."<dir>".x 不生效，路径含点时裸写也不生效），只能用内联表
     opts.push('-c', `projects={${JSON.stringify(spec.bookDir)}={trust_level="trusted"}}`);
-    if (!spec.subagents) opts.push('-c', 'agents.enabled=false', '-c', 'features.multi_agent=false');
+    opts.push('-c', 'agents.enabled=false', '-c', 'features.multi_agent=false');
     const eff = effortOf(spec, EFFORTS);
     if (eff) opts.push('-c', `model_reasoning_effort="${eff}"`);
-    opts.push(...mat.argv);
     opts.push('--dangerously-bypass-approvals-and-sandbox');
-    const outputSchema = home.configFiles.find((f) => f.path.endsWith('receipt.codex.json'));
-    if (wantsSchema(spec, caps) && outputSchema) opts.push('--output-schema', outputSchema.path);
     opts.push('-o', path.join(spec.logDir, 'last-message.json'));
     if (!spec.persistSession) opts.push('--ephemeral');
     opts.push(...filterExtraArgs(spec.extraArgs, DENY_EXTRA));
     const argv = [inst.binPath, 'exec', ...(sub ? [sub] : []), ...opts, ...(sub ? [spec.session.id] : []), '-'];
     const acctEnv = { ...acct.secretEnv };
     if (acct.authMode !== 'api_key') delete acctEnv.CODEX_API_KEY;
-    const env = buildEnv(spec, inst, acctEnv, home.env, mat.env);
+    const env = buildEnv(spec, inst, acctEnv, home.env);
     return invocation(spec, argv, env, { file: spec.workOrderFile }, [
       { signal: 'SIGINT', graceMs: 10_000 },
       { signal: 'SIGTERM', graceMs: 10_000 },

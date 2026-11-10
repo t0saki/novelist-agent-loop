@@ -5,7 +5,7 @@ import { books, chapters, tasks } from '../db/schema.js';
 import type { BookRepo } from '../book/repo.js';
 import { git } from '../book/git.js';
 import { TRAILER } from '../book/trailers.js';
-import type { PromotePlan, TaskRow } from '../pipeline/types.js';
+import type { PromotePlan, TaskRow } from '../runtime/types.js';
 import { lockChapter, readV3Meta } from '../flow/state.js';
 import { chapterText } from '../flow/testing.js';
 import { addV3Book } from '../flow/testing-book.js';

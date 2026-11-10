@@ -1,3 +1,5 @@
+> 历史文档（Novelist 2）。现行设计见 [docs/v3/DESIGN.md](../v3/DESIGN.md)。
+
 
 # Novelist 2.0 架构设计（修订定稿）
 

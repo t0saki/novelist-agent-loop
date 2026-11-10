@@ -5,7 +5,7 @@
  * 文件约定（$RUN = spec.runDir）：
  *   $RUN/in/spec.json      ShimSpec（env 已去除秘密）
  *   $RUN/log/.secret-env.json  0600，shim 读后删除
- *   $RUN/log/run.json      审计输入（home 配置 hash、声明产物 glob、argv 预览）——reattach 用
+ *   $RUN/log/run.json      审计输入（home 配置 hash、argv 预览）——reattach 用
  *   $RUN/log/{stdout.ndjson,stderr.log,pid,exit.json,heartbeat,kill,shim.log}
  * 事件 seq 从 1 开始、由 stdout 内容确定性地导出：reattach 时重新解析整个 stdout，跳过 seq ≤ fromSeq 的事件。
  */
@@ -16,8 +16,6 @@ import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 import type { Capabilities, ErrorClass, HarnessInstall, IsolationBackend, NEvent, Outcome } from '@novelist/shared';
-import { parse as parseYaml } from 'yaml';
-import type { CompiledInstructions } from '../instructions/types.js';
 import { stamp } from './events.js';
 import { isAllowed, mountPlanFor, postRunAudit, wrapInvocation } from './isolation.js';
 import { KILL_FILE, type ShimExit, type ShimPidInfo, type ShimSpec } from './shim/spec.js';
@@ -31,7 +29,6 @@ export interface PreparedRun {
   install: HarnessInstall;
   caps: Capabilities;
   isolation: IsolationBackend;
-  compiled: CompiledInstructions;
 }
 
 export interface RunEventSink {
@@ -58,17 +55,17 @@ export interface RunResult {
   eventCount: number;
   /** 归一化事件里 t === 'tool_call' 的个数（整个 stdout，reattach 时也从头数） */
   toolSteps: number;
-  /** run 后审计结果（isolation.postRunAudit） */
+  /** run 后审计结果（isolation.postRunAudit：只查 home 配置文件没被改；extraFiles 恒为 []） */
   audit: { ok: boolean; extraFiles: string[]; tamperedConfig: string[] };
   /** 原始 stdout 文件（zstd 归档由清理任务负责） */
   stdoutFile: string;
   stderrTail: string;
 }
 
-/** 启动前就失败（不消耗 attempt 的配置类问题）。code=budget → 该 profile 不可承载，avoidProfile 后重路由 */
+/** 启动前就失败（配置类问题） */
 export class RunPrepareError extends Error {
   readonly errorClass: ErrorClass;
-  readonly code: 'budget' | 'not_allowed' | 'missing_file' | 'auth_config' | 'spawn';
+  readonly code: 'not_allowed' | 'missing_file' | 'auth_config' | 'spawn';
   constructor(errorClass: ErrorClass, code: RunPrepareError['code'], message: string) {
     super(message);
     this.name = 'RunPrepareError';
@@ -83,6 +80,7 @@ interface RunMeta {
   harness: string;
   isolation: IsolationBackend;
   outDir: string;
+  /** 旧契约的声明产物 glob；恒为 []（旧 run.json 里可能还有值，不再读） */
   declaredGlobs: string[];
   homeConfigHashes: Record<string, string>;
   argvPreview: string[];
@@ -129,22 +127,6 @@ export function shimScriptPath(): string {
   throw new Error('nv-shim script not found');
 }
 
-/** 从 work order frontmatter 取声明产物 glob（+ receipt.json 总是允许） */
-export async function declaredArtifactGlobs(workOrderFile: string): Promise<string[]> {
-  const globs = new Set<string>(['receipt.json']);
-  try {
-    const text = await fs.readFile(workOrderFile, 'utf8');
-    const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-    if (m) {
-      const fm = parseYaml(m[1]!) as { artifacts?: { path?: string }[] } | null;
-      for (const a of fm?.artifacts ?? []) if (a?.path) globs.add(a.path);
-    }
-  } catch {
-    /* 没有 frontmatter：只允许 receipt */
-  }
-  return [...globs];
-}
-
 /** 秘密值集合：账号 secretEnv 全部 + invocation env 中名字像秘密的值 */
 function secretValues(inv: Invocation, acct: ResolvedAccount): Set<string> {
   const s = new Set<string>();
@@ -155,7 +137,7 @@ function secretValues(inv: Invocation, acct: ResolvedAccount): Set<string> {
   return s;
 }
 
-/** spawn 前再检查一次 argv / stdin 引用的 $RUN/in 文件存在（§3.1：agy --json-schema、pi --append-system-prompt 文件缺失会被当字面文本） */
+/** spawn 前再检查一次 argv / stdin 引用的 $RUN/in 文件存在（文件缺失会被当字面文本） */
 export function checkReferencedFiles(inv: Invocation, spec: RunSpec): string[] {
   const missing: string[] = [];
   const check = (p: string) => {
@@ -175,11 +157,12 @@ async function writeFiles(files: { path: string; content: string; mode?: number 
 }
 
 /**
- * 完整准备并启动：adapter.prepareHome → adapter.materialize → buildInvocation → isolation.wrapInvocation
- * → 写 $RUN/in/spec.json → 再次检查 argv 引用的文件存在（§3.1）→ detached 启动 nv-shim。
+ * 完整准备并启动：adapter.prepareHome → buildInvocation → isolation.wrapInvocation
+ * → 写 $RUN/in/spec.json → 再次检查 argv 引用的文件存在 → detached 启动 nv-shim。
+ * 指令在书快照根目录的 AGENTS.md / CLAUDE.md（executor 写好），这里不再物化任何 system channel。
  */
 export async function startRun(p: PreparedRun, sink: RunEventSink): Promise<RunHandle> {
-  const { spec, adapter, account, install, caps, isolation, compiled } = p;
+  const { spec, adapter, account, install, caps, isolation } = p;
   const lf = logFiles(spec.logDir);
   for (const d of [spec.inDir, spec.logDir, spec.outDir]) await fs.mkdir(d, { recursive: true });
 
@@ -187,12 +170,8 @@ export async function startRun(p: PreparedRun, sink: RunEventSink): Promise<RunH
   if (!gate.ok) throw new RunPrepareError('sandbox', 'not_allowed', gate.reason ?? `${spec.harness} 不允许在 ${isolation} 档运行`);
 
   const home = await adapter.prepareHome(account, install, spec);
-  const mat = await adapter.materialize(spec, compiled, caps, { home: account.home });
-  if (!mat.budget.ok) throw new RunPrepareError('config', 'budget', mat.budget.reason ?? `指令超出 ${spec.harness} 的承载上限（${mat.budget.bytes}/${mat.budget.limit}）`);
-  // buildInvocation 可能调整 mat.files（例：cc 把 adapter 权限设置合并进 lane C 的 settings），所以先构造再落盘
-  const inv0 = adapter.buildInvocation(spec, caps, home, mat, account, install);
+  const inv0 = adapter.buildInvocation(spec, caps, home, account, install);
   await writeFiles(home.configFiles);
-  await writeFiles(mat.files);
   const extraRo = [path.dirname(install.binPath), path.dirname(process.execPath), ...installRoots(install.binPath)];
   const plan = mountPlanFor(spec, [account.home, ...home.stateDirs], extraRo);
   const inv = wrapInvocation(inv0, isolation, plan);
@@ -214,7 +193,7 @@ export async function startRun(p: PreparedRun, sink: RunEventSink): Promise<RunH
     harness: spec.harness,
     isolation,
     outDir: spec.outDir,
-    declaredGlobs: await declaredArtifactGlobs(spec.workOrderFile),
+    declaredGlobs: [],
     homeConfigHashes,
     argvPreview: preview,
     startedAt,
@@ -293,7 +272,7 @@ export async function reattachRun(runDir: string, adapter: HarnessAdapter, spec:
     harness: spec.harness,
     isolation: 'container' as const,
     outDir: spec.outDir,
-    declaredGlobs: await declaredArtifactGlobs(spec.workOrderFile),
+    declaredGlobs: [],
     homeConfigHashes: {},
     argvPreview: [],
     startedAt: new Date().toISOString(),
@@ -491,7 +470,7 @@ function createHandle(ctx: HandleCtx): RunHandle {
     } else {
       outcome = adapter.classify(exit, kept, stderrTail);
     }
-    const audit = await postRunAudit({ outDir: ctx.meta.outDir, declaredGlobs: ctx.meta.declaredGlobs, homeConfigHashes: ctx.meta.homeConfigHashes });
+    const audit = await postRunAudit({ homeConfigHashes: ctx.meta.homeConfigHashes });
     if (audit.tamperedConfig.length && outcome.status === 'completed') {
       outcome = { ...outcome, status: 'failed', errorClass: 'sandbox', message: `home 配置文件被改动：${audit.tamperedConfig.join(', ')}` };
     }

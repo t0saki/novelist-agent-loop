@@ -20,7 +20,7 @@ const facts = (p: Partial<V3RunFacts> = {}): V3RunFacts => ({
 });
 const fullOutcome = (o: Partial<Outcome>): Outcome => ({ status: 'failed', usage: { input: 0, cachedInput: 0, cacheWrite: 0, output: 0, reasoning: 0, costSource: 'unknown' }, denials: [], exitCode: 1, signal: null, rateLimits: [], ...o });
 const fp = (o: Partial<Outcome>) =>
-  planFailure(o.errorClass ?? 'network', { taskId: 't', kind: 'book.write', bookId: 'b', outcome: fullOutcome(o), orch: {} as never, profile: 'p1', accountId: 'a1', vendor: 'google', refusalRetryOtherVendor: false, denialInOutDir: false, now }).result;
+  planFailure(o.errorClass ?? 'network', { taskId: 't', bookId: 'b', outcome: fullOutcome(o), orch: {} as never, profile: 'p1', accountId: 'a1', now }).result;
 
 describe('classifyV3Run (§2.10 table)', () => {
   it('row 1: accepted > 0 → done, counters reset, infra side effects kept', () => {
@@ -52,11 +52,12 @@ describe('classifyV3Run (§2.10 table)', () => {
     const r = fp({ errorClass: 'quota', retryAfter: plus(2 * 3600_000) });
     expect(classifyV3Run(facts({ outcome: { status: 'failed', errorClass: 'quota' }, planFailure: r, accountStreak: 1 }))).toEqual({ status: 'waiting', retryAfter: plus(2 * 3600_000), infraClass: 'quota', zeroDiff: false, bookEmpty: 'keep', pauseAccount: false, bookInbox: null });
   });
-  it('row 5: model_unavailable / overloaded over cap: retry mapped to waiting, avoidProfile kept', () => {
+  it('row 5: model_unavailable waits 30 min (the profile cools down, P3 D8); overloaded over cap: retry mapped to waiting', () => {
     const mu = fp({ errorClass: 'model_unavailable' });
-    expect(mu.status).toBe('retry');
-    const v = classifyV3Run(facts({ outcome: { status: 'failed', errorClass: 'model_unavailable' }, planFailure: { status: mu.status, ...(mu.retryAfter ? { retryAfter: mu.retryAfter } : {}), ...(mu.avoidProfile ? { avoidProfile: mu.avoidProfile } : {}) } }));
-    expect(v).toMatchObject({ status: 'waiting', avoidProfile: 'p1', infraClass: 'model_unavailable', zeroDiff: false });
+    expect(mu).toMatchObject({ status: 'waiting', retryAfter: plus(30 * 60_000) });
+    const v = classifyV3Run(facts({ outcome: { status: 'failed', errorClass: 'model_unavailable' }, planFailure: { status: mu.status, ...(mu.retryAfter ? { retryAfter: mu.retryAfter } : {}) } }));
+    expect(v).toMatchObject({ status: 'waiting', retryAfter: plus(30 * 60_000), infraClass: 'model_unavailable', zeroDiff: false });
+    expect(v.avoidProfile).toBeUndefined();
     const over = classifyV3Run(facts({ outcome: { status: 'failed', errorClass: 'overloaded' }, planFailure: { status: 'retry' } }));
     expect(over).toMatchObject({ status: 'waiting', retryAfter: plus(10 * 60_000), zeroDiff: false, bookEmpty: 'keep' });
   });

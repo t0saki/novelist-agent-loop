@@ -1,10 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { HARNESS_IDS, TASK_KINDS } from '@novelist/shared';
-import { HANDLERS } from '../src/pipeline/registry.js';
+import { HANDLERS } from '../src/runtime/registry.js';
 import { ADAPTERS } from '../src/harness/registry.js';
 import { dataPaths, loadConfig } from '../src/config/index.js';
-import { KNOWN_LIMITS } from '../src/instructions/budget.js';
-import { SECTION_QUOTAS } from '../src/context/pack.js';
 
 describe('skeleton contracts', () => {
   it('every TaskKind has a handler with matching kind', () => {
@@ -26,9 +24,5 @@ describe('skeleton contracts', () => {
     expect(pg.dbKind).toBe('pg');
     expect(pg.databaseUrl).toBe('postgresql://u:p@h:5432/novelist2');
     expect(dataPaths('/data').instructionsGlobal).toBe('/data/instructions/global');
-  });
-  it('context pack quotas sum to 65k', () => {
-    expect(Object.values(SECTION_QUOTAS).reduce((a, b) => a + b, 0)).toBe(65_000);
-    expect(KNOWN_LIMITS.agy).toBe(20_000);
   });
 });

@@ -6,9 +6,10 @@ import { and, desc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import type { BookConfig, V3BookSummary, V3BookView, V3Cost, V3RunCostRow, V3Settings, V3StoryFile } from '@novelist/shared';
 import { zPublishConfig } from '@novelist/shared';
 import type { AppDeps } from '../app.js';
-import { bookFiles, openRepo } from '../book/index.js';
+import { bookFiles, isV3Meta, openRepo } from '../book/index.js';
 import type { Db } from '../db/client.js';
-import { accountsState, books, runs, tasks } from '../db/schema.js';
+import { accountsState, books, profiles, runs, tasks } from '../db/schema.js';
+import { HttpProblem } from '../api/problem.js';
 import { NOTE_BUDGETS, noteSize } from '../flow/contract.js';
 import { RETRO_EVERY, plannedUpper } from '../flow/decide.js';
 import { loadSystemSettings } from '../orchestrator/routing.js';
@@ -16,7 +17,7 @@ import { selectHints } from '../flow/order.js';
 import { patchV3Meta, readV3Meta } from '../flow/state.js';
 import { v3Status, type V3StatusInput } from '../flow/status.js';
 import type { V3BookMeta, V3OwnerMessageMeta } from '../flow/types.js';
-import { ensureBatchLog, rewindPoints } from '../orchestrator/rewind-v3.js';
+import { ensureBatchLog, rewindFloor, rewindPoints } from '../orchestrator/rewind-v3.js';
 import { nextSlots } from '../orchestrator/publisher.js';
 import { bookDir, type BookRow } from '../api/helpers.js';
 import { assertPublishConfig } from './publish-config.js';
@@ -29,10 +30,8 @@ const SHOWN = ['pending', 'ready', 'waiting', 'leased', 'running', 'finalizing',
 const LIVE_RANK: Record<string, number> = { finalizing: 0, running: 1, leased: 2, waiting: 3, ready: 4, pending: 5, blocked: 6 };
 const DEFAULT_TZ = 'Asia/Shanghai';
 
-export const isV3Row = (row: Pick<BookRow, 'meta'>): boolean => {
-  const v3 = (row.meta as { v3?: unknown } | null)?.v3;
-  return v3 !== undefined && v3 !== null;
-};
+/** v3 书 = meta.v3 是 JSON 对象（book/legacy.ts 的唯一判定，P3 D1） */
+export const isV3Row = (row: Pick<BookRow, 'meta'>): boolean => isV3Meta(row.meta);
 
 export function costOf(agg: { runs: number; ms: number; output: number }, totalCjk: number): V3Cost {
   return {
@@ -201,8 +200,10 @@ function settingsOf(cfg: BookConfig): V3Settings {
     target_cjk: cfg.v3.target_cjk,
     min_chapter_cjk: cfg.v3.min_chapter_cjk,
     batch: cfg.v3.batch,
-    effort: { ...cfg.v3.effort },
+    effort: { open: cfg.v3.effort.open, write: cfg.v3.effort.write, closing: cfg.v3.effort.closing ?? cfg.v3.effort.finale, finale: cfg.v3.effort.finale, retro: cfg.v3.effort.retro },
     publish: { mode: cfg.publish.mode, cadence: cfg.publish.cadence, timezone: cfg.publish.timezone, per_slot: cfg.publish.per_slot, max_buffer: cfg.publish.max_buffer },
+    writer_profile: cfg.routing.writer_profile ?? null,
+    budgets: { priority: cfg.budgets.priority, monthly_usd_cap: cfg.budgets.monthly_usd_cap ?? null, max_window_util_pct: cfg.budgets.max_window_util_pct ?? null },
   };
 }
 
@@ -267,7 +268,7 @@ export async function v3BookView(deps: AppDeps, rowIn: BookRow): Promise<V3BookV
     retro: { enabled: cfg.v3.length === 'long' || cfg.v3.length === 'epic', batchesSince: retroBatchesSince(meta), every: RETRO_EVERY, lastAt: meta.retro.lastAt },
     hints: selectHints(meta.hints, frozen).hintsShown.map((h) => ({ kind: h.kind, text: h.text })),
     pending: meta.pending ? { failures: meta.pending.failures, lastError: meta.pending.lastError ?? null, blocked: meta.pending.failures >= 3 || flowTask !== undefined } : null,
-    rewindPoints: rewindPoints(meta, row.publishedThrough, row.acceptedThrough),
+    rewindPoints: rewindPoints(meta, row.publishedThrough, row.acceptedThrough, rewindFloor(meta)),
     locked: [...meta.locked].sort((a, b) => a - b),
     agentsSize: meta.agentsSize,
   };
@@ -285,6 +286,11 @@ export async function saveV3Settings(deps: AppDeps, row: BookRow, s: V3Settings)
   const { syncBookIndex } = await import('./repo-files.js');
   const repo = openRepo(bookDir(deps, row.slug));
   const cfg = (await bookFiles(repo).config()).config;
+  // 写作模型覆盖：只认已有的 profile（没改的旧值照收，profile 后来被删了也不挡别的设置）
+  if (s.writer_profile !== null && s.writer_profile !== (cfg.routing.writer_profile ?? null)) {
+    const found = await deps.db.select({ id: profiles.id }).from(profiles).where(eq(profiles.id, s.writer_profile)).limit(1);
+    if (!found[0]) throw new HttpProblem(400, 'unknown_profile', `没有这个 profile：${s.writer_profile}`);
+  }
   const resume = Math.max(1, s.publish.max_buffer - 5);
   const nextPublish = zPublishConfig.parse({ ...cfg.publish, ...s.publish, resume_buffer: resume });
   assertPublishConfig(nextPublish, { batch: s.batch });
@@ -305,6 +311,20 @@ export async function saveV3Settings(deps: AppDeps, row: BookRow, s: V3Settings)
       doc.setIn(['v3', 'min_chapter_cjk'], s.min_chapter_cjk);
       doc.setIn(['v3', 'batch'], s.batch);
       for (const k of ['open', 'write', 'finale', 'retro'] as const) doc.setIn(['v3', 'effort', k], s.effort[k]);
+      // closing 没写过、又和 finale 一样：不写（这本书照旧用 finale，P3 之前的书不多出一个键）
+      if (cfg.v3.effort.closing !== undefined || s.effort.closing !== s.effort.finale) doc.setIn(['v3', 'effort', 'closing'], s.effort.closing);
+      // null = 删掉这个键（没有这个键时什么也不写）
+      const unset = (p: string[]) => {
+        if (doc.hasIn(p)) doc.deleteIn(p);
+      };
+      if (s.writer_profile === null) unset(['routing', 'writer_profile']);
+      else doc.setIn(['routing', 'writer_profile'], s.writer_profile);
+      if (doc.hasIn(['budgets', 'priority']) || s.budgets.priority !== cfg.budgets.priority) doc.setIn(['budgets', 'priority'], s.budgets.priority);
+      for (const k of ['monthly_usd_cap', 'max_window_util_pct'] as const) {
+        const v = s.budgets[k];
+        if (v === null) unset(['budgets', k]);
+        else doc.setIn(['budgets', k], v);
+      }
       if (targetChanged) {
         doc.setIn(['v3', 'planned_chapters_initial'], n0);
         doc.setIn(['v3', 'planned_chapters'], plannedNext);

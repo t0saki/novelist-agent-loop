@@ -67,6 +67,8 @@ export const chapters = pgTable(
     chapterId: text('chapter_id').notNull(), // c00421
     title: text('title').notNull().default(''),
     volume: text('volume').notNull().default(''),
+    /** 卷标题（P3：旧书从 plan/volumes/*.yaml 回填；空 = 读者端只显示卷 id） */
+    volumeTitle: text('volume_title').notNull().default(''),
     arc: text('arc').notNull().default(''),
     /** ChapterWorkflowState（见 shared/api.ts） */
     state: text('state').notNull().default('planned'),

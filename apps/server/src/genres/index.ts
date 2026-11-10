@@ -1,12 +1,13 @@
 /**
  * 题材包（DESIGN §4.1、§6.5、附录 A）。Owner: lane C。
- * $DATA/genres/<id>/{pack.yaml,gates.yaml,pacing.yaml,lexicon.yaml,AGENTS.md,roles/<role>.md,skills/<name>/SKILL.md}
+ * $DATA/genres/<id>/{pack.yaml,AGENTS.md,roles/<role>.md,skills/<name>/SKILL.md}
+ * 旧包里只有旧流程读过的 gates.yaml / pacing.yaml / lexicon.yaml 原样留在磁盘上，不再读取（写坏了也不影响开书）。
  * extends 链：pack.extends 依次展开（深度优先、去重、检测环），base 在前、自身在后。
  * 内置包在 apps/server/src/genres/builtin/，首次启动 seedBuiltinGenres 拷到 $DATA/genres（已存在则不覆盖，用户可改）。
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { type GatesFile, type GenrePack, GENRE_FILES, type Lexicon, type Pacing, type PlainObject, mergeLayers, zGatesFile, zGenrePack, zLexicon, zPacing } from '@novelist/shared';
+import { type GenrePack, GENRE_FILES, zGenrePack } from '@novelist/shared';
 import { parse as yamlParse, parseDocument, stringify as yamlStringify } from 'yaml';
 import { TRAILER, ensureGitRepo, NothingToCommitError, openRepo } from '../book/index.js';
 import type { DataPaths } from '../config/index.js';
@@ -18,18 +19,7 @@ export interface ResolvedGenre {
   pack: GenrePack;
   /** base 在前、自身在后 */
   chain: { id: string; dir: string; pack: GenrePack }[];
-  /** 按链顺序的 gates 文件（validators 负责合并） */
-  gates: { genre: string; file: GatesFile }[];
-  /** 链上合并后的 pacing（后者覆盖前者） */
-  pacing: Pacing;
-  /** 链上合并后的 lexicon（ban/watch/allow/patterns 追加合并） */
-  lexicon: Lexicon;
-  /** event_families 合并 */
-  eventFamilies: Record<string, string[]>;
 }
-
-/** 链上没有任何 pacing.yaml 时的兜底 */
-const DEFAULT_PACING: PlainObject = { schema: 'nv.pacing/1', chapter_length: { min: 2000, target: 3000, max: 4000, count_mode: 'han' } };
 
 async function readYaml(file: string): Promise<unknown | null> {
   const text = await fs.readFile(file, 'utf8').catch((e: NodeJS.ErrnoException) => {
@@ -66,43 +56,10 @@ async function expandChain(paths: DataPaths, id: string): Promise<ResolvedGenre[
   return chain;
 }
 
-function lexiconKey(entry: Lexicon['ban'][number]): string {
-  return typeof entry === 'string' ? entry : entry.pattern;
-}
-
-function dedupeByKey<T>(items: T[], key: (item: T) => string): T[] {
-  const map = new Map<string, T>();
-  for (const it of items) map.set(key(it), it);
-  return [...map.values()];
-}
-
-function mergeLexicons(files: Lexicon[]): Lexicon {
-  return {
-    schema: 'nv.lexicon/1',
-    ban: dedupeByKey(files.flatMap((f) => f.ban), lexiconKey),
-    watch: dedupeByKey(files.flatMap((f) => f.watch), lexiconKey),
-    allow: dedupeByKey(files.flatMap((f) => f.allow), lexiconKey),
-    patterns: dedupeByKey(files.flatMap((f) => f.patterns), (p) => p.id),
-  };
-}
-
 export async function loadGenre(paths: DataPaths, id: string): Promise<ResolvedGenre> {
   const chain = await expandChain(paths, id);
-  const gates: ResolvedGenre['gates'] = [];
-  const pacingLayers: PlainObject[] = [DEFAULT_PACING];
-  const lexicons: Lexicon[] = [];
-  const eventFamilies: Record<string, string[]> = {};
-  for (const { id: gid, dir, pack } of chain) {
-    const g = await readYaml(path.join(dir, GENRE_FILES.gates));
-    if (g !== null) gates.push({ genre: gid, file: zGatesFile.parse(g) });
-    const p = await readYaml(path.join(dir, GENRE_FILES.pacing));
-    if (p !== null) pacingLayers.push(p as PlainObject);
-    const l = await readYaml(path.join(dir, GENRE_FILES.lexicon));
-    if (l !== null) lexicons.push(zLexicon.parse(l));
-    for (const [family, words] of Object.entries(pack.event_families)) eventFamilies[family] = [...new Set([...(eventFamilies[family] ?? []), ...words])];
-  }
   const self = chain[chain.length - 1]!;
-  return { id, pack: self.pack, chain, gates, pacing: zPacing.parse(mergeLayers(...pacingLayers)), lexicon: mergeLexicons(lexicons), eventFamilies };
+  return { id, pack: self.pack, chain };
 }
 
 export async function listGenres(paths: DataPaths): Promise<GenrePack[]> {
@@ -225,6 +182,43 @@ export async function setGenreHidden(paths: DataPaths, id: string, hidden: boole
   await ensureGitRepo(paths.genres);
   await openRepo(paths.genres)
     .commit({ message: `genres: ${hidden ? 'hide' : 'unhide'} ${id}`, trailers: { [TRAILER.owner]: 'true' }, paths: [`${id}/${GENRE_FILES.pack}`] })
+    .catch((e: unknown) => {
+      if (!(e instanceof NothingToCommitError)) throw e;
+    });
+  return readPack(path.join(paths.genres, id), id);
+}
+
+/** pack.yaml 改完后不合 zGenrePack（PATCH /genres/:id/auto 回 400 invalid_pack，文件不动） */
+export class InvalidPackError extends Error {
+  constructor(readonly issues: { path: string; message: string }[]) {
+    super(`pack.yaml 不合格式：${issues.map((i) => `${i.path}: ${i.message}`).join('；')}`);
+  }
+}
+
+/**
+ * 题材包的自动开书配置（P3 D31：参与与权重只有 pack.yaml 这一个来源）。parseDocument 改 auto.<键>（保留注释；null = 删掉这个键），
+ * 整份重新按 zGenrePack 校验，不合格就什么都不写；合格则以 owner 身份提交到题材包仓库。
+ */
+export async function patchGenreAuto(paths: DataPaths, id: string, patch: Partial<Record<'enabled' | 'weight' | 'keywords' | 'length_hint', unknown>>): Promise<GenrePack> {
+  assertPlainGenreId(id);
+  await readPack(path.join(paths.genres, id), id);
+  const file = path.join(paths.genres, id, GENRE_FILES.pack);
+  const raw = await fs.readFile(file, 'utf8');
+  const doc = parseDocument(raw);
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
+    if (v === null) {
+      if (doc.hasIn(['auto', k])) doc.deleteIn(['auto', k]);
+    } else doc.setIn(['auto', k], v);
+  }
+  const next = doc.toString({ lineWidth: 0 });
+  const checked = zGenrePack.safeParse(yamlParse(next));
+  if (!checked.success) throw new InvalidPackError(checked.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })));
+  if (next === raw) return checked.data;
+  await fs.writeFile(file, next, 'utf8');
+  await ensureGitRepo(paths.genres);
+  await openRepo(paths.genres)
+    .commit({ message: `genres: edit ${id} auto`, trailers: { [TRAILER.owner]: 'true' }, paths: [`${id}/${GENRE_FILES.pack}`] })
     .catch((e: unknown) => {
       if (!(e instanceof NothingToCommitError)) throw e;
     });

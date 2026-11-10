@@ -1,7 +1,7 @@
 /**
- * 连载发布（DESIGN §9.4；D4 默认）：cadence 槽位到点 → 若 audited_through ≥ 章号且存稿 ≥ lag → 入队 publish 任务。
- * lag=auto → max(当前弧长, min_lag)；存稿 > max_buffer → 暂停该书生产，回落到 resume_buffer 以下恢复；
- * 存稿可维持天数 < low_buffer_days_alert → Inbox 提醒。存稿不足 lag 时宁可空槽，不追赶、不发未审计章。Owner: lane F。
+ * 连载发布（DESIGN §3.4）：cadence 槽位到点 → 按 v3 的可发布上限（flow/publish.ts#v3PublishCap）和 per_slot 入队 publish 任务。
+ * 存稿 > max_buffer → 暂停该书生产，回落到 resume_buffer 以下恢复。错过的槽位不追赶（宁可空槽）。
+ * 旧书不发布（loadConfig 返回 'skip'）；旧流程的 lag / 审计前沿 / 存稿告警都已删除。
  */
 import { Cron } from 'croner';
 import { eq, sql } from 'drizzle-orm';
@@ -12,17 +12,10 @@ import { books, publishSchedule } from '../db/schema.js';
 
 export interface BufferState {
   accepted: number;
-  audited: number;
   published: number;
   buffer: number;
-  lag: number;
   bufferDays: number | null;
   productionPaused: boolean;
-}
-
-function effectiveLag(cfg: PublishConfig, arcLength: number): number {
-  if (cfg.mode === 'immediate') return 0;
-  return cfg.lag === 'auto' ? Math.max(arcLength, cfg.min_lag) : Math.max(cfg.lag, cfg.min_lag);
 }
 
 /** 按 cadence 估算每天有几个发布槽位（未来 7 天的平均；乘 per_slot 才是章数） */
@@ -43,7 +36,7 @@ export function slotsPerDay(cfg: PublishConfig, from: Date): number {
   }
 }
 
-export async function bufferState(db: Db, bookId: string, cfg: PublishConfig, arcLength: number, now: Date = new Date()): Promise<BufferState> {
+export async function bufferState(db: Db, bookId: string, cfg: PublishConfig, now: Date = new Date()): Promise<BufferState> {
   const rows = await db.select().from(books).where(eq(books.id, bookId)).limit(1);
   const b = rows[0];
   if (!b) throw new Error(`book not found: ${bookId}`);
@@ -51,10 +44,8 @@ export async function bufferState(db: Db, bookId: string, cfg: PublishConfig, ar
   const perDay = slotsPerDay(cfg, now) * cfg.per_slot;
   return {
     accepted: b.acceptedThrough,
-    audited: b.auditedThrough,
     published: b.publishedThrough,
     buffer,
-    lag: effectiveLag(cfg, arcLength),
     bufferDays: perDay > 0 ? buffer / perDay : null,
     productionPaused: b.pausedReason === 'max_buffer',
   };
@@ -74,83 +65,74 @@ export function nextSlots(cfg: PublishConfig, from: Date, count: number): string
 }
 
 /**
- * 这一刻（slot 到点时）最多可以发到第几章（返回 ≤ published 表示不发）。
- * v3Cap 给出时（v3 书，flow/publish.ts）：不看 lag 与审计，只按 v3 规则的上限和 per_slot 节奏。
+ * 这一刻（slot 到点时）最多可以发到第几章（返回 ≤ published 表示不发）：v3 规则的上限（v3Cap）和 per_slot 节奏。
+ * 没给上限（undefined）就什么都不发：发布对读者撤不回，拿不到 v3 规则时宁可不发。require_audited / lag / min_lag 不再看。
  */
-export function eligibleThrough(state: Pick<BufferState, 'accepted' | 'audited' | 'published' | 'lag'>, cfg: PublishConfig, ignoreAudit = false, v3Cap?: number): number {
-  if (v3Cap !== undefined) {
-    const cap = Math.min(v3Cap, state.accepted);
-    return cfg.mode === 'immediate' ? cap : Math.min(cap, state.published + cfg.per_slot);
-  }
-  const byBuffer = state.accepted - state.lag + 1;
-  let through = cfg.mode === 'immediate' ? state.accepted : Math.min(byBuffer, state.published + cfg.per_slot);
-  if (cfg.require_audited && !ignoreAudit && cfg.mode !== 'immediate') through = Math.min(through, state.audited);
-  return Math.min(through, state.accepted);
+export function eligibleThrough(state: Pick<BufferState, 'accepted' | 'published'>, cfg: PublishConfig, v3Cap: number | undefined): number {
+  if (v3Cap === undefined) return state.published;
+  const cap = Math.min(v3Cap, state.accepted);
+  return cfg.mode === 'immediate' ? cap : Math.min(cap, state.published + cfg.per_slot);
 }
 
 export interface PublishIo {
-  /** 读书的发布配置与当前弧长（默认：books.meta.publishConfig，弧长 0） */
-  loadConfig?(bookId: string): Promise<{ cfg: PublishConfig; arcLength: number; v3Cap?: number }>;
+  /**
+   * 读书的发布配置与 v3 可发布上限；'skip' = 不是 v3 书（旧书不再发布，P3 D13）。出错时这一分钟跳过这本书（不发布、不改暂停、不推进槽位水位）。
+   * 没提供（只有测试）：books.meta.publishConfig，上限 = 已收章数。
+   */
+  loadConfig?(bookId: string): Promise<{ cfg: PublishConfig; v3Cap: number } | 'skip'>;
   /** 入队 publish 任务（publish.execute 打 tag、写前沿）；默认不入队（仅更新水位，测试用） */
   enqueue?(input: { bookId: string; through: number; slot: string | null }): Promise<boolean | void>;
-  /** 存稿告警（Inbox） */
-  lowBuffer?(input: { bookId: string; bufferDays: number }): Promise<void>;
   /** 生产暂停/恢复（Inbox / 总线） */
   productionChanged?(input: { bookId: string; paused: boolean; buffer: number }): Promise<void>;
-  /** 存稿超上限但没有可发布章节（lag/审计卡住）：不暂停生产，提醒 owner */
-  bufferBlocked?(input: { bookId: string; buffer: number; lag: number; audited: number; published: number }): Promise<void>;
 }
 
-const LOW_BUFFER_COOLDOWN_MS = 24 * 3600_000;
-
 /** 现在能否发布出至少一章（不考虑 per_slot 与 cadence）：false 时暂停生产只会和发布互等 */
-function canDrain(state: BufferState, cfg: PublishConfig, v3Cap?: number): boolean {
+function canDrain(state: BufferState, cfg: PublishConfig, v3Cap: number | undefined): boolean {
   if (cfg.mode === 'manual') return true; // 手动模式 owner 随时能发布
-  return eligibleThrough(state, { ...cfg, per_slot: Number.MAX_SAFE_INTEGER }, false, v3Cap) > state.published;
+  return eligibleThrough(state, { ...cfg, per_slot: Number.MAX_SAFE_INTEGER }, v3Cap) > state.published;
 }
 
 interface PublishMeta {
   lastSlot?: string;
 }
 
-/** 每分钟一次：推进 cadence 水位，到点的槽位按 lag/审计入队 publish；检查 max_buffer；检查存稿告警 */
+/** 每分钟一次：推进 cadence 水位，到点的槽位入队 publish；检查 max_buffer */
 export async function publishTick(db: Db, now: Date, io: PublishIo = {}): Promise<{ bookId: string; through: number }[]> {
   const rows = await db.select().from(books);
   const out: { bookId: string; through: number }[] = [];
   for (const b of rows) {
     if (b.status === 'archived' || b.status === 'draft' || b.status === 'importing') continue;
-    const loaded = io.loadConfig ? await io.loadConfig(b.id).catch(() => null) : null;
+    let loaded: { cfg: PublishConfig; v3Cap: number } | 'skip' | null = null;
+    if (io.loadConfig) {
+      try {
+        loaded = await io.loadConfig(b.id);
+      } catch {
+        // 读不到 book.yaml / v3 上限（瞬时故障、写到一半的文件）：这一分钟不碰这本书，lastSlot 不推进，下一分钟按 v3 规则补上
+        continue;
+      }
+    }
+    if (loaded === 'skip') continue;
     const cfg = loaded?.cfg ?? zPublishConfig.parse((b.meta as { publishConfig?: unknown }).publishConfig ?? {});
-    const state = await bufferState(db, b.id, cfg, loaded?.arcLength ?? 0, now);
-    const v3Cap = loaded?.v3Cap;
-    // v3：存稿上限由 decideNext / prepareV3 自己拦；“超上限但暂时没有可发布章节”是两批之间的常态，不发这两类待办
-    const v3 = v3Cap !== undefined;
+    const state = await bufferState(db, b.id, cfg, now);
+    // 测试用的默认 io（没有 loadConfig）：上限 = 已收章数，显式给出
+    const v3Cap = loaded ? loaded.v3Cap : state.accepted;
 
+    // 存稿上限由 decideNext / prepareV3 自己拦；“超上限但暂时没有可发布章节”是两批之间的常态，不暂停也不发待办
     const drainable = canDrain(state, cfg, v3Cap);
     if (state.buffer > cfg.max_buffer && b.pausedReason !== 'max_buffer' && b.status === 'active') {
       if (drainable) {
         await db.update(books).set({ pausedReason: 'max_buffer', updatedAt: now.toISOString() }).where(eq(books.id, b.id));
         await io.productionChanged?.({ bookId: b.id, paused: true, buffer: state.buffer });
-      } else if (!v3) {
-        await io.bufferBlocked?.({ bookId: b.id, buffer: state.buffer, lag: state.lag, audited: state.audited, published: state.published }).catch(() => {});
       }
     } else if (b.pausedReason === 'max_buffer' && (state.buffer <= cfg.resume_buffer || !drainable)) {
       await db.update(books).set({ pausedReason: null, updatedAt: now.toISOString() }).where(eq(books.id, b.id));
       await io.productionChanged?.({ bookId: b.id, paused: false, buffer: state.buffer });
-      if (!drainable && state.buffer > cfg.resume_buffer && !v3) await io.bufferBlocked?.({ bookId: b.id, buffer: state.buffer, lag: state.lag, audited: state.audited, published: state.published }).catch(() => {});
-    }
-
-    const alertedAt = (b.meta as { lowBufferAlertAt?: string }).lowBufferAlertAt;
-    const finished = b.status === 'completed' && state.accepted === state.published;
-    if (!v3 && state.bufferDays !== null && state.published > 0 && state.bufferDays < cfg.low_buffer_days_alert && !finished && (!alertedAt || now.getTime() - new Date(alertedAt).getTime() >= LOW_BUFFER_COOLDOWN_MS)) {
-      await io.lowBuffer?.({ bookId: b.id, bufferDays: state.bufferDays }).catch(() => {});
-      await mergeMeta(db, b.id, { lowBufferAlertAt: now.toISOString() });
     }
 
     if (cfg.mode === 'manual' || b.status === 'paused') continue;
 
     if (cfg.mode === 'immediate') {
-      const through = eligibleThrough(state, cfg, false, v3Cap);
+      const through = eligibleThrough(state, cfg, v3Cap);
       if (through > state.published) {
         const created = await enqueueSafe(io, { bookId: b.id, through, slot: null });
         await markScheduled(db, b.id, state.published + 1, through, null, now);
@@ -181,7 +163,7 @@ export async function publishTick(db: Db, now: Date, io: PublishIo = {}): Promis
     }
     if (!slot) continue;
     await mergeMeta(db, b.id, { publish: { lastSlot: slot.toISOString() } });
-    const through = eligibleThrough(state, cfg, false, v3Cap);
+    const through = eligibleThrough(state, cfg, v3Cap);
     if (through <= state.published) continue;
     const created = await enqueueSafe(io, { bookId: b.id, through, slot: slot.toISOString() });
     await markScheduled(db, b.id, state.published + 1, through, slot.toISOString(), now);
@@ -190,7 +172,7 @@ export async function publishTick(db: Db, now: Date, io: PublishIo = {}): Promis
   return out;
 }
 
-/** 只合并给定的键（jsonb ||）：tick 开头的快照可能已过时，不能整体回写 meta（会丢掉 audit 进度） */
+/** 只合并给定的键（jsonb ||）：tick 开头的快照可能已过时，不能整体回写 meta */
 async function mergeMeta(db: Db, bookId: string, patch: Record<string, unknown>): Promise<void> {
   await db.update(books).set({ meta: sql`${books.meta} || ${JSON.stringify(patch)}::jsonb` }).where(eq(books.id, bookId));
 }

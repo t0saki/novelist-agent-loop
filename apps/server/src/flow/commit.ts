@@ -3,7 +3,7 @@
  * 一章一个提交并打 ch/NNNNN；改写在前（不打标签），设定和笔记跟在本批最后一个提交里。
  */
 import { chapterId, tags } from '@novelist/shared';
-import type { BookHandle, PromotePlan, RunContext, TaskRow } from '../pipeline/types.js';
+import type { BookHandle, PromotePlan, RunContext, TaskRow } from '../runtime/types.js';
 import type { HarvestPlan, OrderSpec, V3BatchEffectArgs, V3BatchNote, V3CommitPart, V3CommitPlan } from './types.js';
 
 const subject = (prefix: string, no: number, title: string) => `${prefix}${chapterId(no)}${title ? `「${title}」` : ''}`;
@@ -26,6 +26,8 @@ export function buildPromote(input: {
   serverTail?: NonNullable<V3CommitPlan['serverTail']>;
   ownerMessageRead?: V3BatchEffectArgs['ownerMessageRead'];
   ownerRequestResults?: V3BatchEffectArgs['ownerRequestResults'];
+  /** P3：接手任务单（order.takeover）且本批有新章 → v3.batch 把 takeover 记成 done */
+  takeoverDone?: boolean;
 }): PromotePlan | null {
   const { book, task, run, order, plan } = input;
   if (plan.zeroDiff) return null;
@@ -73,6 +75,7 @@ export function buildPromote(input: {
     ...(input.toolSteps !== undefined ? { toolSteps: input.toolSteps } : {}),
     ...(input.ownerMessageRead ? { ownerMessageRead: input.ownerMessageRead } : {}),
     ...(input.ownerRequestResults?.length ? { ownerRequestResults: input.ownerRequestResults } : {}),
+    ...(input.takeoverDone ? { takeoverDone: true } : {}),
   };
   return {
     bookId: book.id,

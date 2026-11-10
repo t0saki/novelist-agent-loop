@@ -16,7 +16,7 @@ import { buildOutcome, classifyText } from '../classify.js';
 import { arr, errorEvent, ndjsonParser, num, obj, optNum, str } from '../events.js';
 import { runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, HomeLayout, StreamParser } from '../types.js';
-import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, materializeVia, minimalEnv, parseModelLines, readSchemaFile, standardProbe, toolCallEvent, toolKindOf, wantsSchema } from './common.js';
+import { authConfigError, buildEnv, detectBin, effortOf, filterExtraArgs, invocation, minimalEnv, parseModelLines, standardProbe, toolCallEvent, toolKindOf } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
   structuredOutput: 'native',
@@ -197,29 +197,23 @@ export const grokAdapter: HarnessAdapter = {
     const GH = path.join(acct.home, '.grok');
     return { home: acct.home, configFiles: [], stateDirs: [GH], env: { HOME: acct.home, GROK_HOME: GH, ...GROK_ISOLATION_ENV } };
   },
-  materialize: (spec, compiled, caps, ctx) => materializeVia('grok', spec, compiled, caps, ctx?.home),
-  buildInvocation(spec, caps, home, mat, acct, inst) {
+  buildInvocation(spec, _caps, home, acct, inst) {
     if (acct.authMode === 'api_key' && !acct.secretEnv.XAI_API_KEY) throw authConfigError('api_key 模式需要 XAI_API_KEY');
     const argv = [inst.binPath, '--no-auto-update', '--prompt-file', spec.workOrderFile, '--cwd', spec.bookDir, '--output-format', 'streaming-json', '-m', spec.model];
     const eff = effortOf(spec, EFFORTS);
     if (eff) argv.push('--reasoning-effort', eff);
-    const disallowed = ['run_terminal_cmd', 'web_search', 'web_fetch'];
-    if (!spec.subagents) disallowed.push('task');
+    // 不开子代理
+    const disallowed = ['run_terminal_cmd', 'web_search', 'web_fetch', 'task'];
     argv.push('--always-approve', '--disallowed-tools', disallowed.join(','), '--disable-web-search', '--no-wait-for-background');
-    if (!spec.subagents) argv.push('--no-subagents');
+    argv.push('--no-subagents');
     if (spec.limits.maxTurns > 0) argv.push('--max-turns', String(spec.limits.maxTurns));
     if (spec.session.mode === 'fresh') argv.push('-s', spec.session.id || spec.runId);
     else {
       argv.push('-r', spec.session.id);
       if (spec.session.mode === 'fork') argv.push('--fork-session');
     }
-    if (wantsSchema(spec, caps)) {
-      const schema = readSchemaFile(spec);
-      if (schema) argv.push('--json-schema', schema);
-    }
-    argv.push(...mat.argv);
     argv.push(...filterExtraArgs(spec.extraArgs, DENY_EXTRA));
-    const env = buildEnv(spec, inst, acct.secretEnv, home.env, mat.env);
+    const env = buildEnv(spec, inst, acct.secretEnv, home.env);
     return invocation(spec, argv, env, 'devnull', [
       { signal: 'SIGINT', graceMs: 25_000 },
       { signal: 'SIGTERM', graceMs: 30_000 },

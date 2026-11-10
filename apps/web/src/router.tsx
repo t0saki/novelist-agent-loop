@@ -1,7 +1,7 @@
 /**
  * 路由（TanStack Router，代码式路由树）。Owner: lane H。
  * 读者端：/login、/（书库）、/books/$slug、/read/$slug/$no（沉浸式阅读）
- * 管理端：/admin/**（页面按需加载，读者不下载管理端和 CodeMirror）
+ * 管理端：首页 /admin、开书 /admin/new、题材与指令 /admin/genres、模型与账号 /admin/models、系统 /admin/system，另有书页、章节页、运行日志；旧地址跳到新家（页面按需加载，读者不下载管理端和 CodeMirror）
  */
 import type React from 'react';
 import { createRootRoute, createRoute, createRouter, lazyRouteComponent, Link, Outlet, redirect } from '@tanstack/react-router';
@@ -68,10 +68,37 @@ const reader = createRoute({
 
 const admin = createRoute({ getParentRoute: () => root, path: '/admin', beforeLoad: requireAdmin, component: AdminLayout });
 const page = <P extends string>(path: P, load: () => Promise<Record<string, unknown>>, name: string) => createRoute({ getParentRoute: () => admin, path, component: lazyRouteComponent(load as never, name as never) as never });
+/** 旧地址（书签）跳到新家 */
+const moved = <P extends string>(path: P, to: string) =>
+  createRoute({
+    getParentRoute: () => admin,
+    path,
+    beforeLoad: () => {
+      throw redirect({ to: to as never });
+    },
+  });
 
-const adminIndex = page('/', () => import('./pages/admin/Dashboard'), 'DashboardPage');
-const adminBooks = page('/books', () => import('./pages/admin/Books'), 'BooksPage');
-const adminNewBook = page('/books/new', () => import('./pages/admin/NewBook'), 'NewBookPage');
+/** 旧控制台的地址（相对 /admin）→ 新家 */
+export const MOVED_ROUTES: Record<string, string> = {
+  '/books': '/admin',
+  '/books/new': '/admin/new',
+  '/inbox': '/admin',
+  '/runs': '/admin',
+  '/instructions': '/admin/genres',
+  '/harness': '/admin/models',
+  '/routing': '/admin/models',
+  '/quota': '/admin/models',
+  '/schedule': '/admin/system',
+  '/readers': '/admin/system',
+  '/settings': '/admin/system',
+  '/import': '/admin/system',
+};
+
+const adminIndex = page('/', () => import('./pages/admin/Home'), 'HomePage');
+const adminNew = page('/new', () => import('./pages/admin/NewBook'), 'NewBookPage');
+const adminGenres = page('/genres', () => import('./pages/admin/Genres'), 'GenresPage');
+const adminModels = page('/models', () => import('./pages/admin/Models'), 'ModelsPage');
+const adminSystem = page('/system', () => import('./pages/admin/System'), 'SystemPage');
 const LazyBookDetail = lazyRouteComponent(() => import('./pages/admin/book/BookDetail') as never, 'BookDetailPage') as unknown as (p: { slug: string; tab: string }) => React.ReactNode;
 const LazyChapterDetail = lazyRouteComponent(() => import('./pages/admin/book/ChapterDetail') as never, 'ChapterDetailPage') as unknown as (p: { slug: string; no: number }) => React.ReactNode;
 const LazyRunDetail = lazyRouteComponent(() => import('./pages/admin/RunDetail') as never, 'RunDetailPage') as unknown as (p: { id: string }) => React.ReactNode;
@@ -99,7 +126,6 @@ const adminBookChapter = createRoute({
     return <LazyChapterDetail slug={slug} no={Number(no)} />;
   },
 });
-const adminRuns = page('/runs', () => import('./pages/admin/Runs'), 'RunsPage');
 const adminRun = createRoute({
   getParentRoute: () => admin,
   path: '/runs/$id',
@@ -108,42 +134,14 @@ const adminRun = createRoute({
     return <LazyRunDetail id={id} />;
   },
 });
-const adminInbox = page('/inbox', () => import('./pages/admin/Inbox'), 'InboxPage');
-const adminInstructions = page('/instructions', () => import('./pages/admin/Instructions'), 'InstructionsPage');
-const adminGenres = page('/genres', () => import('./pages/admin/Genres'), 'GenresPage');
-const adminHarness = page('/harness', () => import('./pages/admin/Harness'), 'HarnessPage');
-const adminRouting = page('/routing', () => import('./pages/admin/Routing'), 'RoutingPage');
-const adminSchedule = page('/schedule', () => import('./pages/admin/Schedule'), 'SchedulePage');
-const adminQuota = page('/quota', () => import('./pages/admin/Quota'), 'QuotaPage');
-const adminReaders = page('/readers', () => import('./pages/admin/Readers'), 'ReadersPage');
-const adminSettings = page('/settings', () => import('./pages/admin/Settings'), 'SettingsPage');
-const adminImport = page('/import', () => import('./pages/admin/Import'), 'ImportPage');
+const movedRoutes = Object.entries(MOVED_ROUTES).map(([from, to]) => moved(from, to));
 
 export const routeTree = root.addChildren([
   login,
   library,
   book,
   reader,
-  admin.addChildren([
-    adminIndex,
-    adminBooks,
-    adminNewBook,
-    adminBook,
-    adminBookTab,
-    adminBookChapter,
-    adminRuns,
-    adminRun,
-    adminInbox,
-    adminInstructions,
-    adminGenres,
-    adminHarness,
-    adminRouting,
-    adminSchedule,
-    adminQuota,
-    adminReaders,
-    adminSettings,
-    adminImport,
-  ]),
+  admin.addChildren([adminIndex, adminNew, adminGenres, adminModels, adminSystem, adminBook, adminBookTab, adminBookChapter, adminRun, ...movedRoutes]),
 ]);
 
 export const router = createRouter({ routeTree, defaultPreload: 'intent', scrollRestoration: true, defaultPendingComponent: () => <Loading /> });

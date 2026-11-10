@@ -1,4 +1,4 @@
-/** 全局枚举。新增取值 = 追加（additive），不得改名/删除（见 IMPL.md §1.3）。 */
+/** 全局枚举。Removed kinds stay readable as strings in tasks/runs rows; never reuse a removed kind name. 其余枚举只追加。 */
 import { z } from 'zod';
 
 export const HARNESS_IDS = ['claude-code', 'codex', 'agy', 'grok', 'dsh', 'pi', 'fake'] as const;
@@ -43,66 +43,17 @@ export const ROLE_IDS = [
 export type RoleId = (typeof ROLE_IDS)[number];
 export const zRoleId = z.enum(ROLE_IDS);
 
-/** 附录 B 任务目录 + 系统任务 */
-export const TASK_KINDS = [
-  'plan.interview',
-  'plan.premise',
-  'plan.compass',
-  'plan.bible',
-  'plan.volumes',
-  'plan.volume',
-  'plan.arc',
-  'plan.fix',
-  'card.repair',
-  'ctx.build',
-  'chapter.write',
-  'chapter.revise',
-  'chapter.expand',
-  'chapter.compress',
-  'chapter.extract',
-  'chapter.reextract',
-  'chapter.check',
-  'format.repair',
-  'chapter.formatcheck',
-  'chapter.confirm',
-  'chapter.review',
-  'chapter.pairwise',
-  'chapter.deslop',
-  'chapter.accept',
-  'chapter.ingest',
-  'chapter.repair',
-  'summary.arc',
-  'summary.volume',
-  'book.blurb',
-  'audit.window',
-  'audit.arc',
-  'audit.volume',
-  'audit.heldout',
-  'bakeoff.write',
-  'bakeoff.judge',
-  'import.bootstrap',
-  'index.rebuild',
-  'slop.fingerprint',
-  'media.cover',
-  'publish',
-  'routing.feasibility',
-  'harness.canary',
-  // v3 流程（docs/v3/DESIGN.md）：一次运行写一批
-  'book.open',
-  'book.write',
-  'book.retro',
-] as const;
+/**
+ * 任务种类（v3 流程，docs/v3/DESIGN.md §2）+ 发布。
+ * Removed kinds stay readable as strings in tasks/runs rows; never reuse a removed kind name.
+ */
+export const TASK_KINDS = ['book.open', 'book.write', 'book.retro', 'publish'] as const;
 export type TaskKind = (typeof TASK_KINDS)[number];
 export const zTaskKind = z.enum(TASK_KINDS);
 
 export const LANES = ['write', 'side', 'system'] as const;
 export type Lane = (typeof LANES)[number];
 
-/** 质量档位。lean = lite 的别名（DESIGN §6.4）。默认 standard（D2 修订）。 */
-export const QUALITY_TIERS = ['lite', 'lean', 'standard', 'key'] as const;
-export type QualityTier = (typeof QUALITY_TIERS)[number];
-export const zQualityTier = z.enum(QUALITY_TIERS);
-export const normalizeTier = (t: QualityTier): 'lite' | 'standard' | 'key' => (t === 'lean' ? 'lite' : t);
 
 export const TASK_STATES = [
   'pending', // 依赖未满足

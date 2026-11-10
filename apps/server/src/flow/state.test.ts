@@ -67,9 +67,13 @@ describe('meta.v3 atomic helpers', () => {
     const m = readV3Meta(await metaOf('b2'));
     expect(m.locked).toEqual([3, 1]);
     expect(m.hints).toHaveLength(1);
-    await addBook('b3');
+    // 旧书（没有 meta.v3，P3 D1）：主人的操作不会把 meta.v3 建出来（接手到一半的书改正文也一样）
+    await addBook('b3', { takeoverIntent: { from: 8 } });
     await lockChapter(h.db, 'b3', 7);
-    expect(readV3Meta(await metaOf('b3')).locked).toEqual([7]);
+    expect(await metaOf('b3')).toEqual({ takeoverIntent: { from: 8 } });
+    await addBook('b4', { v3: emptyV3Meta() });
+    await lockChapter(h.db, 'b4', 7);
+    expect(readV3Meta(await metaOf('b4')).locked).toEqual([7]);
   });
 });
 

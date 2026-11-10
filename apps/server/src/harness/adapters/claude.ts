@@ -24,12 +24,9 @@ import {
   effortOf,
   filterExtraArgs,
   invocation,
-  materializeVia,
   minimalEnv,
-  readSchemaFile,
   standardProbe,
   toolCallEvent,
-  wantsSchema,
 } from './common.js';
 
 const DEFAULTS: CapabilityDefaults = {
@@ -375,28 +372,10 @@ export const claudeAdapter: HarnessAdapter = {
       },
     };
   },
-  materialize: (spec, compiled, caps, ctx) => materializeVia('claude-code', spec, compiled, caps, ctx?.home),
-  buildInvocation(spec, caps, home, mat, acct, inst) {
+  buildInvocation(spec, _caps, home, acct, inst) {
     checkAuthEnv(acct.authMode, acct.secretEnv);
-    // settings：若 lane C 产出了 cc.settings.json（Stop hook），把 adapter 的权限设置合并进去，只传一个 --settings
-    const adapterSettingsFile = home.configFiles.find((f) => f.path.endsWith('cc.adapter.settings.json'));
-    const matArgv = [...mat.argv];
-    const sIdx = matArgv.indexOf('--settings');
-    let settingsPath = adapterSettingsFile?.path;
-    if (sIdx >= 0 && matArgv[sIdx + 1]) {
-      const cPath = matArgv[sIdx + 1]!;
-      const cFile = mat.files.find((f) => f.path === cPath);
-      if (cFile && adapterSettingsFile) {
-        try {
-          const merged = deepMerge(JSON.parse(cFile.content), JSON.parse(adapterSettingsFile.content));
-          cFile.content = JSON.stringify(merged, null, 2);
-        } catch {
-          /* C 的 settings 不是 JSON：保留 C 的 */
-        }
-      }
-      settingsPath = cPath;
-      matArgv.splice(sIdx, 2);
-    }
+    // 指令在 cwd（书快照）的 CLAUDE.md → @AGENTS.md；这里只传 adapter 的权限设置
+    const settingsPath = home.configFiles.find((f) => f.path.endsWith('cc.adapter.settings.json'))?.path;
     const argv = [inst.binPath, '-p', '--output-format', 'stream-json', '--verbose'];
     if (spec.role === 'writer') argv.push('--include-partial-messages');
     if (spec.session.mode === 'fresh') argv.push('--session-id', spec.session.id || spec.runId);
@@ -408,25 +387,18 @@ export const claudeAdapter: HarnessAdapter = {
     const eff = effortOf(spec, EFFORTS);
     if (eff) argv.push('--effort', eff);
     const tools = ['Read', 'Write', 'Edit', 'Glob', 'Grep'];
-    const disallowed = ['Bash', 'WebFetch', 'WebSearch', 'NotebookEdit'];
-    if (spec.subagents) tools.push('Agent');
-    else disallowed.push('Agent', 'Task');
+    // 不开子代理
+    const disallowed = ['Bash', 'WebFetch', 'WebSearch', 'NotebookEdit', 'Agent', 'Task'];
     argv.push('--permission-mode', 'acceptEdits', '--permission-prompts', 'none');
     argv.push('--tools', tools.join(','), '--disallowedTools', disallowed.join(','));
     argv.push('--setting-sources', 'project', '--strict-mcp-config');
-    if (spec.mcp) argv.push('--mcp-config', path.join(spec.inDir, 'mcp.cc.json'));
     if (settingsPath) argv.push('--settings', settingsPath);
-    argv.push(...matArgv);
-    if (wantsSchema(spec, caps)) {
-      const schema = readSchemaFile(spec);
-      if (schema) argv.push('--json-schema', schema);
-    }
     if (spec.limits.maxTurns > 0) argv.push('--max-turns', String(spec.limits.maxTurns));
     if (spec.limits.maxBudgetUsd && !SUBSCRIPTION_MODES.has(acct.authMode)) argv.push('--max-budget-usd', String(spec.limits.maxBudgetUsd));
     if (!spec.persistSession) argv.push('--no-session-persistence');
     argv.push('--add-dir', spec.inDir);
     argv.push(...filterExtraArgs(spec.extraArgs, DENY_EXTRA));
-    const env = buildEnv(spec, inst, acct.secretEnv, home.env, mat.env);
+    const env = buildEnv(spec, inst, acct.secretEnv, home.env);
     if (SUBSCRIPTION_MODES.has(acct.authMode)) {
       delete env.ANTHROPIC_API_KEY;
       delete env.ANTHROPIC_AUTH_TOKEN;
@@ -498,13 +470,3 @@ export const claudeAdapter: HarnessAdapter = {
     return null;
   },
 };
-
-function deepMerge(a: unknown, b: unknown): unknown {
-  if (Array.isArray(a) && Array.isArray(b)) return [...new Set([...a, ...b])];
-  if (a && b && typeof a === 'object' && typeof b === 'object') {
-    const out: Record<string, unknown> = { ...(a as Record<string, unknown>) };
-    for (const [k, v] of Object.entries(b as Record<string, unknown>)) out[k] = k in out ? deepMerge(out[k], v) : v;
-    return out;
-  }
-  return b ?? a;
-}

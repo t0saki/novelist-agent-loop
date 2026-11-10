@@ -11,8 +11,8 @@ import { V3_LAUNCH_PROMPT, V3_TITLE_PLACEHOLDER, chapterId } from '@novelist/sha
 import { books, runs, tasks } from '../db/schema.js';
 import { readRunChanges } from '../book/harvest.js';
 import { V3_CLAUDE_MD, renderAgentsMdV3 } from '../instructions/v3.js';
-import { buildManifest, frontmatterFor, requireBook } from '../pipeline/common.js';
-import type { BookHandle, HarvestedRun, InboxInput, PipelineContext, PrepareResult, RunContext, TaskHandler, TaskResult, TaskRow, TaskSpec } from '../pipeline/types.js';
+import { buildManifest, requireBook } from '../runtime/manifest.js';
+import type { BookHandle, HarvestedRun, InboxInput, PipelineContext, PrepareResult, RunContext, TaskHandler, TaskResult, TaskRow, TaskSpec } from '../runtime/types.js';
 import { loadSystemSettings } from '../orchestrator/routing.js';
 import { normaliseChapter } from './checks.js';
 import { buildPromote } from './commit.js';
@@ -120,11 +120,6 @@ export async function prepareV3(ctx: PipelineContext, task: TaskRow, run: RunCon
   return {
     kind: 'run',
     plan: {
-      frontmatter: frontmatterFor(book, task, run, []),
-      body: '',
-      inputs: [],
-      ownerNotes: [],
-      contract: 'v3',
       v3: { agentsMd: agents.text, agentsBytes: agents.bytes, claudeMd: V3_CLAUDE_MD, orderMd, launchPrompt: V3_LAUNCH_PROMPT, stackHash: agents.stackHash, layers: agents.layers },
       effort: spec.effort,
       limits: { maxTurns: 30 + 12 * n, wallMs },
@@ -370,6 +365,7 @@ export async function finalizeV3(ctx: PipelineContext, task: TaskRow, h: Harvest
     ...(serverTail ? { serverTail } : {}),
     ...(ownerMessageRead ? { ownerMessageRead } : {}),
     ...(ownerRequestResults.length ? { ownerRequestResults } : {}),
+    ...(order.takeover && plan.newChapters.length > 0 ? { takeoverDone: true } : {}),
   });
 
   const inbox: InboxInput[] = [];
@@ -484,6 +480,7 @@ export async function nextTasksV3(ctx: PipelineContext, book: BookHandle, row: t
     sinceRetro,
     rewinding: meta.rewinding !== null,
     finaleNoMarker: meta.finaleNoMarker,
+    ...(meta.writeNow ? { writeNow: true } : {}),
   };
   const step = decideNext(state);
   if (step.kind === 'none') return [];
@@ -528,7 +525,7 @@ async function updateSched(ctx: PipelineContext, book: BookHandle, row: typeof b
   if (changed) await setSched(ctx.deps.db, book.id, { bufferDays, bufferFull, at: now.toISOString() });
 }
 
-export const bookOpen: TaskHandler = { kind: 'book.open', role: 'writer', lane: 'write', maxAttempts: 50, contract: 'v3', manifest: v3Manifest, prepare: prepareV3, finalize: finalizeV3 };
-export const bookWrite: TaskHandler = { kind: 'book.write', role: 'writer', lane: 'write', maxAttempts: 50, contract: 'v3', manifest: v3Manifest, prepare: prepareV3, finalize: finalizeV3 };
+export const bookOpen: TaskHandler = { kind: 'book.open', role: 'writer', lane: 'write', maxAttempts: 50, manifest: v3Manifest, prepare: prepareV3, finalize: finalizeV3 };
+export const bookWrite: TaskHandler = { kind: 'book.write', role: 'writer', lane: 'write', maxAttempts: 50, manifest: v3Manifest, prepare: prepareV3, finalize: finalizeV3 };
 /** 复盘：只改笔记和大纲，不改正文；从不重试（失败也算做过了，见 executor finishTaskV3 与上面的兜底） */
-export const bookRetro: TaskHandler = { kind: 'book.retro', role: 'writer', lane: 'write', maxAttempts: 1, contract: 'v3', manifest: v3Manifest, prepare: prepareV3, finalize: finalizeV3 };
+export const bookRetro: TaskHandler = { kind: 'book.retro', role: 'writer', lane: 'write', maxAttempts: 1, manifest: v3Manifest, prepare: prepareV3, finalize: finalizeV3 };

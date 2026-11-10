@@ -9,7 +9,7 @@ import { V3_AGENTS_SOFT_LIMIT, V3_CLAUDE_MD, renderAgentsMdV3 } from '../instruc
 import { books } from '../db/schema.js';
 import { execEnv, type ExecEnv } from '../orchestrator/executor.js';
 import { createOrchTestEnv, type OrchTestEnv } from '../orchestrator/testing.js';
-import type { PipelineContext, TaskRow } from '../pipeline/types.js';
+import type { PipelineContext, TaskRow } from '../runtime/types.js';
 import { ORDER_TEMPLATES_DIR, buildOrderSpec, fillTemplate, noteBudgetLines, ownerRewriteHint, renderEnding, renderFeedback, renderHints, renderLibrary, renderOrder, selectHints, waitingOwnerRequests } from './order.js';
 import { emptyV3Meta } from './state.js';
 import { renderLibraryV3 } from './library.js';
@@ -90,6 +90,41 @@ describe('ORDER.md golden files', () => {
   it('write-feedback (phrases + short line)', async () => {
     const spec = orderSpec({ feedback: { phrases: ['深吸一口气', '月光洒在青石板上', '嘴角'], range: [1, 5], shortRecent: true } });
     await expect(await renderOrder(spec, { ...noExtra, mustRead: MUST_READ })).toMatchFileSnapshot('./__golden__/order.write-feedback.golden.md');
+  });
+  it('takeover (P3: first write of a taken-over legacy book)', async () => {
+    const spec = orderSpec({ from: 13, count: 5, accepted: 12, totalCjk: 41000, planned: 22, targetCjk: 80000, phase: 'normal', takeover: { lastChapters: [10, 11, 12], legacyFiles: ['bible/premise.md', 'notes/v1/bible.json', 'plan/volumes/v01.yaml'] } });
+    const mustRead = ['- bible/premise.md', '- notes/v1/bible.json（很长，只看开头）', '- plan/volumes/v01.yaml'].join('\n');
+    await expect(await renderOrder(spec, { ...noExtra, mustRead, ownerNote: true, budgets: '' })).toMatchFileSnapshot('./__golden__/order.takeover.golden.md');
+  });
+  it('takeover-closing (the first batch is already in the closing phase: ending list, threads, no end marker yet)', async () => {
+    const spec = orderSpec({ from: 13, count: 5, accepted: 12, totalCjk: 41000, planned: 22, targetCjk: 80000, phase: 'closing', endingListExists: false, effort: 'high', allowRewrite: [11], takeover: { lastChapters: [10, 11, 12], legacyFiles: ['bible/premise.md'] } });
+    const out = await renderOrder(spec, { ...noExtra, mustRead: '- bible/premise.md', budgets: '' });
+    await expect(out).toMatchFileSnapshot('./__golden__/order.takeover-closing.golden.md');
+    expect(out).toContain('## 收尾阶段');
+    expect(out).toContain('加一节"## 结局章节清单"');
+    expect(out).toContain('故事还没到结局批，不要写"（全书完）"。');
+    expect(out).toContain('允许改写的旧章：第 11 章');
+  });
+  it('takeover-finale (short length / few chapters left: write to the end with the end marker)', async () => {
+    const spec = orderSpec({ mode: 'finale', finale: true, from: 9, count: 4, accepted: 8, totalCjk: 24000, planned: 12, targetCjk: 30000, takeover: { lastChapters: [6, 7, 8], legacyFiles: ['bible/premise.md'] } });
+    const out = await renderOrder(spec, { ...noExtra, mustRead: '- bible/premise.md', budgets: '' });
+    await expect(out).toMatchFileSnapshot('./__golden__/order.takeover-finale.golden.md');
+    expect(out).toMatch(/^任务：接手这本书，然后从第 9 章写到全书结束（计划还剩约 4 章，章数不限）$/m);
+    expect(out).toContain('最后一章写完后，在末尾单独一行写"（全书完）"。');
+    expect(out).toContain('结束前确认最后一章末尾有"（全书完）"。');
+    expect(out).not.toContain('不要写"（全书完）"');
+  });
+  it('takeover-open (a legacy book with no chapters: read the old premise / notes, keep its direction, start at chapter 1)', async () => {
+    const spec = orderSpec({ mode: 'open-long', kind: 'book.open', from: 1, count: 5, planned: 20, accepted: 0, totalCjk: 0, bibleExisted: false, takeover: { lastChapters: [], legacyFiles: ['bible/premise.md', 'notes/v1/bible.json', 'notes/v1/outline.json'] } });
+    const mustRead = ['- bible/premise.md', '- notes/v1/bible.json', '- notes/v1/outline.json'].join('\n');
+    const out = await renderOrder(spec, { ...noExtra, mustRead, library: '书库摘要（不要和这些书雷同）：\n- 《别的书》\n', budgets: '' });
+    await expect(out).toMatchFileSnapshot('./__golden__/order.takeover-open.golden.md');
+    expect(out).toContain('bible/premise.md');
+    expect(out).toContain('沿用其中的书名、设定和方向');
+    expect(out).not.toContain('最不像');
+    expect(out).not.toContain('书库摘要');
+    expect(out).not.toContain('seed.md');
+    expect(out).toContain('然后从第 1 章写起，正文从 manuscript/c00001.md 起');
   });
   it('retro', async () => {
     const spec = orderSpec({ mode: 'retro', kind: 'book.retro', from: 21, count: 0, accepted: 20, planned: 50, totalCjk: 81000, retro: { from: 1, to: 20 }, effort: 'medium' });
@@ -196,6 +231,9 @@ describe('ORDER.md rendering rules', () => {
       { spec: orderSpec({ mode: 'finale', from: 11, count: 3, finale: true, accepted: 10 }), want: { mode: 'finale', from: 11, count: 3 } },
       { spec: orderSpec({ phase: 'closing', feedback: { phrases: ['甲乙丙丁'], range: [1, 5], shortRecent: true } }), want: { mode: 'write', from: 6, count: 5 } },
       { spec: orderSpec({ mode: 'retro', kind: 'book.retro', from: 21, count: 0, accepted: 20, planned: 50, retro: { from: 11, to: 20 } }), want: { mode: 'retro', from: 11, count: 10, planned: 50 } },
+      { spec: orderSpec({ from: 13, count: 5, accepted: 12, planned: 22, takeover: { lastChapters: [10, 11, 12], legacyFiles: [] } }), want: { mode: 'write', from: 13, count: 5, planned: 22, takeover: true } },
+      { spec: orderSpec({ mode: 'finale', finale: true, from: 9, count: 4, accepted: 8, planned: 12, takeover: { lastChapters: [6, 7, 8], legacyFiles: [] } }), want: { mode: 'finale', from: 9, count: 4, planned: 12, takeover: true } },
+      { spec: orderSpec({ mode: 'open-long', kind: 'book.open', from: 1, count: 5, accepted: 0, planned: 20, takeover: { lastChapters: [], legacyFiles: [] } }), want: { mode: 'write', from: 1, count: 5, planned: 20, takeover: true } },
     ];
     for (const c of cases) expect(parseOrderText(await renderOrder(c.spec, noExtra))).toMatchObject(c.want);
   });
@@ -283,6 +321,45 @@ describe('ORDER.md owner steering (WP-2)', () => {
     const r = (id: string, chapter: number, status: 'waiting' | 'done' = 'waiting') => ({ id, kind: 'rewrite' as const, chapter, note: '', at: AT, status });
     const meta = { ...emptyV3Meta(), locked: [6], ownerRequests: [r('a', 6), r('b', 2), r('c', 9), r('d', 4, 'done'), r('e', 5), r('f', 7)] };
     expect(waitingOwnerRequests(meta, 2, 8).map((x) => x.id)).toEqual(['e', 'f']);
+  });
+});
+
+describe('buildOrderSpec for a taken-over legacy book (P3)', () => {
+  let t: OrchTestEnv;
+  let env: ExecEnv;
+  beforeEach(async () => {
+    t = await createOrchTestEnv();
+    env = execEnv(t.deps);
+  });
+  afterEach(async () => {
+    await t.close();
+  });
+  async function build(slug: string, status: 'pending' | 'done') {
+    const files: Record<string, string> = { 'notes/v1/bible.json': '{"chars":[]}\n', 'notes/v1/outline.json': `${'很长的大纲。'.repeat(12_000)}\n`, 'plan/volumes/v01.yaml': 'id: v01\ntitle: 第一卷\n', 'bible/world.md': '世界观。\n', 'bible/notes.txt': '不列\n' };
+    const b = await addV3Book(t, slug, { chapters: 6, meta: { takeover: { at: AT, from: 7, status } }, files });
+    const book = await env.pipe.openBook(env.pdeps, b.id);
+    const task = { id: `t-${slug}`, kind: 'book.write', target: 'x', params: { from: 7 } } as unknown as TaskRow;
+    return buildOrderSpec({ deps: env.pdeps, book }, book, task);
+  }
+
+  it('pending → the takeover order: last three chapters, the legacy files at HEAD (long ones marked), notes to build first', async () => {
+    const out = await build('tk', 'pending');
+    if (!('spec' in out)) throw new Error('skipped');
+    expect(out.spec.takeover?.lastChapters).toEqual([4, 5, 6]);
+    expect(out.spec.takeover?.legacyFiles).toEqual(['bible/premise.md', 'bible.md', 'outline.md', 'notes/progress.md', 'notes/v1/bible.json', 'notes/v1/outline.json', 'bible/world.md', 'plan/volumes/v01.yaml']);
+    expect(out.extra.mustRead.split('\n')).toEqual(['- bible/premise.md', '- bible.md', '- outline.md', '- notes/progress.md', '- notes/v1/bible.json', '- notes/v1/outline.json（很长，只看开头）', '- bible/world.md', '- plan/volumes/v01.yaml']);
+    const md = await renderOrder(out.spec, out.extra);
+    expect(md).toMatch(/^任务：接手这本书，然后新写第 7–11 章（共 5 章）$/m);
+    expect(md).toContain('读最后三章：manuscript/c00004.md、manuscript/c00005.md、manuscript/c00006.md。');
+    expect(md).toContain('- notes/v1/outline.json（很长，只看开头）');
+    expect(parseOrderText(md)).toMatchObject({ mode: 'write', from: 7, count: 5 });
+  });
+
+  it('done → the normal write order', async () => {
+    const out = await build('tkd', 'done');
+    if (!('spec' in out)) throw new Error('skipped');
+    expect(out.spec.takeover).toBeUndefined();
+    expect(await renderOrder(out.spec, out.extra)).toMatch(/^任务：新写第 7–11 章/m);
   });
 });
 

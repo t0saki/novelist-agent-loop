@@ -1,12 +1,12 @@
 import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { V3_PUBLISH_DEFAULTS, zPublishConfig, type PublishConfig } from '@novelist/shared';
-import { books, chapters, tasks } from '../db/schema.js';
+import { books, chapters, inbox, tasks } from '../db/schema.js';
 import { emptyV3Meta } from '../flow/state.js';
 import { v3PublishCap } from '../flow/publish.js';
 import { addV3Book } from '../flow/testing-book.js';
 import type { V3Hint } from '../flow/types.js';
-import { publish } from '../pipeline/handlers/system.js';
+import { publish } from '../runtime/publish.js';
 import { eligibleThrough, publishTick, type PublishIo } from './publisher.js';
 import { createScheduler } from './scheduler.js';
 import { execEnv } from './executor.js';
@@ -46,7 +46,7 @@ function io(cfg: PublishConfig, extra: Partial<PublishIo> = {}): PublishIo & { e
   const enqueued: number[] = [];
   return {
     enqueued,
-    loadConfig: async (bookId) => ({ cfg, arcLength: 0, v3Cap: await v3PublishCap(t.db, bookId, NOW, 24) }),
+    loadConfig: async (bookId) => ({ cfg, v3Cap: await v3PublishCap(t.db, bookId, NOW, 24) }),
     enqueue: async ({ through }) => {
       enqueued.push(through);
       return true;
@@ -81,10 +81,31 @@ describe('v3 publishing', () => {
 
   it('require_audited and min_lag ignored', () => {
     const cfg = v3cfg({ require_audited: true, min_lag: 5, lag: 5, per_slot: 3 });
-    expect(eligibleThrough({ accepted: 10, audited: 0, published: 0, lag: 5 }, cfg, false, 9)).toBe(3);
-    expect(eligibleThrough({ accepted: 10, audited: 0, published: 0, lag: 5 }, { ...cfg, mode: 'immediate' }, false, 9)).toBe(9);
-    // 没有 v3Cap：旧规则（审计前沿卡住）
-    expect(eligibleThrough({ accepted: 10, audited: 0, published: 0, lag: 5 }, cfg)).toBe(0);
+    expect(eligibleThrough({ accepted: 10, published: 0 }, cfg, 9)).toBe(3);
+    expect(eligibleThrough({ accepted: 10, published: 0 }, { ...cfg, mode: 'immediate' }, 9)).toBe(9);
+    // 没有 v3Cap（拿不到 v3 规则）：什么都不发，不退回“按已收章数放行”
+    expect(eligibleThrough({ accepted: 10, published: 0 }, cfg, undefined)).toBe(0);
+  });
+
+  it('loadConfig throwing skips the book for this tick: nothing published (manual mode / frozen chapters stay safe), lastSlot and pause state untouched; the next tick publishes by the v3 rules', async () => {
+    const id = await book({ accepted: 10, lastBatchFrom: 6, meta: { publish: { lastSlot: ago(48) } }, hints: [{ kind: 'early_end', text: '第 3 章写成了结局', chapter: 3, rewrite: 3, at: ago(1) }] });
+    const before = (await t.db.select().from(books).where(eq(books.id, id)))[0];
+    let fail = true;
+    const x = io(v3cfg({ per_slot: 5 }), {
+      loadConfig: async (bookId) => {
+        if (fail) throw new Error('book.yaml 写到一半');
+        return { cfg: v3cfg({ per_slot: 5 }), v3Cap: await v3PublishCap(t.db, bookId, NOW, 24) };
+      },
+    });
+    await publishTick(t.db, NOW, x);
+    expect(x.enqueued).toEqual([]);
+    const after = (await t.db.select().from(books).where(eq(books.id, id)))[0];
+    expect((after?.meta as { publish?: unknown }).publish).toEqual((before?.meta as { publish?: unknown }).publish);
+    expect(after?.pausedReason).toBe(before?.pausedReason);
+    fail = false;
+    await publishTick(t.db, NOW, x);
+    // early_end 冻结：只发到第 2 章
+    expect(x.enqueued).toEqual([2]);
   });
 
   it('immediate mode publishes cap', async () => {
@@ -107,20 +128,12 @@ describe('v3 publishing', () => {
     expect(await v3PublishCap(t.db, id, NOW, 24)).toBe(5);
   });
 
-  it('low-buffer and buffer-blocked inbox suppressed for v3', async () => {
-    // 存稿 30 > max_buffer 15，但新一批刚入库、没有可发布的章节；已发布 1 章，每天 2 章 → 存稿天数很多？用 low_buffer_days_alert 拉高
+  it('over max_buffer with nothing publishable yet (a batch just landed): production not paused, no inbox', async () => {
+    // 存稿 30 > max_buffer 15，但新一批刚入库、没有可发布的章节
     await book({ accepted: 31, published: 1, lastBatchFrom: 2 });
-    let blocked = 0;
-    let low = 0;
-    const cfg = v3cfg({ low_buffer_days_alert: 1000 });
-    await publishTick(t.db, NOW, io(cfg, { bufferBlocked: async () => void (blocked += 1), lowBuffer: async () => void (low += 1) }));
-    expect(blocked).toBe(0);
-    expect(low).toBe(0);
+    await publishTick(t.db, NOW, io(v3cfg({ low_buffer_days_alert: 1000 })));
     expect((await t.db.select().from(books).where(eq(books.id, 'b')))[0]?.pausedReason).toBeNull();
-    // 同样的书走旧规则（没有 v3Cap）：两类待办都会发
-    await publishTick(t.db, NOW, { loadConfig: async () => ({ cfg: { ...cfg, require_audited: true }, arcLength: 0 }), bufferBlocked: async () => void (blocked += 1), lowBuffer: async () => void (low += 1) });
-    expect(blocked).toBe(1);
-    expect(low).toBe(1);
+    expect(await t.db.select().from(inbox)).toEqual([]);
   });
 
   it('scheduler loads the v3 cap for flow: v3 books and enqueues publish', async () => {

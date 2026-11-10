@@ -1,23 +1,20 @@
-/** 书的生命周期服务（开书、删除、reindex）与书级视图（summary/overview/publish）。Owner: lane G（调用 B 的 initBookRepo、C 的 genreExists、E 的 initialTasks、F 的 startBook）。 */
+/** 书的生命周期服务（开书、删除、reindex）与书级视图（summary/overview/publish）。新书一律是 v3 流程；旧书只读。 */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
-import { and, count, desc, eq, inArray, ne, notInArray } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { parseDocument } from 'yaml';
-import type { BookOverview, BookSummary, CreateBook, Frontiers, GitCommitRow, PublishOverview } from '@novelist/shared';
-import { V3_PUBLISH_DEFAULTS, V3_TITLE_PLACEHOLDER, chapterId, countCjk, parseChapterHeading, stripBeatMarkers, stripTitleLine, zCreateBook } from '@novelist/shared';
-import type { z } from 'zod';
+import type { AutoLength, BookConfig, BookOverview, BookSummary, CreateBookCompat, CreateBookParsed, Frontiers, GitCommitRow, V3Length } from '@novelist/shared';
+import { AUTO_LENGTHS, V3_PUBLISH_DEFAULTS, V3_TITLE_PLACEHOLDER, chapterId, countCjk, parseChapterHeading, stripBeatMarkers, stripTitleLine, zBookConfig, zCreateBook } from '@novelist/shared';
 import type { AppDeps } from '../app.js';
-import { bookFiles, CanonicalParseError, initBookRepo, openRepo, P, type BookRepo } from '../book/index.js';
+import { bookFiles, CanonicalParseError, fillVolumeTitles, initBookRepo, moveToTrash, openRepo, P, slugifyName, V3_BOOK_SQL, type BookRepo } from '../book/index.js';
 import { books, chapters, inbox, runs, tasks, publishSchedule, readingProgress, bookEvents } from '../db/schema.js';
-import { genreExists } from '../genres/index.js';
+import { genreExists, listGenres } from '../genres/index.js';
 import { syncBibleMeta } from '../flow/library.js';
 import { HttpProblem, conflict } from '../api/problem.js';
 import { bookBySlug, bookDir, type BookRow } from '../api/helpers.js';
-import { bufferState, commitOwnerEdit, ensureBatchLog, loadSystemSettings, nextSlots } from '../orchestrator/index.js';
-import { loadBookState, milestoneStatus } from '../state/index.js';
+import { bufferState, commitOwnerEdit, ensureBatchLog, loadSystemSettings } from '../orchestrator/index.js';
 import { isV3Row, v3Summaries } from './v3-view.js';
-import type { PublishConfig } from '@novelist/shared';
 
 export const AUTO_CREATED_EVENT = 'book.auto_created';
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -33,73 +30,121 @@ export async function makeSlug(deps: Pick<AppDeps, 'db' | 'paths'>, title: strin
   } catch {
     // books 目录尚未创建
   }
-  const { slugifyName } = await import('../state/ids.js');
-  // 空书名（只有 v3 允许）：不拼音化，直接用随机 slug
+  // 空书名：不拼音化，直接用随机 slug
   const candidate = title.trim() || opts.blankRandom !== true ? slugifyName(title, taken).slice(0, 60).replace(/-$/, '') : '';
   if (SLUG_RE.test(candidate) && !taken.has(candidate)) return candidate;
   return `book-${nanoid(8).toLowerCase().replace(/[^a-z0-9]/g, '0')}`;
 }
 
-/** 无题材不立项（v1 教训）：genre 不存在 → 400 */
-export async function createBook(deps: AppDeps, input: CreateBook): Promise<BookSummary> {
-  const parsed: z.output<typeof zCreateBook> = zCreateBook.parse(input);
-  if (!(await genreExists(deps.paths, parsed.genre))) throw new HttpProblem(400, 'unknown_genre', `题材包不存在：${parsed.genre}`);
-  const slug = parsed.slug ?? (await makeSlug(deps, parsed.title, { blankRandom: parsed.flow === 'v3' }));
+/** 开书的结果：题材、篇幅、种子都已定下 */
+export interface ResolvedNewBook {
+  genre: string;
+  length: V3Length;
+  seed: string;
+  title: string;
+}
+
+const AUTO_EVENT_KIND = AUTO_CREATED_EVENT;
+
+/**
+ * 开书表单 → 具体的题材 / 篇幅 / 种子（P3 WP-3）。
+ * 题材 'random'：在可见的题材包里按自动开书的权重（设置里的覆盖 → pack.yaml 的 auto.weight → 1）和自动开过的本数挑，与自动开书同一个规则；
+ * 篇幅 'random'：按篇幅分布补最近 20 本自动书的缺口（题材包的篇幅倾向加权）；
+ * 种子：请求里给了 seed 就原样用；否则按题材拼一份（buildAutoSeedV3：成人题材的年龄声明照旧带上），再接上主人的一句话想法。
+ */
+export async function resolveNewBook(deps: Pick<AppDeps, 'db' | 'paths'>, input: CreateBookParsed, opts: { rng?: () => number } = {}): Promise<ResolvedNewBook> {
+  // auto-start.ts 依赖本文件（createBook），这里动态引入避免循环
+  const { buildAutoSeedV3, lengthClass, pickGenre, pickKeywords, pickLength } = await import('./auto-start.js');
+  const settings = await loadSystemSettings(deps.db);
+  const cfg = settings.autoStart;
+  const packs = (await listGenres(deps.paths)).filter((p) => !p.hidden);
+  const events = await deps.db.select({ body: bookEvents.body }).from(bookEvents).where(eq(bookEvents.kind, AUTO_EVENT_KIND)).orderBy(desc(bookEvents.ts), desc(bookEvents.id));
+  const counts = new Map<string, number>();
+  for (const e of events) {
+    const g = typeof e.body.genre === 'string' ? e.body.genre : null;
+    if (g) counts.set(g, (counts.get(g) ?? 0) + 1);
+  }
+  let genreId = input.genre;
+  if (genreId === 'random') {
+    const weightOf = (p: (typeof packs)[number]) => cfg.genreWeights[p.id] ?? p.auto?.weight ?? 1;
+    const weighted = packs.filter((p) => weightOf(p) > 0);
+    const pool = weighted.length > 0 ? weighted : packs;
+    const picked = pickGenre(pool, counts, new Map(pool.map((p) => [p.id, weightOf(p)])));
+    if (!picked) throw new HttpProblem(400, 'no_genre', '没有可用的题材包，先新建或恢复一个');
+    genreId = picked;
+  } else if (!(await genreExists(deps.paths, genreId))) {
+    throw new HttpProblem(400, 'unknown_genre', `题材包不存在：${genreId}`);
+  }
+  const pack = (await listGenres(deps.paths)).find((p) => p.id === genreId);
+  let length: V3Length;
+  if (input.length === 'random') {
+    const recent = events
+      .map((e) => e.body.length)
+      .filter((l): l is AutoLength => typeof l === 'string' && (AUTO_LENGTHS as readonly string[]).includes(l))
+      .slice(0, 20);
+    length = pickLength(recent, cfg.lengthMix, pack?.auto?.length_hint ? lengthClass(pack.auto.length_hint) : null);
+  } else {
+    length = input.length;
+  }
+  let seed = input.seed;
+  if (seed === undefined) {
+    const base = pack ? buildAutoSeedV3(pack, { ordinal: counts.get(genreId) ?? 0, keywords: pickKeywords(pack.auto?.keywords ?? [], opts.rng ?? Math.random) }) : '';
+    const idea = input.idea.trim();
+    seed = `${base}${idea ? `\n主人的想法：${idea}\n` : ''}`;
+  }
+  return { genre: genreId, length, seed, title: input.title };
+}
+
+/** 无题材不立项（v1 教训）：genre 不存在 → 400。新书一律走 v3 流程（请求里的 flow / tier / preset 不再起作用） */
+export async function createBook(deps: AppDeps, input: CreateBookCompat, opts: { rng?: () => number } = {}): Promise<BookSummary> {
+  const parsed = zCreateBook.parse(input);
+  const resolved = await resolveNewBook(deps, parsed, opts);
+  const slug = parsed.slug ?? (await makeSlug(deps, parsed.title, { blankRandom: true }));
   const existing = await deps.db.select({ id: books.id }).from(books).where(eq(books.slug, slug)).limit(1);
   if (existing[0]) throw conflict(`书 ${slug} 已存在`);
   const dir = bookDir(deps, slug);
   if (await fs.stat(dir).then(() => true, () => false)) throw conflict(`目录 ${slug} 已存在`);
-
-  if (parsed.flow === 'v3') return createBookV3(deps, parsed, slug, dir);
-
-  const tier = parsed.tier ?? (await loadSystemSettings(deps.db)).defaultTier;
-  const config: Record<string, unknown> = { slug, title: parsed.title, genre: parsed.genre, tier };
-  if (parsed.scale) config.scale = parsed.scale;
-  if (parsed.preset) config.routing = { preset: parsed.preset };
-  if (parsed.approvals) config.approvals = parsed.approvals;
-  const { commit } = await initBookRepo(dir, { config: config as never, premise: parsed.seed });
-  const id = randomUUID();
-  await deps.db.insert(books).values({ id, slug, title: parsed.title, genre: parsed.genre, status: 'draft', tier, headCommit: commit });
-  await deps.db.insert(bookEvents).values({ bookId: id, kind: 'book.created', body: { slug, seed_chars: parsed.seed.length } });
-  if (parsed.start) await deps.orchestrator.startBook(id, { interview: parsed.interview });
-  deps.bus.publish({ type: 'book_changed', book: slug });
-  const row = await bookBySlug(deps, slug);
-  return (await summarize(deps, [row]))[0] as BookSummary;
+  return createBookV3(deps, parsed, resolved, slug, dir);
 }
 
 /**
  * v3 开书（p1-plan §3 WP-C）：book.yaml 写 flow/v3/发布默认值，仓库用 v3 布局（seed.md、不入库的根 AGENTS.md）。
  * 书名可留空：用 '未命名·' 占位（与自动开书的 '待命名·' 不同，nameAutoBooks 不会碰），由作者在 bible.md 里起名（auto_title）。
  */
-async function createBookV3(deps: AppDeps, parsed: z.output<typeof zCreateBook>, slug: string, dir: string): Promise<BookSummary> {
+async function createBookV3(deps: AppDeps, parsed: CreateBookParsed, resolved: ResolvedNewBook, slug: string, dir: string): Promise<BookSummary> {
   const settings = await loadSystemSettings(deps.db);
-  const len = parsed.v3?.length ?? 'medium';
-  const target = parsed.v3?.target_cjk ?? settings.autoStart.lengths[len].targetCjk;
+  const len = resolved.length;
+  const target = parsed.target_cjk ?? settings.autoStart.lengths[len].targetCjk;
   const n0 = Math.max(1, Math.ceil(target / 4000));
-  const batch = parsed.v3?.batch ?? 5;
-  const typed = parsed.title.trim();
+  const batch = parsed.batch ?? 5;
+  const typed = resolved.title.trim();
   const title = typed || `${V3_TITLE_PLACEHOLDER}${nanoid(6)}`;
-  const maxBuffer = Math.max(15, 2 * batch);
+  // 发布与 effort 的全站默认值（系统页、模型页可改；初始值 = 以前写死的那一套）
+  const pd = settings.v3.publishDefaults;
+  const maxBuffer = Math.max(pd.max_buffer, 2 * batch);
   const config: Record<string, unknown> = {
     slug,
     title,
-    genre: parsed.genre,
-    tier: 'lite',
+    genre: resolved.genre,
     flow: 'v3',
-    v3: { length: len, target_cjk: target, planned_chapters: n0, planned_chapters_initial: n0, batch, min_chapter_cjk: parsed.v3?.min_chapter_cjk ?? 3000, auto_title: !typed },
-    publish: { ...V3_PUBLISH_DEFAULTS, max_buffer: maxBuffer, resume_buffer: maxBuffer - 5 },
+    v3: { length: len, target_cjk: target, planned_chapters: n0, planned_chapters_initial: n0, batch, min_chapter_cjk: parsed.min_chapter_cjk ?? 3000, auto_title: !typed, effort: { ...settings.v3.effortDefaults } },
+    publish: { ...V3_PUBLISH_DEFAULTS, mode: pd.mode, cadence: pd.cadence, timezone: pd.timezone, per_slot: pd.per_slot, max_buffer: maxBuffer, resume_buffer: Math.max(1, maxBuffer - 5) },
   };
-  const { commit } = await initBookRepo(dir, { config: config as never, premise: parsed.seed, layout: 'v3' });
+  const { commit } = await initBookRepo(dir, { config: config as never, premise: resolved.seed, layout: 'v3' });
   const id = randomUUID();
   const meta = { v3: { hints: [], noChapterStreak: 0, emptyStreak: 0, finaleNoMarker: 0, lastBatchFrom: null, lastBatchAt: null, hintedShort: [], locked: [], pending: null } };
-  await deps.db.insert(books).values({ id, slug, title, genre: parsed.genre, status: 'draft', tier: 'lite', headCommit: commit, meta });
-  await deps.db.insert(bookEvents).values({ bookId: id, kind: 'book.created', body: { slug, seed_chars: parsed.seed.length, flow: 'v3' } });
-  if (parsed.start) await deps.orchestrator.startBook(id, { interview: false });
+  await deps.db.insert(books).values({ id, slug, title, genre: resolved.genre, status: 'draft', headCommit: commit, meta });
+  await deps.db.insert(bookEvents).values({ bookId: id, kind: 'book.created', body: { slug, seed_chars: resolved.seed.length, flow: 'v3', length: len } });
+  if (parsed.start) await deps.orchestrator.startBook(id);
   deps.bus.publish({ type: 'book_changed', book: slug });
   const row = await bookBySlug(deps, slug);
   return (await summarize(deps, [row]))[0] as BookSummary;
 }
 
+/**
+ * 删书：数据库行照旧删除；书目录移进回收站（$DATA/trash/books/<slug>-<时间>，带墓碑），不做不可恢复的删除（P3 D14）。
+ * 目录本来就不在（手工移走过）：只删数据库行。移动失败时数据库已删、目录还在原处：可以重建行后 `novelist reindex` 找回。
+ */
 export async function deleteBook(deps: AppDeps, slug: string): Promise<void> {
   const book = await bookBySlug(deps, slug);
   await deps.db.update(books).set({ status: 'archived', pausedReason: 'deleting', updatedAt: new Date().toISOString() }).where(eq(books.id, book.id));
@@ -107,6 +152,7 @@ export async function deleteBook(deps: AppDeps, slug: string): Promise<void> {
   for (const t of live) await deps.orchestrator.cancelTask(t.id).catch(() => {});
   const active = await deps.db.select({ n: count() }).from(runs).where(and(eq(runs.bookId, book.id), inArray(runs.state, [...ACTIVE_RUN_STATES])));
   if (Number(active[0]?.n ?? 0) > 0) throw conflict('还有运行中的 run，已暂停并取消任务，请等它们结束后重试', 'runs_active');
+  const deletedAt = new Date().toISOString();
   await deps.db.transaction(async (tx) => {
     await tx.delete(tasks).where(eq(tasks.bookId, book.id));
     await tx.delete(runs).where(eq(runs.bookId, book.id));
@@ -117,7 +163,16 @@ export async function deleteBook(deps: AppDeps, slug: string): Promise<void> {
     await tx.delete(bookEvents).where(and(eq(bookEvents.bookId, book.id), ne(bookEvents.kind, AUTO_CREATED_EVENT)));
     await tx.delete(books).where(eq(books.id, book.id)); // chapters 级联
   });
-  await fs.rm(bookDir(deps, slug), { recursive: true, force: true });
+  const dir = bookDir(deps, slug);
+  if (await fs.stat(dir).then(() => true, () => false)) {
+    const tombstone = { id: book.id, slug, title: book.title, genre: book.genre, status: book.status, meta: book.meta, acceptedThrough: book.acceptedThrough, publishedThrough: book.publishedThrough, deletedAt };
+    try {
+      await moveToTrash(deps.paths, 'books', slug, dir, tombstone);
+    } catch (err) {
+      deps.log.error({ err: (err as Error).message, slug }, 'delete book: moving the directory to the trash failed (database rows already deleted, directory left in place)');
+      throw new HttpProblem(500, 'trash_failed', `书已从数据库删除，但目录没能移进回收站：${(err as Error).message}`);
+    }
+  }
   deps.bus.publish({ type: 'book_changed', book: slug });
 }
 
@@ -152,23 +207,23 @@ export async function reindexBook(deps: AppDeps, slug: string): Promise<void> {
         .onConflictDoUpdate({ target: [chapters.bookId, chapters.no], set: update });
       continue;
     }
-    const card = await files.card(no, head).catch(() => null);
-    const update = { chapterId: chapterId(no), cjk, state: 'accepted', updatedAt: nowIso, ...(card ? { title: card.title, volume: card.volume, arc: card.arc } : {}) };
+    // 旧书：已有行的标题、卷保持原样；卷标题之后由 fillVolumeTitles 按 plan/volumes 回填
+    const update = { chapterId: chapterId(no), cjk, state: 'accepted', updatedAt: nowIso };
     const publishedAt = no <= pubThrough ? nowIso : null;
     await deps.db
       .insert(chapters)
-      .values({ bookId: book.id, no, title: card?.title ?? `第${no}章`, volume: card?.volume ?? '', arc: card?.arc ?? '', ...update, publishedAt })
+      .values({ bookId: book.id, no, title: `第${no}章`, volume: '', arc: '', ...update, publishedAt })
       .onConflictDoUpdate({ target: [chapters.bookId, chapters.no], set: update });
   }
-  const cards = (await repo.list('plan/cards', { rev: head })).map((p) => Number(/c(\d{5})\.yaml$/.exec(p)?.[1] ?? 0));
-  const cardsThrough = cards.length ? Math.max(...cards) : 0;
-  await deps.db.update(books).set({ acceptedThrough, totalCjk, cursor: acceptedThrough + 1, cardsThrough, headCommit: head, publishedThrough: Math.max(book.publishedThrough, pubThrough), updatedAt: nowIso }).where(eq(books.id, book.id));
+  await deps.db.update(books).set({ acceptedThrough, totalCjk, cursor: acceptedThrough + 1, headCommit: head, publishedThrough: Math.max(book.publishedThrough, pubThrough), updatedAt: nowIso }).where(eq(books.id, book.id));
   // v3（phase 1 写的书没有 batchLog）：按提交 trailer 回填批次（回退点、复盘用）
   if (v3 && acceptedThrough > 0) await ensureBatchLog(deps.db, repo, book.id);
   // v3：标签（书库摘要用）按 HEAD 上 bible.md 的第三行补上
   if (v3) {
     const bible = await repo.readFile('bible.md', head).catch(() => null);
     if (bible) await syncBibleMeta(deps.db, book.id, bible);
+  } else {
+    await fillVolumeTitles(deps.db, deps.paths, book).catch((err: Error) => deps.log.warn({ err: err.message, slug }, 'reindex: volume titles not filled'));
   }
   deps.bus.publish({ type: 'book_changed', book: slug });
 }
@@ -176,9 +231,7 @@ export async function reindexBook(deps: AppDeps, slug: string): Promise<void> {
 function frontiers(row: BookRow, bufferDays: number | null): Frontiers {
   return {
     accepted: row.acceptedThrough,
-    audited: row.auditedThrough,
     published: row.publishedThrough,
-    cardsPlanned: row.cardsThrough,
     buffer: Math.max(0, row.acceptedThrough - row.publishedThrough),
     bufferDays,
   };
@@ -187,7 +240,7 @@ function frontiers(row: BookRow, bufferDays: number | null): Frontiers {
 export async function summarize(deps: Pick<AppDeps, 'db' | 'paths'>, rows: BookRow[]): Promise<BookSummary[]> {
   const ids = rows.map((r) => r.id);
   if (ids.length === 0) return [];
-  // v3 书：状态句与花费（批量查询；flow 按 meta.v3 是否存在判断，旧流程书不读 book.yaml）
+  // v3 书：状态句与花费（批量查询；flow 按 meta.v3 判断，旧书不读 book.yaml）
   const v3 = await v3Summaries(deps, rows, new Date());
   const [taskRows, inboxRows, waitingRows] = await Promise.all([
     deps.db.select({ bookId: tasks.bookId, n: count() }).from(tasks).where(and(inArray(tasks.bookId, ids), inArray(tasks.state, [...LIVE_TASK_STATES]))).groupBy(tasks.bookId),
@@ -205,7 +258,6 @@ export async function summarize(deps: Pick<AppDeps, 'db' | 'paths'>, rows: BookR
     title: row.title,
     genre: row.genre,
     status: row.status as BookSummary['status'],
-    tier: row.tier as BookSummary['tier'],
     totalCjk: row.totalCjk,
     frontiers: frontiers(row, null),
     activeTasks: taskCount.get(row.id) ?? 0,
@@ -213,12 +265,26 @@ export async function summarize(deps: Pick<AppDeps, 'db' | 'paths'>, rows: BookR
     inboxOpen: inboxCount.get(row.id) ?? 0,
     updatedAt: row.updatedAt,
     flow: isV3Row(row) ? 'v3' : 'v2',
+    legacy: !isV3Row(row),
     v3: v3.get(row.id) ?? null,
   }));
 }
 
-export async function listBookSummaries(deps: Pick<AppDeps, 'db' | 'paths'>): Promise<BookSummary[]> {
-  const rows = await deps.db.select().from(books).orderBy(desc(books.updatedAt));
+export const BOOK_FILTERS = ['active', 'finished', 'legacy', 'all'] as const;
+export type BookFilter = (typeof BOOK_FILTERS)[number];
+
+/** 首页的筛选：active = 在写和等待中的新流程书（缺省），finished = 已完结 / 归档的新流程书，legacy = 旧书（导入的、旧流程写的），all = 全部 */
+export async function listBookSummaries(deps: Pick<AppDeps, 'db' | 'paths'>, opts: { filter?: BookFilter } = {}): Promise<BookSummary[]> {
+  const filter = opts.filter ?? 'active';
+  const where =
+    filter === 'active'
+      ? and(V3_BOOK_SQL, inArray(books.status, ['draft', 'planning', 'active', 'paused']))
+      : filter === 'finished'
+        ? and(V3_BOOK_SQL, inArray(books.status, ['completed', 'archived']))
+        : filter === 'legacy'
+          ? sql`not coalesce(${V3_BOOK_SQL}, false)`
+          : undefined;
+  const rows = await deps.db.select().from(books).where(where).orderBy(desc(books.updatedAt));
   return summarize(deps, rows);
 }
 
@@ -226,57 +292,30 @@ export function commitRow(c: { sha: string; ts: string; subject: string; trailer
   return { sha: c.sha, ts: c.ts, subject: c.subject, trailers: c.trailers, tags: c.tags };
 }
 
+/** book.yaml 读不出来（旧书的旧键不合 schema、文件没了）时的兜底配置：页面照常打开 */
+export function fallbackConfig(row: Pick<BookRow, 'slug' | 'title' | 'genre'>): BookConfig {
+  return zBookConfig.parse({ schema: 'nv.book/1', slug: SLUG_RE.test(row.slug) ? row.slug : 'legacy', title: row.title || row.slug || 'legacy', genre: row.genre || 'generic' });
+}
+
 export async function bookOverview(deps: AppDeps, row: BookRow): Promise<BookOverview> {
-  const repo = openRepo(bookDir(deps, row.slug));
-  const files = bookFiles(repo);
-  const [{ config }, summary, log, debtList, current, state] = await Promise.all([
-    files.config(),
+  const dir = bookDir(deps, row.slug);
+  const dirMissing = !(await fs.stat(dir).then((st) => st.isDirectory(), () => false));
+  const repo = openRepo(dir);
+  const [loaded, summary, log] = await Promise.all([
+    dirMissing ? Promise.resolve(null) : bookFiles(repo).config().catch(() => null),
     summarize(deps, [row]),
-    repo.log({ limit: 10 }),
-    files.debts().catch(() => []),
-    deps.db.select().from(chapters).where(and(eq(chapters.bookId, row.id), notInArray(chapters.state, ['accepted', 'planned']))).orderBy(chapters.no).limit(1),
-    loadBookState(bookDir(deps, row.slug)).catch(() => null),
+    dirMissing ? Promise.resolve({ items: [] }) : repo.log({ limit: 10 }).catch(() => ({ items: [] })),
   ]);
-  const milestones = state ? milestoneStatus(state).map((m) => ({ id: m.id, at: m.at, done: m.done, position: row.acceptedThrough ? Math.min(1, m.at / row.acceptedThrough) : 0 })) : [];
-  let currentChapter: BookOverview['currentChapter'] = null;
-  if (current[0]) {
-    const chId = chapterId(current[0].no);
-    const task = await deps.db.select({ id: tasks.id }).from(tasks).where(and(eq(tasks.bookId, row.id), eq(tasks.target, chId), inArray(tasks.state, [...LIVE_TASK_STATES]))).limit(1);
-    currentChapter = { no: current[0].no, state: current[0].state, taskId: task[0]?.id ?? null };
-  }
-  const open = debtList.filter((d) => d.status === 'open');
+  const config = loaded?.config ?? fallbackConfig(row);
+  const cfg = loaded?.config ?? null;
   const base = summary[0] as BookSummary;
   return {
     ...base,
-    frontiers: frontiers(row, (await bufferState(deps.db, row.id, config.publish, 0)).bufferDays),
-    config,
-    writerProfile: row.writerProfile,
-    currentChapter,
-    milestones,
-    debts: { forwardOpen: open.filter((d) => d.class === 'forward').length, metricOpen: open.filter((d) => d.class === 'metric').length, cap: config.policy.forward_debt_cap },
+    frontiers: frontiers(row, (await bufferState(deps.db, row.id, config.publish)).bufferDays),
+    config: cfg ? { flow: cfg.flow, publish: cfg.publish, v3: cfg.v3, routing: cfg.routing, genre: cfg.genre, title: cfg.title } : null,
+    writerOverride: cfg?.routing.writer_profile ?? null,
     recentCommits: log.items.map(commitRow),
-    formatVersion: row.formatVersion,
-  };
-}
-
-export async function publishOverview(deps: AppDeps, row: BookRow, cfgIn?: PublishConfig): Promise<PublishOverview> {
-  let cfg = cfgIn;
-  if (!cfg) cfg = (await bookFiles(openRepo(bookDir(deps, row.slug))).config()).config.publish;
-  const state = await bufferState(deps.db, row.id, cfg, 0);
-  let slots: string[] = [];
-  try {
-    slots = nextSlots(cfg, new Date(), 5);
-  } catch {
-    // cadence 配置错误由 PUT 校验提示
-  }
-  return {
-    slug: row.slug,
-    title: row.title,
-    config: cfg,
-    frontiers: frontiers(row, state.bufferDays),
-    nextSlots: slots,
-    paused: row.status === 'paused' || state.productionPaused,
-    pausedReason: row.pausedReason,
+    dirMissing,
   };
 }
 

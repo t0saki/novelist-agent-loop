@@ -4,7 +4,6 @@
  */
 import fs from 'node:fs/promises';
 import os from 'node:os';
-import path from 'node:path';
 import { eq, sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import type { AppConfig } from './config/index.js';
@@ -14,13 +13,14 @@ import { ensureAdminPassword } from './api/auth.js';
 import { buildServer } from './api/server.js';
 import { ensureGitRepo } from './book/index.js';
 import { migrate, openDb } from './db/client.js';
-import { accounts, importJobs, settings } from './db/schema.js';
+import { accounts, importJobs } from './db/schema.js';
 import { convertV1Packs, seedBuiltinGenres } from './genres/index.js';
 import { createAutoStarter } from './services/auto-start.js';
 import { createLoginManager, probeIsolation } from './harness/index.js';
 import { createLogger, type Logger } from './log.js';
-import { createEventBus, createOrchestrator, loadSystemSettings, seedRouting } from './orchestrator/index.js';
+import { createEventBus, createOrchestrator, loadSystemSettings, saveSlots, seedProfiles } from './orchestrator/index.js';
 import { registerLoginResult } from './services/accounts.js';
+import { createWriterOverrideRetry, runBootMigrations, runPostRecoveryMigrations } from './boot/migrate-p3.js';
 import { createSecretStore, loadMasterKey, loadSessionSecret } from './services/secrets.js';
 
 export interface RunningApp {
@@ -32,7 +32,7 @@ export interface RunningApp {
 const SHUTDOWN_GRACE_MS = 80_000;
 
 /** 组装进程级依赖（不启动 HTTP / 调度）。CLI 与 serve 共用 */
-export async function bootstrap(configIn: AppConfig, opts: { log?: Logger; migrate?: boolean } = {}): Promise<AppDeps> {
+export async function bootstrap(configIn: AppConfig, opts: { log?: Logger; migrate?: boolean; /** P3 开机迁移（boot/migrate-p3.ts）；只有 startServe 在编排进程里传 true */ bootMigrate?: boolean } = {}): Promise<AppDeps> {
   const paths = dataPaths(configIn.dataDir);
   for (const d of [paths.root, paths.books, paths.accounts, paths.runs, paths.runsActive, paths.instructionsGlobal, paths.genres, paths.harness, paths.exports, paths.media, paths.backups, paths.tmp, configIn.harnessDir]) {
     await fs.mkdir(d, { recursive: true });
@@ -61,33 +61,29 @@ export async function bootstrap(configIn: AppConfig, opts: { log?: Logger; migra
       onFinished: (_s, acct, result) => registerLoginResult({ db: dbh.db, secrets }, acct, result),
     }),
   };
-  await installNvWrapper(config.harnessDir, deps.log);
   if (opts.migrate !== false) {
     await ensureGitRepo(paths.instructionsGlobal);
     await seedBuiltinGenres(paths);
     await convertV1Packs(paths, log);
-    await seedRouting(dbh.db);
+    await seedProfiles(dbh.db);
+    // P3 开机迁移：只在 serve 的编排进程里跑（CLI 命令、只有 web / runner 的进程不跑；它们靠 claimNext / tick / 门面的过滤保持安全）
+    if (opts.bootMigrate) {
+      const report = await runBootMigrations(deps);
+      log.info({ report }, 'p3 boot migration');
+    }
     if (config.fakeHarness) await enableFakeMode(deps);
   }
   return deps;
 }
 
-/** mock 模式：确保 fake 账号存在，并把全部角色强制路由到 preset 'fake'（覆盖书级路由，重启后仍生效） */
+/**
+ * mock 模式：确保 fake 账号存在，两个路由位置都写成 fake（与以前覆盖路由一致）。
+ * 强制本身不存库：路由按 config.fakeHarness 在运行时强制走 fake、忽略书级覆盖；以后不用 fake 模式启动时位置照常可改。
+ */
 async function enableFakeMode(deps: AppDeps): Promise<void> {
   await deps.db.insert(accounts).values({ id: 'fake', harness: 'fake', label: 'fake', authMode: 'none', enabled: true, body: {} }).onConflictDoNothing({ target: accounts.id });
-  await deps.db.update(settings).set({ value: { presetId: 'fake', overrides: {}, forced: true }, updatedAt: new Date().toISOString() }).where(eq(settings.key, 'routing.active'));
-  deps.log.warn('NOVELIST_FAKE_HARNESS=1：mock 模式，全部角色走 fake adapter，不调用任何模型');
-}
-
-/**
- * 把 validators/cli.js 暴露成 `nv`（harness hook 的 `${NOVELIST_NV_BIN:-nv}`）。harness env 是 env -i 起步，只继承 PATH：
- * 写一个 sh 包装到 $DATA/harness/bin（在 harness 的 PATH 里）。开发（.ts）跳过。
- */
-async function installNvWrapper(harnessDir: string, log: Logger): Promise<void> {
-  const cli = path.join(import.meta.dirname, 'validators', 'cli.js');
-  if (!(await fs.stat(cli).then(() => true, () => false))) return;
-  const wrapper = path.join(harnessDir, 'nv');
-  await fs.writeFile(wrapper, `#!/bin/sh\nexec "${process.execPath}" "${cli}" "$@"\n`, { mode: 0o755 }).catch((err: Error) => log.warn({ err: err.message }, 'nv wrapper'));
+  await saveSlots(deps.db, { writer: { primary: 'fake', fallback: null }, utility: { primary: 'fake', fallback: null } });
+  deps.log.warn('NOVELIST_FAKE_HARNESS=1：mock 模式，两个路由位置都走 fake adapter，不调用任何模型');
 }
 
 export async function shutdownDeps(deps: AppDeps): Promise<void> {
@@ -96,7 +92,7 @@ export async function shutdownDeps(deps: AppDeps): Promise<void> {
 }
 
 export async function startServe(config: AppConfig): Promise<RunningApp> {
-  const deps = await bootstrap(config);
+  const deps = await bootstrap(config, { bootMigrate: config.roles.includes('orchestrator') });
   const { log } = deps;
   // 导入/安装是进程内后台任务：上次进程的 running 行不可能再完成，否则新任务永远 409
   if (deps.config.roles.includes('orchestrator')) {
@@ -122,8 +118,15 @@ export async function startServe(config: AppConfig): Promise<RunningApp> {
 
   const runOrchestrator = deps.config.roles.includes('orchestrator') || deps.config.roles.includes('runner');
   if (runOrchestrator) {
-    deps.orchestrator.scheduler.setLeaderHook(createAutoStarter(deps));
-    await deps.orchestrator.start();
+    const autoStart = createAutoStarter(deps);
+    // M4b 开机时延后的书：leader tick 里每分钟至多重试一次（没有延后的书就什么都不做）
+    const retryWriterOverrides = deps.config.roles.includes('orchestrator') ? createWriterOverrideRetry(deps) : null;
+    deps.orchestrator.scheduler.setLeaderHook(async (now, settings) => {
+      if (retryWriterOverrides) await retryWriterOverrides(now).catch((err: Error) => log.warn({ err: err.message }, 'p3 writer-override retry failed'));
+      await autoStart(now, settings);
+    });
+    // M4b（书级写手覆盖搬进 book.yaml）只在编排进程里、恢复之后跑；出错只记日志
+    await deps.orchestrator.start(deps.config.roles.includes('orchestrator') ? { afterRecover: () => runPostRecoveryMigrations(deps) } : {});
   }
 
   let closing: Promise<void> | null = null;

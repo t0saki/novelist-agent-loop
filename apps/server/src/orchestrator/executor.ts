@@ -1,6 +1,7 @@
 /**
- * 单个任务的执行（把 A/B/C/D/E 串起来；见 pipeline/types.ts 顶部的生命周期）。Owner: lane F。
- * 失败映射见 DESIGN §7.6 错误类 → 动作表；output_contract 同 profile 2 次后换 profile；TAIL nonce 缺失重跑一次仍缺 → profile 标“不可承载”。
+ * 单个任务的执行（见 runtime/types.ts 顶部的生命周期）。
+ * agent 任务（handler 有 prepare）一律走 v3 的 run 生命周期：先收稿、再判定（classifyV3Run）、pending 记录、逐章提交（promoteV3）。
+ * 确定性任务（publish）直接 execute。已删除的旧任务种类：执行时记 failed（config），不开 run。
  *
  * executeTask 返回 TaskResult（可能带 promote）；提交、入队、完成状态由 finishTask 负责。两者都不在事务里跨越模型调用。
  * 恢复（serve 崩溃）：runs/active 下的 run 通过 recovery.ts 接管后也走这里的 finishRun 尾段。
@@ -9,19 +10,20 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { and, eq, gt, inArray, like, sql } from 'drizzle-orm';
-import type { Capabilities, ErrorClass, HarnessInstall, NEvent, Outcome, QualityTier, RoleId, RunState, TaskKind, WorkOrderFrontmatter } from '@novelist/shared';
-import { toJsonSchema, zAccount, zCapabilities, zReceipt } from '@novelist/shared';
+import type { Capabilities, ErrorClass, HarnessInstall, NEvent, Outcome, RoleId, RunState } from '@novelist/shared';
+import { zAccount, zCapabilities } from '@novelist/shared';
 import type { AppConfig, DataPaths } from '../config/index.js';
 import type { Db } from '../db/client.js';
-import { accounts, books, capabilities, chapters, inbox, profiles, runEvents, runs, tasks } from '../db/schema.js';
-import { compileInstructions, resolveStack, checkNonces, type CompiledInstructions, type NonceCheckReport } from '../instructions/index.js';
+import { accounts, books, capabilities, chapters, inbox, runEvents, runs, tasks } from '../db/schema.js';
 import type { Logger } from '../log.js';
 import type { SecretStore } from '../services/secrets.js';
-import type { AgentPlan, BookHandle, HarvestedRun, PipelineContext, PipelineDeps, PromotePlan, RunContext, TaskHandler, TaskRow, TaskResult, TaskSpec } from '../pipeline/types.js';
+import type { AgentPlan, BookHandle, HarvestedRun, PipelineContext, PipelineDeps, PromotePlan, RunContext, TaskHandler, TaskRow, TaskResult, TaskSpec } from '../runtime/types.js';
+import { UnknownTaskKindError, isKnownKind } from '../runtime/registry.js';
+import { isV3Meta } from '../book/legacy.js';
 import { P } from '../book/layout.js';
-import { createRunSnapshot, harvestOut, removeRunSnapshot } from '../book/worktree.js';
+import { createRunSnapshot, removeRunSnapshot } from '../book/worktree.js';
 import { collectRunChanges } from '../book/harvest.js';
-import { V3_AGENTS_SOFT_LIMIT } from '../instructions/v3.js';
+import { V3_AGENTS_SOFT_LIMIT, renderAgentsMdV3 } from '../instructions/v3.js';
 import { BOOK_LADDER_MS, classifyV3Run } from '../flow/judge.js';
 import { ZERO_DIFF_PAUSE_MS, bumpZeroDiff, readZeroDiff, zeroDiffAccountKey, zeroDiffInbox } from '../flow/accounts.js';
 import { BUDGET_WAIT_PREFIX, NO_PROSE_WAIT, isInstructionFile } from '../flow/contract.js';
@@ -29,18 +31,16 @@ import { bumpBookEmpty, clearPending, markRetro, patchPending, readPending, read
 import { isV3Kind, serverFault } from '../flow/handlers.js';
 import { v3InboxAllowed } from '../flow/inbox-v3.js';
 import type { V3AgentsSize, V3CommitPlan, V3Pending } from '../flow/types.js';
-import { buildViews } from '../state/index.js';
 import { RunPrepareError, defaultCapabilities, getAdapter, probeIsolation, reattachRun, resolveAccount, startRun, syncBackCredentials, type HarnessAdapter, type ResolvedAccount, type RunEventSink, type RunHandle, type RunResult, type RunSpec } from '../harness/index.js';
 import type { EventBus } from './bus.js';
 import { planFailure, INFRA_CLASSES, type FailurePlan } from './actions.js';
 import { defaultPipeline, type PipelineBinding } from './binding.js';
-import { applyCanaryResult, recordRun } from './circuit.js';
-import { promote, promoteV3, withRepoLock, type PromoteMeta, type PromoteOutcome } from './committer.js';
+import { promoteV3, withRepoLock, type PromoteMeta } from './committer.js';
 import { createInboxItem, upsertOpenInbox } from './inbox.js';
-import { chapterNoOf, orchOf, taskTrailerValue, withOrch, type OrchTaskState } from './orch-state.js';
+import { orchOf, taskTrailerValue, withOrch, type OrchTaskState } from './orch-state.js';
 import { ACTIVE_STATES, completeTask, enqueue, renewLease, setTaskState } from './queue.js';
-import { accountUsdCapReached, checkBookBudget, expectedChapterCost, expectedTaskCost, markAuthBad, recordRateLimit, releaseReservations, reserve, settle, sleepAccount, utilSnapshot } from './quota.js';
-import { effectiveRouting, loadSystemSettings, resolveRoute, vendorOf, writerHarnesses, type ResolvedRoute } from './routing.js';
+import { accountUsdCapReached, checkBookBudget, markAuthBad, recordRateLimit, settle, sleepAccount, utilSnapshot } from './quota.js';
+import { loadSystemSettings, markProfileDown, resolveSlot, type ResolvedRoute } from './routing.js';
 
 export interface ExecutorDeps {
   db: Db;
@@ -140,34 +140,6 @@ async function resolvedAccountFor(env: ExecEnv, route: ResolvedRoute): Promise<R
   return resolveAccount(account, env.paths, env.secrets);
 }
 
-/** shellTool='always' 的 harness 上的 profile（codex / dsh：工具集里的 shell 关不掉） */
-async function shellProfiles(env: ExecEnv): Promise<string[]> {
-  const rows = await env.db.select({ id: profiles.id, harness: profiles.harness }).from(profiles);
-  return rows.filter((p) => { try { return getAdapter(p.harness as RunSpec['harness']).defaults?.shellTool === 'always'; } catch { return false; } }).map((p) => p.id);
-}
-
-async function writerVendorFor(env: ExecEnv, book: BookHandle | null): Promise<string | null> {
-  if (!book) return null;
-  const rows = await env.db.select({ w: books.writerProfile }).from(books).where(eq(books.id, book.id)).limit(1);
-  const preset = await effectiveRouting(env.db, book);
-  const profileId = book.config.routing.writer_profile ?? rows[0]?.w ?? preset.roles.writer?.chain[0];
-  if (!profileId) return null;
-  const pRows = await env.db.select({ h: profiles.harness }).from(profiles).where(eq(profiles.id, profileId)).limit(1);
-  return pRows[0] ? vendorOf(pRows[0].h) : null;
-}
-
-async function routeVendorOf(env: ExecEnv, book: BookHandle | null, role: RoleId): Promise<string | null> {
-  const preset = await effectiveRouting(env.db, book);
-  const first = preset.roles[role]?.chain[0];
-  if (!first) return null;
-  const rows = await env.db.select({ h: profiles.harness }).from(profiles).where(eq(profiles.id, first)).limit(1);
-  return rows[0] ? vendorOf(rows[0].h) : null;
-}
-
-function normalizeTierOrNull(tier: string | null): QualityTier | null {
-  return (tier as QualityTier | null) ?? null;
-}
-
 // ───────────────────────── 事件落库 ─────────────────────────
 
 class EventLog implements RunEventSink {
@@ -240,22 +212,51 @@ class EventLog implements RunEventSink {
 
 // ───────────────────────── run 会话（可持久化，供 reattach） ─────────────────────────
 
+/**
+ * $RUN/in/session.json（reattach 用）。读的时候两种形状都认：上一版镜像写的（compiled / reservationIds / artifacts / contract）和这一版写的（stackHash）。
+ * 写的时候为了能回滚到上一版镜像（D22），兼容字段照旧写固定值：contract 'v3'、compiled { nonces: {}, stackHash }、reservationIds []、artifacts []，
+ * spec 经 legacySessionSpec 补上 contract / systemFile / receiptSchemaFile（占位路径，文件从不创建；上一版只在重建调用时读它们，reattach 不会）。
+ */
 export interface RunSession {
   schema: 'nv.session/1';
-  spec: RunSpec;
+  spec: RunSpec & LegacySpecFields;
   runCtx: HarvestedRun['run'];
-  reservationIds: string[];
   utilBefore: Record<string, number>;
   harnessVersion: string;
   isolation: Capabilities['isolation'];
-  compiled: Pick<CompiledInstructions, 'nonces' | 'stackHash'>;
-  artifacts: AgentPlan['frontmatter']['artifacts'];
+  /** 本次 run 的指令 hash（进 trailer 与 pending.route） */
+  stackHash?: string;
   billUsd: boolean;
   accountEnvNames: string[];
-  /** v3 契约的 run（reattach 也要知道）：收稿走 pending，提交走 promoteV3 */
-  contract?: 'v3';
   /** v3：本次 run 的幂等键（pending.trailerKey） */
   trailerKey?: string;
+  /** @deprecated rollback compatibility, remove in the release after P3：新写的恒为 'v3'；没有这个字段 = 旧流程的 run */
+  contract?: 'v3';
+  /** @deprecated rollback compatibility, remove in the release after P3 */
+  compiled?: { nonces: Record<string, unknown>; stackHash: string };
+  /** @deprecated rollback compatibility, remove in the release after P3 */
+  reservationIds?: string[];
+  /** @deprecated rollback compatibility, remove in the release after P3 */
+  artifacts?: unknown[];
+}
+
+/** 上一版镜像的 RunSpec 必有、这一版已删掉的字段（只为回滚写进 session.json） */
+export interface LegacySpecFields {
+  /** @deprecated rollback compatibility */
+  contract?: 'v3';
+  /** @deprecated rollback compatibility */
+  systemFile?: string;
+  /** @deprecated rollback compatibility */
+  receiptSchemaFile?: string;
+}
+
+export function legacySessionSpec(spec: RunSpec): RunSpec & LegacySpecFields {
+  return { ...spec, contract: 'v3', systemFile: path.join(spec.inDir, 'system.md'), receiptSchemaFile: path.join(spec.inDir, 'receipt.schema.json') };
+}
+
+/** 两种 session 形状的指令 hash */
+export function sessionStackHash(s: Pick<RunSession, 'stackHash' | 'compiled'>): string {
+  return s.stackHash ?? s.compiled?.stackHash ?? '';
 }
 
 export async function loadSession(runDir: string): Promise<RunSession | null> {
@@ -270,14 +271,21 @@ export async function loadSession(runDir: string): Promise<RunSession | null> {
 
 export async function executeTask(deps: ExecutorDeps, task: TaskRow, signal: AbortSignal): Promise<TaskResult> {
   const env = execEnv(deps);
-  const handler = env.pipe.handlerFor(task.kind as TaskKind);
+  let handler: TaskHandler;
+  try {
+    handler = env.pipe.handlerFor(task.kind);
+  } catch (err) {
+    // 已删除的旧种类（开机迁移已取消这类任务；这里是第二道防线）：不开 run，不复活
+    if (err instanceof UnknownTaskKindError) return { status: 'failed', errorClass: 'config', message: `unknown task kind ${task.kind}` };
+    throw err;
+  }
   const book = task.bookId ? await env.pipe.openBook(env.pdeps, task.bookId) : null;
   const ctx: PipelineContext = { deps: env.pdeps, book };
 
   const orch = orchOf(task);
-  if (handler.contract === 'v3') {
-    // v3 的恢复只看 pending 记录：VALIDATED.json 与 _orch.recover 都不用
-    if (orch.recover) await patchOrch(env, task, { recover: undefined });
+  // 恢复只看 pending 记录（agent 任务）；旧的 _orch.recover 标记一律清掉
+  if (orch.recover) await patchOrch(env, task, { recover: undefined });
+  if (handler.prepare) {
     if (book) {
       const pending = await readPending(env.db, book.id);
       if (pending) {
@@ -290,22 +298,14 @@ export async function executeTask(deps: ExecutorDeps, task: TaskRow, signal: Abo
     }
     return runAgentTask(env, ctx, handler, task, signal);
   }
-  if (orch.recover) {
-    const recovered = await executeRecovery(env, ctx, handler, task, orch.recover);
-    if (recovered) return recovered;
-    // VALIDATED.json 不存在：退回普通执行
-  }
 
-  if (handler.role === null) {
-    if (!handler.execute) return { status: 'failed', errorClass: 'config', message: `handler ${task.kind} 没有 execute` };
-    await setTaskState(env.db, task.id, 'running');
-    if (book) {
-      const staleReason = await preRunStale(book, task);
-      if (staleReason) return staleResult(staleReason);
-    }
-    return handler.execute(ctx, task);
+  if (!handler.execute) return { status: 'failed', errorClass: 'config', message: `handler ${task.kind} 没有 execute` };
+  await setTaskState(env.db, task.id, 'running');
+  if (book) {
+    const staleReason = await preRunStale(book, task);
+    if (staleReason) return staleResult(staleReason);
   }
-  return runAgentTask(env, ctx, handler, task, signal);
+  return handler.execute(ctx, task);
 }
 
 /** claim 后、昂贵的 run 之前先比 hard manifest；变了直接作废，不浪费模型调用 */
@@ -323,43 +323,19 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
   const orch = orchOf(task);
   const now = env.nowFn();
   const role = (task.role ?? handler.role) as RoleId;
-  const tier: QualityTier = normalizeTierOrNull(task.tier) ?? (book ? env.pipe.effectiveTier(book, chapterNoOf(task.target)) : 'standard');
 
   if (book) {
     const staleReason = await preRunStale(book, task);
     if (staleReason) return staleResult(staleReason);
-    const budget = await checkBookBudget(env.db, book, task.kind as TaskKind, now);
-    if (!budget.ok) return { status: 'waiting', retryAfter: budget.waitUntil ?? new Date(now.getTime() + 1800_000).toISOString(), message: handler.contract === 'v3' ? `${BUDGET_WAIT_PREFIX}${budget.reason ?? '本书预算已到上限'}` : (budget.reason ?? 'budget') };
+    const budget = await checkBookBudget(env.db, book, now);
+    if (!budget.ok) return { status: 'waiting', retryAfter: budget.waitUntil ?? new Date(now.getTime() + 1800_000).toISOString(), message: `${BUDGET_WAIT_PREFIX}${budget.reason ?? '本书预算已到上限'}` };
   }
 
-  // 1. 路由
-  const writerVendor = role === 'writer' ? null : await writerVendorFor(env, book);
-  const plannerVendor = role === 'plan_judge' ? await routeVendorOf(env, book, 'planner') : null;
-  const excludeProfiles = Array.isArray(task.params.excludeProfiles) ? (task.params.excludeProfiles as string[]) : [];
-  // 不可信输入（v1 导入正文）不走带 shell 的 harness（DESIGN §10.6）。必须走 avoidProfiles：excludeProfiles 只在 not_in_judges 约束下生效
-  const noShell = task.kind === 'import.bootstrap' ? await shellProfiles(env) : [];
-  const avoidProfiles = [...(orch.avoidProfiles ?? []), ...noShell];
-  const resolveAvoiding = (avoid: string[]) =>
-    resolveRoute(env.db, {
-      role,
-      book,
-      tier,
-      writerVendor,
-      plannerVendor,
-      ...(excludeProfiles.length ? { excludeProfiles } : {}),
-      ...(avoid.length ? { avoidProfiles: avoid } : {}),
-      ...(orch.avoidVendors?.length ? { avoidVendors: orch.avoidVendors } : {}),
-      now,
-      allowFakeHarness: env.config.allowFakeHarness,
-    });
-  let route = await resolveAvoiding(avoidProfiles);
-  // 产物不合格时换 profile 只是优化：没有别的 profile 可换就继续用原来的，次数上限由 handler 兜底。noShell 是安全约束，始终保留
-  const keepAvoiding = (orch.avoidProfiles ?? []).filter((p) => !orch.contractFailures?.[p]);
-  if (!route.profile && !route.waitUntil && keepAvoiding.length < (orch.avoidProfiles?.length ?? 0)) route = await resolveAvoiding([...keepAvoiding, ...noShell]);
-  if (!route.profile || !route.profileObj) return routeFailure(env, task, route, book);
-  if (role === 'writer' && book) await rememberWriter(env, book, route);
+  // 1. 路由：写作位置（书级覆盖顶替主用；fake 模式强制 fake）
+  const route = await resolveSlot(env.db, { slot: 'writer', book, now, allowFakeHarness: env.config.allowFakeHarness, forced: env.config.fakeHarness });
+  if (!route.profile || !route.profileObj) return routeFailure(env, task, route);
 
-  // 2. 配额
+  // 2. 配额（不预留；usage_ledger 照常由 settle 记账）
   if (route.accountObj) {
     const capUntil = await accountUsdCapReached(env.db, route.accountObj, now);
     if (capUntil) {
@@ -367,21 +343,6 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
       return { status: 'waiting', retryAfter: capUntil, message: '账号月度 USD 上限' };
     }
   }
-  let reservationIds: string[] = [];
-  // v3 不预留配额（usage_ledger 照常由 settle 记账）
-  if (route.account && handler.contract !== 'v3') {
-    const costs =
-      task.kind === 'chapter.write' && book
-        ? await expectedChapterCost(env.db, { bookId: book.id, tier, book, writer: { profileId: route.profile, accountId: route.account }, allowFakeHarness: env.config.allowFakeHarness })
-        : await expectedTaskCost(env.db, { profileId: route.profile, accountId: route.account, kind: task.kind as TaskKind, tier });
-    const res = await reserve(env.db, { taskId: task.id, bookId: task.bookId, costs, now });
-    if (!res.ok) {
-      env.bus.publish({ type: 'quota_wait', accountId: route.account, until: res.waitUntil, reason: res.reason });
-      return { status: 'waiting', retryAfter: res.waitUntil ?? new Date(now.getTime() + 1800_000).toISOString(), message: `配额：${res.reason}` };
-    }
-    reservationIds = res.ids;
-  }
-
   // 3. run 行与目录
   const runId = randomUUID();
   const attempt = task.attempts + 1;
@@ -403,7 +364,6 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
   let snapshot: Awaited<ReturnType<typeof createRunSnapshot>> | null = null;
   let resolved: ResolvedAccount | null = null;
   const cleanupRun = async (state: RunState, errorClass: ErrorClass | null): Promise<void> => {
-    await releaseReservations(env.db, reservationIds);
     await env.db.update(runs).set({ state, errorClass, endedAt: new Date().toISOString() }).where(eq(runs.id, runId));
     await fs.rm(activeLink, { force: true });
     if (snapshot) await removeRunSnapshot(snapshot).catch(() => {});
@@ -445,13 +405,6 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
         snapshot = await createRunSnapshot(book.dir, head, snapshotDir);
         return head;
       });
-      if (handler.contract !== 'v3') {
-        try {
-          await buildViews(snapshotDir);
-        } catch (err) {
-          env.log.warn({ err: (err as Error).message, taskId: task.id }, 'buildViews failed (继续执行)');
-        }
-      }
     } else {
       await fs.mkdir(snapshotDir, { recursive: true });
     }
@@ -471,7 +424,6 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
       harness: route.harness as string,
       model: route.model as string,
       role,
-      degraded: route.degraded,
     };
 
     // 5. prepare
@@ -482,17 +434,10 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
     }
     const plan = prepared.plan;
 
-    // 6. 工作单 + 指令
-    for (const input of plan.inputs) {
-      const dest = path.join(inDir, input.to);
-      await fs.mkdir(path.dirname(dest), { recursive: true });
-      await fs.copyFile(input.from, dest);
-    }
+    // 6. 指令 + 任务单
     let workOrderFile: string;
-    let receiptSchemaFile: string;
-    let systemFile: string;
-    let compiled: CompiledInstructions;
-    if (plan.v3) {
+    let stackHash: string;
+    {
       // v3：指令在快照根 AGENTS.md（cc 经 CLAUDE.md 引用），任务在 ORDER.md；启动语是一句话；没有回执、schema、nonce
       const v3 = plan.v3;
       // 大小（WP-3）：不进待办，记在 meta.v3.agentsSize（书页列各层字节数，超过硬上限时状态句是“等你处理”）；渲染回 16 KB 以下的运行清掉
@@ -518,33 +463,7 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
       await fs.writeFile(path.join(snapshotDir, 'ORDER.md'), v3.orderMd);
       workOrderFile = path.join(inDir, 'launch.md');
       await fs.writeFile(workOrderFile, v3.launchPrompt);
-      systemFile = path.join(inDir, 'system.md');
-      await fs.writeFile(systemFile, '');
-      receiptSchemaFile = path.join(inDir, 'receipt.none.json');
-      compiled = emptyCompiled(v3.stackHash);
-    } else {
-      const fm: WorkOrderFrontmatter = { schema: 'nv.workorder/1', task_id: task.id, run_id: runId, out_dir: outDir, ...plan.frontmatter };
-      const workOrderText = env.pipe.renderWorkOrder(fm, plan.body);
-      workOrderFile = path.join(inDir, 'workorder.md');
-      await fs.writeFile(workOrderFile, workOrderText);
-      const snapWorkOrder = path.join(snapshotDir, P.workOrder(task.id));
-      await fs.mkdir(path.dirname(snapWorkOrder), { recursive: true });
-      await fs.writeFile(snapWorkOrder, workOrderText);
-      const dialect = caps.schemaDialect === 'none' ? 'lenient' : caps.schemaDialect;
-      receiptSchemaFile = path.join(inDir, `receipt.${dialect}.json`);
-      await fs.writeFile(receiptSchemaFile, JSON.stringify(toJsonSchema(zReceipt, dialect)));
-
-      const stack = await resolveStack({
-        globalDir: env.paths.instructionsGlobal,
-        genreDirs: book ? book.genre.chain.map((g) => ({ id: g.id, dir: g.dir })) : [],
-        bookDir: book ? snapshotDir : null,
-        role,
-        taskKind: task.kind as TaskKind,
-        ownerNotes: [...plan.ownerNotes, ...(orch.ownerNotes ?? [])],
-      });
-      compiled = compileInstructions(stack, { nonces: 'random' });
-      systemFile = path.join(inDir, 'system.md');
-      await fs.writeFile(systemFile, compiled.systemMd);
+      stackHash = v3.stackHash;
     }
 
     // 7. RunSpec + 启动
@@ -559,7 +478,7 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
       taskId: task.id,
       attempt,
       role,
-      taskKind: task.kind as TaskKind,
+      taskKind: task.kind,
       harness: route.harness as RunSpec['harness'],
       profileId: route.profile,
       accountId: route.account,
@@ -570,17 +489,13 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
       inDir,
       logDir,
       workOrderFile,
-      systemFile,
-      receiptSchemaFile,
       model: route.model as string,
-      ...(plan.contract ? { contract: plan.contract } : {}),
       // 本次 run 的 effort（v3 按开书 / 写作 / 结局批）压过 profile 的
       ...((plan.effort ?? route.profileObj.effort) ? { effort: plan.effort ?? route.profileObj.effort } : {}),
       limits,
-      session: plan.resume?.sessionId && caps.resume ? { mode: 'resume', id: plan.resume.sessionId } : { mode: 'fresh', id: runId },
+      session: { mode: 'fresh', id: runId },
       persistSession: false,
       egress: { allow: [] },
-      subagents: /^(plan|audit)\./.test(task.kind),
       extraArgs: route.profileObj.extra_args,
     };
 
@@ -588,31 +503,34 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
     const utilBefore = route.account ? await utilSnapshot(env.db, route.account) : {};
     const session: RunSession = {
       schema: 'nv.session/1',
-      spec,
+      spec: legacySessionSpec(spec),
       runCtx,
-      reservationIds,
       utilBefore,
       harnessVersion: installInfo.version,
       isolation,
-      compiled: { nonces: compiled.nonces, stackHash: compiled.stackHash },
-      artifacts: plan.frontmatter.artifacts,
+      stackHash,
       billUsd: route.accountObj ? ['api_key', 'custom_api'].includes(route.accountObj.authMode) : false,
       accountEnvNames: resolved ? Object.keys(resolved.secretEnv) : [],
-      ...(plan.v3 ? { contract: 'v3' as const, trailerKey: `${taskTrailerValue(task.id, orch.generation)}@${runId}` } : {}),
+      trailerKey: `${taskTrailerValue(task.id, orch.generation)}@${runId}`,
+      // 回滚兼容（D22）：上一版镜像 reattach / 收尾 / 判 lost 时读这些
+      contract: 'v3',
+      compiled: { nonces: {}, stackHash },
+      reservationIds: [],
+      artifacts: [],
     };
     await fs.writeFile(path.join(inDir, 'session.json'), JSON.stringify(session));
-    await env.db.update(runs).set({ baseCommit, stackHash: compiled.stackHash }).where(eq(runs.id, runId));
+    await env.db.update(runs).set({ baseCommit, stackHash }).where(eq(runs.id, runId));
 
     // 准备期间主人取消 / killRun：abort 事件不会补发，这里不再启动 harness（pending 还没写，按普通方式清理）
     if (signal.aborted && signal.reason !== 'detach') {
       await cleanupRun('killed', null);
-      if (handler.contract === 'v3' && signal.reason !== 'cancel') return { status: 'waiting', retryAfter: new Date(env.nowFn().getTime() + 10 * 60_000).toISOString(), message: 'run killed before start' };
+      if (signal.reason !== 'cancel') return { status: 'waiting', retryAfter: new Date(env.nowFn().getTime() + 10 * 60_000).toISOString(), message: 'run killed before start' };
       return { status: 'failed', message: 'run killed before start' };
     }
     let handle: RunHandle;
     const log = new EventLog(env, runId, route.account, () => undefined);
     // v3：从 run 即将启动到收稿提交（或确认为空），books.meta.v3.pending 一直描述它；有 pending 时本书不再开新 run
-    const pendingBook = session.contract === 'v3' && book ? book : null;
+    const pendingBook = book;
     if (pendingBook) {
       await setPending(env.db, pendingBook.id, {
         taskId: task.id,
@@ -625,14 +543,14 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
         baseCommit,
         manifestFile: null,
         trailerKey: session.trailerKey as string,
-        route: { profile: route.profile, account: route.account, harness: route.harness as string, model: (route.model as string | null) ?? null, isolation, stackHash: compiled.stackHash },
+        route: { profile: route.profile, account: route.account, harness: route.harness as string, model: (route.model as string | null) ?? null, isolation, stackHash },
         failures: 0,
         createdAt: now.toISOString(),
       });
       v3Started = true;
     }
     try {
-      handle = await startRun({ spec, adapter, account: resolved, install: installInfo, caps, isolation, compiled }, log);
+      handle = await startRun({ spec, adapter, account: resolved, install: installInfo, caps, isolation }, log);
     } catch (err) {
       await log.close();
       const cls: ErrorClass = err instanceof RunPrepareError ? err.errorClass : 'config';
@@ -642,12 +560,12 @@ async function runAgentTask(env: ExecEnv, ctx: PipelineContext, handler: TaskHan
         v3Started = false;
       }
       await cleanupRun('killed', cls);
-      if (code === 'budget' || code === 'not_allowed') return { status: 'retry', errorClass: cls, message: (err as Error).message, retryAfter: now.toISOString(), avoidProfile: route.profile };
+      if (code === 'not_allowed') return { status: 'retry', errorClass: cls, message: (err as Error).message, retryAfter: now.toISOString() };
       return { status: 'retry', errorClass: cls, message: (err as Error).message };
     }
     await env.db.update(runs).set({ state: 'running', shimPid: handle.shimPid, harnessPid: handle.harnessPid, startedAt: handle.startedAt }).where(eq(runs.id, runId));
 
-    const finishing = finishRun(env, ctx, handler, task, { handle, log, session, activeLink, snapshot, route, resolved, signal, adapter, tier });
+    const finishing = finishRun(env, ctx, handler, task, { handle, log, session, activeLink, snapshot, route, resolved, signal, adapter });
     if (!v3Started) return finishing;
     return await finishing;
   } catch (err) {
@@ -690,7 +608,6 @@ async function finishRunInner(
     resolved: ResolvedAccount | null;
     signal: AbortSignal;
     adapter: HarnessAdapter;
-    tier: QualityTier | null;
   },
 ): Promise<TaskResult> {
   const { handle, log, session } = r;
@@ -730,95 +647,62 @@ async function finishRunInner(
   const finalState: RunState = result.outcome.status === 'cancelled' ? 'killed' : 'exited';
   await env.db
     .update(runs)
-    .set({ state: finalState, endedAt: new Date().toISOString(), exitCode: result.exit.code, errorClass: result.outcome.errorClass ?? null, outcome: { status: result.outcome.status, message: result.outcome.message, toolSteps: result.toolSteps, ...(session.contract === 'v3' && result.outcome.retryAfter ? { retryAfter: result.outcome.retryAfter } : {}) }, usage: result.outcome.usage as unknown as Record<string, unknown>, denials: result.outcome.denials.length, sessionId: result.outcome.sessionId ?? null, modelReported: result.outcome.model ?? null })
+    .set({ state: finalState, endedAt: new Date().toISOString(), exitCode: result.exit.code, errorClass: result.outcome.errorClass ?? null, outcome: { status: result.outcome.status, message: result.outcome.message, toolSteps: result.toolSteps, ...(result.outcome.retryAfter ? { retryAfter: result.outcome.retryAfter } : {}) }, usage: result.outcome.usage as unknown as Record<string, unknown>, denials: result.outcome.denials.length, sessionId: result.outcome.sessionId ?? null, modelReported: result.outcome.model ?? null })
     .where(eq(runs.id, session.spec.runId));
   // 账号的在跑数刚降下来：叫醒停在“路由等待”的 v3 任务，由 claimNext 的排序决定谁先写
   await wakeRouteWaiters(env).catch((err: Error) => env.log.warn({ err: err.message }, 'wakeRouteWaiters failed'));
 
-  // 8. 收割
-  let stagedOutDir = '';
-  let files: string[] = [];
-  const v3Book = session.contract === 'v3' && book ? book : null;
+  // 8. 收割：先收稿再判定错误类（额度用完、超时、崩溃之前写下的正文都要收）。收稿失败：快照和 pending 都留着，下次只收稿不开 run
+  if (!book) throw new Error('agent task without book');
+  const v3Book = book;
   let v3Manifest: string | null = null;
   let v3Failure: unknown = null;
-  if (v3Book) {
-    // v3：先收稿再判定错误类（额度用完、超时、崩溃之前写下的正文都要收）。收稿失败：快照和 pending 都留着，下次只收稿不开 run
-    try {
-      const ch = await collectRunChanges({ snapshotDir: session.spec.bookDir, baseCommit: session.runCtx.baseCommit, liveBookDir: v3Book.dir, taskId: task.id, runId: session.spec.runId });
-      v3Manifest = ch.manifestFile;
-      await patchPending(env.db, v3Book.id, session.spec.runId, { stage: 'harvested', manifestFile: v3Manifest });
-      // 改动已复制到 live 树 work/ 下，快照这时才能删
-      if (r.snapshot) await removeRunSnapshot(r.snapshot).catch(() => {});
-    } catch (err) {
-      v3Failure = err;
-      env.log.warn({ err: (err as Error).message, taskId: task.id, runId: session.spec.runId }, 'v3 harvest failed (snapshot and pending kept)');
-    }
-    // 测试钩子：收稿之后、提交之前“进程死掉”（任务停在 leased，lease 过期后由下一次执行消化 pending）
-    if (!v3Failure && (await serverFault(ctx, session.spec.inDir, 'crashAfterHarvest'))) return { status: 'waiting', message: 'detached', summary: { detached: true } };
-  } else if (book) {
-    const harvested = await harvestOut(session.spec.outDir, book.dir, task.id, session.spec.attempt).catch(() => ({ stagedDir: '', files: [] as string[] }));
-    stagedOutDir = harvested.stagedDir;
-    files = harvested.files;
+  try {
+    const ch = await collectRunChanges({ snapshotDir: session.spec.bookDir, baseCommit: session.runCtx.baseCommit, liveBookDir: v3Book.dir, taskId: task.id, runId: session.spec.runId });
+    v3Manifest = ch.manifestFile;
+    await patchPending(env.db, v3Book.id, session.spec.runId, { stage: 'harvested', manifestFile: v3Manifest });
+    // 改动已复制到 live 树 work/ 下，快照这时才能删
     if (r.snapshot) await removeRunSnapshot(r.snapshot).catch(() => {});
-  } else {
-    stagedOutDir = session.spec.outDir;
-    files = await listOut(stagedOutDir);
+  } catch (err) {
+    v3Failure = err;
+    env.log.warn({ err: (err as Error).message, taskId: task.id, runId: session.spec.runId }, 'v3 harvest failed (snapshot and pending kept)');
   }
+  // 测试钩子：收稿之后、提交之前“进程死掉”（任务停在 leased，lease 过期后由下一次执行消化 pending）
+  if (!v3Failure && (await serverFault(ctx, session.spec.inDir, 'crashAfterHarvest'))) return { status: 'waiting', message: 'detached', summary: { detached: true } };
   if (r.resolved) {
     await syncBack(env, r.resolved).catch((err) => env.log.warn({ err: (err as Error).message }, 'syncBackCredentials failed'));
   }
 
-  // 9. nonce + 组装（v3 没有 nonce）
-  let nonce: NonceCheckReport = { layers: [], tainted: false, missingTail: [], ok: true };
-  if (!v3Book) {
-    const echoed = await readEchoedNonces(stagedOutDir, result.outcome);
-    nonce = checkNonces({ nonces: session.compiled.nonces, echoed, events: log.events, inDir: session.spec.inDir, role: session.spec.role });
-    await env.db.update(runs).set({ nonceReport: nonce.layers as unknown[] }).where(eq(runs.id, session.spec.runId));
-  }
-  const harvested: HarvestedRun = { run: session.runCtx, outcome: result.outcome, stagedOutDir, files, artifacts: session.artifacts, nonce, audit: result.audit };
-  if (v3Book) {
-    // 主人取消的是任务（cancelTask）；单纯 killRun 时任务还活着
-    const taskState = (await env.db.select({ state: tasks.state }).from(tasks).where(eq(tasks.id, task.id)).limit(1))[0]?.state;
-    harvested.v3 = { manifestFile: v3Manifest, lost: false, stderrTail: result.stderrTail, trailerKey: session.trailerKey ?? `${task.id}@${session.spec.runId}`, ownerCancelled: taskState === 'cancelled', toolSteps: result.toolSteps };
-  }
+  // 9. 组装（没有 nonce）。主人取消的是任务（cancelTask）；单纯 killRun 时任务还活着
+  const taskState = (await env.db.select({ state: tasks.state }).from(tasks).where(eq(tasks.id, task.id)).limit(1))[0]?.state;
+  const harvested: HarvestedRun = {
+    run: session.runCtx,
+    outcome: result.outcome,
+    v3: { manifestFile: v3Manifest, lost: false, stderrTail: result.stderrTail, trailerKey: session.trailerKey ?? `${task.id}@${session.spec.runId}`, ownerCancelled: taskState === 'cancelled', toolSteps: result.toolSteps },
+  };
 
-  // 10. 结算配额、熔断
+  // 10. 记账
   await settle(env.db, {
-    reservationIds: session.reservationIds,
     runId: session.spec.runId,
     accountId: r.route.account ?? null,
     profileId: r.route.profile as string,
     harness: r.route.harness as string,
     model: (r.route.model as string | null) ?? null,
-    kind: task.kind as TaskKind,
-    tier: r.tier,
+    kind: task.kind,
     bookId: task.bookId,
     outcome: result.outcome,
     utilBefore: session.utilBefore,
     billUsd: session.billUsd,
   }).catch((err) => env.log.warn({ err: (err as Error).message }, 'settle failed'));
-  await recordRun(env.db, {
-    harness: r.route.harness as string,
-    version: session.harnessVersion,
-    isolation: session.isolation,
-    errorClass: result.outcome.status === 'completed' ? null : (result.outcome.errorClass ?? 'unknown'),
-    unknownEventRatio: log.unknownRatio(),
-    tailNonceMissing: !nonce.ok && nonce.missingTail.length > 0,
-    contractViolations: result.audit.ok ? 0 : 1,
-  }).catch(() => {});
   await env.db.update(runs).set({ state: 'finalized' }).where(eq(runs.id, session.spec.runId));
   await fs.rm(r.activeLink, { force: true });
   env.bus.publish({ type: 'run_exit', runId: session.spec.runId, state: 'finalized', errorClass: result.outcome.errorClass ?? null });
 
   // 11. 判定
-  const meta: PromoteMeta = { harness: r.route.harness as string, model: (r.route.model as string | null) ?? undefined, isolation: session.isolation, instructionsHash: session.compiled.stackHash };
-  if (v3Book) {
-    const res = v3Failure
-      ? await pendingFailure(env, task, v3Book.id, session.spec.runId, v3Failure)
-      : await judgeRunV3(env, ctx, handler, task, harvested, { profile: r.route.profile as string, account: (r.route.account as string | null) ?? null, harness: r.route.harness as string }, result.outcome);
-    return attachMeta(res, meta, harvested);
-  }
-  const res = await judgeRun(env, ctx, handler, task, harvested, r.route.profile as string, r.route.harness as string, result.outcome);
+  const meta: PromoteMeta = { harness: r.route.harness as string, model: (r.route.model as string | null) ?? undefined, isolation: session.isolation, instructionsHash: sessionStackHash(session) };
+  const res = v3Failure
+    ? await pendingFailure(env, task, v3Book.id, session.spec.runId, v3Failure)
+    : await judgeRunV3(env, ctx, handler, task, harvested, { profile: r.route.profile as string, account: (r.route.account as string | null) ?? null, harness: r.route.harness as string }, result.outcome);
   return attachMeta(res, meta, harvested);
 }
 
@@ -827,31 +711,6 @@ async function renewRunLease(env: ExecEnv, taskId: string, runId: string): Promi
   const now = new Date().toISOString();
   await env.db.update(tasks).set({ leaseExpiresAt: expires, updatedAt: now }).where(and(eq(tasks.id, taskId), eq(tasks.leaseOwner, env.owner)));
   await env.db.update(runs).set({ leaseExpiresAt: expires, heartbeatAt: now }).where(eq(runs.id, runId));
-}
-
-async function listOut(dir: string): Promise<string[]> {
-  const out: string[] = [];
-  const walk = async (abs: string, rel: string): Promise<void> => {
-    const entries = await fs.readdir(abs, { withFileTypes: true }).catch(() => []);
-    for (const e of entries) {
-      const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) await walk(path.join(abs, e.name), r);
-      else if (e.isFile()) out.push(r);
-    }
-  };
-  await walk(dir, '');
-  return out.sort();
-}
-
-async function readEchoedNonces(dir: string, outcome: Outcome): Promise<string[]> {
-  const fromOutcome = (outcome.receipt as { nonces?: unknown } | undefined)?.nonces;
-  if (Array.isArray(fromOutcome)) return fromOutcome.filter((x): x is string => typeof x === 'string');
-  try {
-    const raw = JSON.parse(await fs.readFile(path.join(dir, 'receipt.json'), 'utf8')) as { nonces?: unknown };
-    return Array.isArray(raw.nonces) ? raw.nonces.filter((x): x is string => typeof x === 'string') : [];
-  } catch {
-    return [];
-  }
 }
 
 async function syncBack(env: ExecEnv, acct: ResolvedAccount): Promise<void> {
@@ -864,69 +723,8 @@ async function syncBack(env: ExecEnv, acct: ResolvedAccount): Promise<void> {
   await env.db.update(accounts).set({ body: { ...row.body, files: acct.files }, updatedAt: new Date().toISOString() }).where(eq(accounts.id, acct.id));
 }
 
-async function judgeRun(env: ExecEnv, ctx: PipelineContext, handler: TaskHandler, task: TaskRow, harvested: HarvestedRun, profile: string, harness: string, outcome: Outcome): Promise<TaskResult> {
-  const orch = orchOf(task);
-  const cls: ErrorClass = outcome.errorClass ?? (outcome.status === 'completed' ? 'unknown' : outcome.status === 'timeout' ? 'timeout_wall' : 'harness_crash');
-  const failed = outcome.status !== 'completed';
-
-  if (outcome.status === 'cancelled') return { status: 'failed', message: outcome.message ?? 'run killed' };
-
-  const denialInOutDir = outcome.denials.some((d) => d.path && d.path.startsWith(harvested.run.outDir));
-  const failCtx = {
-    taskId: task.id,
-    kind: task.kind as TaskKind,
-    bookId: task.bookId,
-    outcome,
-    orch,
-    profile,
-    accountId: harvested.run.accountId,
-    vendor: vendorOf(harness),
-    refusalRetryOtherVendor: ctx.book?.config.policy.refusal_retry_other_vendor ?? true,
-    denialInOutDir,
-    now: env.nowFn(),
-  };
-
-  if (failed && (INFRA_CLASSES.has(cls) || harvested.files.length === 0)) {
-    return applyFailurePlan(env, task, planFailure(cls, failCtx));
-  }
-  if (!handler.finalize) return applyFailurePlan(env, task, planFailure('config', failCtx));
-
-  let result: TaskResult;
-  try {
-    result = await handler.finalize(ctx, task, harvested);
-  } catch (err) {
-    env.log.warn({ err: (err as Error).message, taskId: task.id }, 'finalize threw');
-    return { status: 'retry', errorClass: 'unknown', message: `finalize: ${(err as Error).message}` };
-  }
-
-  if (result.status === 'retry' && result.errorClass) {
-    // §3.3 产物缺失 + outDir 内 denial → permission_denied；并计入 output_contract 的 profile 计数
-    const cls2: ErrorClass = result.errorClass === 'output_contract' && denialInOutDir ? 'permission_denied' : result.errorClass;
-    const plan = planFailure(cls2, failCtx);
-    return applyFailurePlan(env, task, { ...plan, result: { ...result, errorClass: cls2, ...(plan.result.avoidProfile ? { avoidProfile: plan.result.avoidProfile } : {}), ...(result.avoidProfile ? { avoidProfile: result.avoidProfile } : {}) } });
-  }
-
-  // TAIL nonce：重跑一次仍缺 → profile 标“不可承载”（§5.6）
-  if (!harvested.nonce.ok && harvested.nonce.missingTail.length > 0) {
-    const counts = { ...(orch.tailMissing ?? {}), [profile]: (orch.tailMissing?.[profile] ?? 0) + 1 };
-    await patchOrch(env, task, { tailMissing: counts });
-    if ((counts[profile] as number) >= 2) {
-      await createInboxItem(env.db, env.bus, {
-        kind: 'notice',
-        bookId: task.bookId,
-        title: `profile ${profile} 不可承载该书指令层`,
-        body: { profile, taskId: task.id, missingTail: harvested.nonce.missingTail },
-        actions: [{ id: 'dismiss', label: '知道了' }],
-        dedupeKey: `nonce:${profile}:${task.bookId ?? 'global'}`,
-      });
-    }
-  }
-  return result;
-}
-
 // ───────────────────────── v3：收稿、判定、pending ─────────────────────────
 
-const OK_NONCE: NonceCheckReport = { layers: [], tainted: false, missingTail: [], ok: true };
 const ZERO_USAGE: Outcome['usage'] = { input: 0, cachedInput: 0, cacheWrite: 0, output: 0, reasoning: 0, costSource: 'unknown' };
 
 /**
@@ -951,11 +749,6 @@ export async function removeStrayInstructionFiles(snapshotDir: string): Promise<
   };
   await walk(snapshotDir, '');
   return removed;
-}
-
-/** v3 没有 system channel、没有 nonce：只保留 stackHash（进 trailer 与 pending.route） */
-export function emptyCompiled(stackHash: string): CompiledInstructions {
-  return { systemMd: '', mirrorMd: '', layers: [], nonces: {}, stackHash, bytes: 0, lastAuthorLayerId: 'L3' };
 }
 
 function agentsSizeOf(v3: NonNullable<AgentPlan['v3']>, hard: boolean, limit: number, harness: string, now: Date): V3AgentsSize {
@@ -1035,16 +828,10 @@ async function consumePending(env: ExecEnv, ctx: PipelineContext, handler: TaskH
     harness: pending.route.harness,
     model: pending.route.model ?? '',
     role: 'writer',
-    degraded: [],
   };
   const harvested: HarvestedRun = {
     run,
     outcome,
-    stagedOutDir: '',
-    files: [],
-    artifacts: [],
-    nonce: OK_NONCE,
-    audit: { ok: true, extraFiles: [], tamperedConfig: [] },
     v3: { manifestFile, lost, stderrTail: '', trailerKey: pending.trailerKey, ownerCancelled: false, ...(typeof runRow?.outcome?.toolSteps === 'number' ? { toolSteps: runRow.outcome.toolSteps } : {}) },
   };
   const res = await judgeRunV3(env, ctx, handler, task, harvested, { profile: pending.route.profile, account: pending.route.account, harness: pending.route.harness }, outcome);
@@ -1058,7 +845,7 @@ async function consumePending(env: ExecEnv, ctx: PipelineContext, handler: TaskH
 async function judgeRunV3(env: ExecEnv, ctx: PipelineContext, handler: TaskHandler, task: TaskRow, harvested: HarvestedRun, route: { profile: string; account: string | null; harness: string }, outcome: Outcome): Promise<TaskResult> {
   const book = ctx.book as BookHandle;
   const runId = harvested.run.runId;
-  const v3 = harvested.v3 as NonNullable<HarvestedRun['v3']>;
+  const v3 = harvested.v3;
   let fin: TaskResult;
   try {
     if (!handler.finalize) throw new Error(`handler ${task.kind} 没有 finalize`);
@@ -1071,19 +858,7 @@ async function judgeRunV3(env: ExecEnv, ctx: PipelineContext, handler: TaskHandl
   const cls = outcome.errorClass ?? null;
   const infraClass = cls && INFRA_CLASSES.has(cls) && outcome.status !== 'completed' ? cls : null;
   const fp: FailurePlan | null = infraClass
-    ? planFailure(infraClass, {
-        taskId: task.id,
-        kind: task.kind as TaskKind,
-        bookId: task.bookId,
-        outcome,
-        orch,
-        profile: route.profile,
-        accountId: route.account,
-        vendor: vendorOf(route.harness),
-        refusalRetryOtherVendor: book.config.policy.refusal_retry_other_vendor ?? true,
-        denialInOutDir: false,
-        now,
-      })
+    ? planFailure(infraClass, { taskId: task.id, bookId: task.bookId, outcome, orch, profile: route.profile, accountId: route.account, now })
     : null;
   const sum = (fin.summary?.v3 ?? {}) as { accepted?: number; changed?: number; noChapterStreak?: number; completed?: unknown };
   const accountKey = zeroDiffAccountKey(route.account, route.profile);
@@ -1102,11 +877,11 @@ async function judgeRunV3(env: ExecEnv, ctx: PipelineContext, handler: TaskHandl
     noChapterStreak: sum.noChapterStreak ?? 0,
     emptyStreak: readV3Meta(bookRow?.meta).emptyStreak,
     accountStreak,
-    planFailure: fp ? { status: fp.result.status, ...(fp.result.retryAfter ? { retryAfter: fp.result.retryAfter } : {}), ...(fp.result.avoidProfile ? { avoidProfile: fp.result.avoidProfile } : {}) } : null,
+    planFailure: fp ? { status: fp.result.status, ...(fp.result.retryAfter ? { retryAfter: fp.result.retryAfter } : {}) } : null,
     now,
   });
   if (fp) {
-    // 账号睡眠 / 认证失效 / 待办 / 换 profile 属于 run 结束的那一刻：每个 run 只做一次。
+    // 账号睡眠 / 认证失效 / 待办 / profile 冷却属于 run 结束的那一刻：每个 run 只做一次。
     // 提交失败或重启后再次消化同一个 pending 时不能重做（主人可能已经修好了账号）
     const pend = await readPending(env.db, book.id);
     const applied = pend?.runId === runId && pend.infraApplied === true;
@@ -1151,7 +926,6 @@ async function judgeRunV3(env: ExecEnv, ctx: PipelineContext, handler: TaskHandl
     ...fin,
     status,
     ...(status === 'waiting' && verdict.retryAfter ? { retryAfter: verdict.retryAfter } : {}),
-    ...(verdict.avoidProfile ? { avoidProfile: verdict.avoidProfile } : {}),
     ...(status !== 'done' && infraClass ? { errorClass: infraClass, message: outcome.message ?? infraClass } : {}),
     // judge 的没出章 / 空批阶梯：固定的等待原因，状态句只对它说“上一次没写出合格的新章”
     ...(status === 'waiting' && !infraClass ? { message: NO_PROSE_WAIT } : {}),
@@ -1170,181 +944,39 @@ async function applyFailurePlan(env: ExecEnv, task: TaskRow, plan: FailurePlan):
   await patchOrch(env, task, plan.orchPatch);
   if (plan.authBad) await markAuthBad(env.db, plan.authBad.accountId, plan.authBad.detail);
   if (plan.sleep) await sleepAccount(env.db, plan.sleep.accountId, plan.sleep.until, plan.sleep.reason);
+  if (plan.profileDown) await markProfileDown(env.db, plan.profileDown.profileId, plan.profileDown.until, plan.profileDown.reason);
   for (const i of plan.inbox ?? []) await createInboxItem(env.db, env.bus, i);
   if (plan.quotaWait) env.bus.publish({ type: 'quota_wait', accountId: plan.quotaWait.accountId, until: plan.quotaWait.until, reason: plan.quotaWait.reason });
   return plan.result;
 }
 
-async function routeFailure(env: ExecEnv, task: TaskRow, route: ResolvedRoute, book: BookHandle | null): Promise<TaskResult> {
+/** 写作位置没有可用模型：有恢复时刻就等到那时；否则 v3 规则（按书合并的 no_route:<book>，复盘不发待办） */
+async function routeFailure(env: ExecEnv, task: TaskRow, route: ResolvedRoute): Promise<TaskResult> {
   const now = env.nowFn();
-  await maybeFailover(env, task, route, book, now);
   if (route.waitUntil) return { status: 'waiting', retryAfter: route.waitUntil, message: `路由等待：${route.reason ?? ''}` };
-  const cause = route.cause ?? 'no_route';
-  if (isV3Kind(task.kind) && task.bookId) return routeFailureV3(env, task, route, cause, now);
-  if (cause === 'avoided' || cause === 'constraint' || cause === 'vendor') {
-    await createInboxItem(env.db, env.bus, {
-      kind: 'block',
-      bookId: task.bookId,
-      title: `任务 ${task.kind}（${task.target}）没有可用路由`,
-      body: { taskId: task.id, reason: route.reason },
-      actions: [
-        { id: 'retry', label: '重试' },
-        { id: 'dismiss', label: '忽略' },
-      ],
-      dedupeKey: `no_route:task:${task.id}`,
-      relatedTaskId: task.id,
-    });
-    return { status: 'blocked', errorClass: 'config', message: route.reason ?? 'no route' };
-  }
-  await createInboxItem(env.db, env.bus, {
-    kind: 'notice',
-    bookId: task.bookId,
-    title: `角色 ${task.role} 暂无可用路由`,
-    body: { taskId: task.id, reason: route.reason, cause },
-    actions: [{ id: 'dismiss', label: '知道了' }],
-    dedupeKey: `no_route:${task.bookId ?? 'global'}:${task.role}`,
-  });
-  return { status: 'waiting', retryAfter: new Date(now.getTime() + 10 * 60_000).toISOString(), message: `无可用路由（${cause}）：${route.reason ?? ''}` };
+  return routeFailureV3(env, task, route, route.cause ?? 'no_route', now);
 }
 
 /**
- * v3 任务没有可用路由（WP-3，DESIGN §8.3“harness 不可用”）：按书合并成一条 no_route:<book>。
- * 任务被拦（block）时带“重试”；只是等（waiting）时只有“知道了”，并且不覆盖这本书已经在的“被拦”那一条。
+ * v3 任务没有可用路由（DESIGN §8.3“harness 不可用”）：等 10 分钟，按书合并成一条 no_route:<book>（只有“知道了”），
+ * 并且不覆盖这本书已经在的“被拦”那一条（旧版本留下的 blocked 任务）。复盘不是主人的事：只等，不发待办。没有书的任务不发待办。
  */
 async function routeFailureV3(env: ExecEnv, task: TaskRow, route: ResolvedRoute, cause: string, now: Date): Promise<TaskResult> {
-  const bookId = task.bookId as string;
+  const waiting: TaskResult = { status: 'waiting', retryAfter: new Date(now.getTime() + 10 * 60_000).toISOString(), message: `无可用路由（${cause}）：${route.reason ?? ''}` };
+  const bookId = task.bookId;
+  if (task.kind === 'book.retro' || !bookId) return waiting;
   const title = (await env.db.select({ title: books.title }).from(books).where(eq(books.id, bookId)).limit(1))[0]?.title ?? bookId;
   const dedupeKey = `no_route:${bookId}`;
-  const blocked = cause === 'avoided' || cause === 'constraint' || cause === 'vendor';
-  // 复盘不是主人的事：路由不到也不发待办（被拦的复盘由 finishTaskV3 记成 failed，算作做过了）
-  if (task.kind === 'book.retro') return blocked ? { status: 'blocked', errorClass: 'config', message: route.reason ?? 'no route' } : { status: 'waiting', retryAfter: new Date(now.getTime() + 10 * 60_000).toISOString(), message: `无可用路由（${cause}）：${route.reason ?? ''}` };
-  const base ={ kind: 'block' as const, bookId, title: `《${title}》没有可用的写作账号`, body: { taskId: task.id, reason: route.reason ?? '', cause, detail: route.reason ?? '' }, dedupeKey, relatedTaskId: task.id };
-  if (blocked) {
-    await upsertOpenInbox(env.db, env.bus, { ...base, actions: [{ id: 'retry', label: '重试' }, { id: 'dismiss', label: '知道了' }] });
-    return { status: 'blocked', errorClass: 'config', message: route.reason ?? 'no route' };
-  }
+  const base = { kind: 'block' as const, bookId, title: `《${title}》没有可用的写作账号`, body: { taskId: task.id, reason: route.reason ?? '', cause, detail: route.reason ?? '' }, dedupeKey, relatedTaskId: task.id };
   const open = (await env.db.select({ relatedTaskId: inbox.relatedTaskId }).from(inbox).where(and(eq(inbox.dedupeKey, dedupeKey), eq(inbox.state, 'open'))).limit(1))[0];
   const rel = open?.relatedTaskId ? (await env.db.select({ state: tasks.state }).from(tasks).where(eq(tasks.id, open.relatedTaskId)).limit(1))[0] : undefined;
   if (rel?.state !== 'blocked') await upsertOpenInbox(env.db, env.bus, { ...base, actions: [{ id: 'dismiss', label: '知道了' }] });
-  return { status: 'waiting', retryAfter: new Date(now.getTime() + 10 * 60_000).toISOString(), message: `无可用路由（${cause}）：${route.reason ?? ''}` };
-}
-
-/** 写手不可用（auth/熔断/模型下架）持续超过 failover_after → 发 failover 提案（额度窗口不触发） */
-async function maybeFailover(env: ExecEnv, task: TaskRow, route: ResolvedRoute, book: BookHandle | null, now: Date): Promise<void> {
-  if (!book || task.role !== 'writer') return;
-  const preset = await effectiveRouting(env.db, book);
-  const writer = preset.roles.writer;
-  if (!writer?.failover_chain.length || writer.failover_on.length === 0 || !writer.failover_after_ms) return;
-  const cause = route.cause ?? '';
-  const eligible = (writer.failover_on as string[]).includes(cause);
-  const rows = await env.db.select({ meta: books.meta }).from(books).where(eq(books.id, book.id)).limit(1);
-  const meta = (rows[0]?.meta ?? {}) as { writerUnavailableSince?: string | null };
-  if (!eligible) {
-    if (meta.writerUnavailableSince) await env.db.update(books).set({ meta: sql`${books.meta} || ${JSON.stringify({ writerUnavailableSince: null })}::jsonb` }).where(eq(books.id, book.id));
-    return;
-  }
-  const since = meta.writerUnavailableSince ?? now.toISOString();
-  if (!meta.writerUnavailableSince) await env.db.update(books).set({ meta: sql`${books.meta} || ${JSON.stringify({ writerUnavailableSince: since })}::jsonb` }).where(eq(books.id, book.id));
-  if (now.getTime() - new Date(since).getTime() < writer.failover_after_ms) return;
-  const to = writer.failover_chain[0] as string;
-  if (!writer.failover_requires_approval) {
-    await env.db.update(books).set({ writerProfile: to, meta: sql`${books.meta} || ${JSON.stringify({ writerUnavailableSince: null })}::jsonb`, updatedAt: now.toISOString() }).where(eq(books.id, book.id));
-    return;
-  }
-  // v3：需要审批的切换不发待办（WP-3）；书停在 no_route:<book> / circuit: 上，状态句会说明。不需要审批的自动切换照常
-  if (isV3Kind(task.kind)) return;
-  await createInboxItem(env.db, env.bus, {
-    kind: 'approval',
-    bookId: book.id,
-    title: `主笔不可用（${cause}），建议切换到 ${to}`,
-    body: { failover: { to, cause }, reason: route.reason },
-    actions: [
-      { id: 'approve', label: `切换到 ${to}` },
-      { id: 'dismiss', label: '继续等待' },
-    ],
-    dedupeKey: `failover:${book.id}`,
-  });
-}
-
-async function rememberWriter(env: ExecEnv, book: BookHandle, route: ResolvedRoute): Promise<void> {
-  const preset = await effectiveRouting(env.db, book);
-  if (preset.roles.writer?.sticky !== 'book') return;
-  await env.db
-    .update(books)
-    .set({ writerProfile: route.profile, updatedAt: new Date().toISOString() })
-    .where(and(eq(books.id, book.id), sql`${books.writerProfile} is null`));
-}
-
-// ───────────────────────── VALIDATED.json + 恢复 ─────────────────────────
-
-/** PromotePlan 的可序列化形式（dbEffects 闭包除外；Buffer 用 base64） */
-type SerializedPlan = Omit<PromotePlan, 'files' | 'dbEffects'> & { files: { path: string; content: string | { b64: string } | null }[] };
-type PersistedResult = Omit<TaskResult, 'promote'>;
-
-interface ValidatedFile {
-  schema: 'nv.validated/1';
-  taskId: string;
-  attempt: number;
-  generation: number;
-  meta: PromoteMeta;
-  harvested: HarvestedRun | null;
-  /** §7.7：恢复时只重放这份已验证的提交计划，不再重跑 handler（缺失 = 该结果带闭包，退回重跑） */
-  plan?: SerializedPlan;
-  result?: PersistedResult;
-}
-
-function serializePlan(plan: PromotePlan): SerializedPlan | null {
-  if (plan.dbEffects && !plan.effect) return null;
-  const { dbEffects: _closure, files, ...rest } = plan;
-  return { ...rest, files: files.map((f) => ({ path: f.path, content: Buffer.isBuffer(f.content) ? { b64: f.content.toString('base64') } : f.content })) };
-}
-
-function deserializePlan(doc: SerializedPlan): PromotePlan {
-  return { ...doc, files: doc.files.map((f) => ({ path: f.path, content: f.content !== null && typeof f.content === 'object' ? Buffer.from(f.content.b64, 'base64') : f.content })) };
-}
-
-function validatedPath(book: BookHandle, task: TaskRow): string {
-  return path.join(book.dir, P.validated(task.id, task.attempts + 1));
-}
-
-async function writeValidated(book: BookHandle, task: TaskRow, meta: PromoteMeta, harvested: HarvestedRun | null, result: TaskResult): Promise<void> {
-  const file = validatedPath(book, task);
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const { promote: plan, ...persisted } = result;
-  const serialized = plan ? serializePlan(plan) : null;
-  const doc: ValidatedFile = { schema: 'nv.validated/1', taskId: task.id, attempt: task.attempts + 1, generation: orchOf(task).generation ?? 1, meta, harvested, ...(serialized ? { plan: serialized, result: persisted } : {}) };
-  await fs.writeFile(file, JSON.stringify(doc));
-}
-
-async function executeRecovery(env: ExecEnv, ctx: PipelineContext, handler: TaskHandler, task: TaskRow, recover: NonNullable<OrchTaskState['recover']>): Promise<TaskResult | null> {
-  if (!ctx.book) return null;
-  let doc: ValidatedFile;
-  try {
-    doc = JSON.parse(await fs.readFile(validatedPath(ctx.book, task), 'utf8')) as ValidatedFile;
-  } catch {
-    await patchOrch(env, task, { recover: undefined });
-    return null;
-  }
-  await setTaskState(env.db, task.id, 'finalizing');
-  void recover; // mode 不改变流程：promote 按 trailer 幂等，已提交时只补 tag + 重放 dbEffects（effectsCommit 去重）
-  if (doc.plan && doc.result) {
-    // 正常路径：重放已验证的提交计划与 followups，不调用 handler（handler 基于已变化的 HEAD/workflow，不可重入）
-    return attachMeta({ ...doc.result, promote: deserializePlan(doc.plan) }, doc.meta, doc.harvested);
-  }
-  let result: TaskResult;
-  if (handler.role === null) {
-    if (!handler.execute) return null;
-    result = await handler.execute(ctx, task);
-  } else {
-    if (!doc.harvested || !handler.finalize) return null;
-    result = await handler.finalize(ctx, task, doc.harvested);
-  }
-  return attachMeta(result, doc.meta, doc.harvested);
+  return waiting;
 }
 
 // ───────────────────────── 完成：提交、入队、outbox ─────────────────────────
 
-/** 把一个 TaskResult 变成持久状态（promote → completeTask → outbox 投递）。executeTask 之后调用。 */
+/** 把一个 TaskResult 变成持久状态（v3：逐章提交 → completeTask → outbox；确定性任务：completeTask → outbox）。executeTask 之后调用。 */
 export async function finishTask(deps: ExecutorDeps, task: TaskRow, result: TaskResult): Promise<void> {
   const env = execEnv(deps);
   const latest = ((await env.db.select().from(tasks).where(eq(tasks.id, task.id)).limit(1)) as TaskRow[])[0];
@@ -1365,49 +997,6 @@ export async function finishTask(deps: ExecutorDeps, task: TaskRow, result: Task
     return;
   }
 
-  const attached = RESULT_META.get(result);
-  let promoted: PromoteOutcome | null = null;
-  if (result.promote && (result.status === 'done' || result.status === 'hold')) {
-    const book = await env.pipe.openBook(env.pdeps, bookId as string);
-    const handler = env.pipe.handlerFor(task.kind as TaskKind);
-    await writeValidated(book, latest, attached?.meta ?? {}, attached?.harvested ?? null, result);
-    await setTaskState(env.db, task.id, 'finalizing');
-    const ctx: PipelineContext = { deps: env.pdeps, book };
-    const manifest = { hard: task.hardManifest, soft: task.softManifest, rebaseValidators: task.rebaseValidators, configHash: '' };
-    promoted = await promote(env.db, book.repo, latest, manifest, result.promote, attached?.meta ?? {}, handler.rebase ? { rebase: (head) => (handler.rebase as NonNullable<TaskHandler['rebase']>)(ctx, latest, head) } : {});
-
-    if (promoted.status === 'stale') {
-      await setTaskState(env.db, task.id, 'stale', { waitReason: 'stale', error: promoted.reason ?? 'stale' });
-      env.bus.publish({ type: 'task_changed', taskId: task.id, book: bookId, state: 'stale' });
-      return;
-    }
-    if (promoted.status === 'rejected') {
-      if (promoted.reason === 'agents_md_edit') {
-        await createInboxItem(env.db, env.bus, {
-          kind: 'agents_md_edit',
-          bookId,
-          title: '根 AGENTS.md 被手动修改',
-          body: { detail: 'Novelist 管理的根 AGENTS.md 有非 Novelist 提交；请把内容迁移到 instructions/AGENTS.md。', on: { migrate: { task: 'ready' } } },
-          actions: [
-            { id: 'migrate', label: '一键迁移到 instructions/AGENTS.md' },
-            { id: 'dismiss', label: '忽略' },
-          ],
-          dedupeKey: `agents_md:${bookId}`,
-          relatedTaskId: task.id,
-        });
-        await completeTask(env.db, task.id, { status: 'blocked', errorClass: 'config', message: 'agents_md_edit' }, completeOpts(env));
-        env.bus.publish({ type: 'task_changed', taskId: task.id, book: bookId, state: 'blocked' });
-        return;
-      }
-      // rebase validators 失败：结果作废，转 followups（card.repair 等），由后续任务修复
-      for (const f of promoted.followups ?? []) await enqueueSpec(env, ctx, { ...f, parentTaskId: task.id });
-      await setTaskState(env.db, task.id, 'stale', { waitReason: 'rebase_failed', error: promoted.reason ?? 'rebase failed' });
-      env.bus.publish({ type: 'task_changed', taskId: task.id, book: bookId, state: 'stale' });
-      return;
-    }
-  }
-
-  // 依赖崩溃恢复重放：dbEffects 已在 promote 内执行（或 replay 时 applyDbEffects 去重）
   const { promote: _p, ...persisted } = result;
   const state = await completeTask(env.db, task.id, persisted as TaskResult, completeOpts(env));
   env.bus.publish({ type: 'task_changed', taskId: task.id, book: bookId, state });
@@ -1428,10 +1017,6 @@ export async function finishTask(deps: ExecutorDeps, task: TaskRow, result: Task
   }
 
   await drainOutbox(env, task.id);
-
-  if (promoted && (promoted.status === 'committed' || promoted.status === 'rebased') && result.chapter?.state === 'accepted' && bookId) {
-    await publishAccepted(env, bookId, result.chapter.no);
-  }
 }
 
 /**
@@ -1546,77 +1131,61 @@ async function publishAccepted(env: ExecEnv, bookId: string, no: number): Promis
 export async function enqueueSpec(env: ExecEnv, ctx: PipelineContext, spec: TaskSpec): Promise<{ id: string; created: boolean }> {
   const handler = env.pipe.handlerFor(spec.kind);
   const manifest = await handler.manifest(ctx, spec);
-  const stackHash = handler.role ? await computeStackHash(env, ctx.book, spec.role ?? handler.role, spec.kind) : '';
+  const stackHash = handler.role ? await computeStackHash(env, ctx.book) : '';
   const id = env.pipe.computeTaskId(spec, manifest, stackHash);
   const full: TaskSpec = { ...spec, lane: spec.lane ?? handler.lane, role: spec.role ?? handler.role, maxAttempts: spec.maxAttempts ?? handler.maxAttempts };
   return enqueue(env.db, { spec: full, id, manifest, baseCommit: ctx.book?.headCommit ?? null });
 }
 
-async function computeStackHash(env: ExecEnv, book: BookHandle | null, role: RoleId, kind: TaskKind): Promise<string> {
+/** 任务 id 用的指令 hash：这本书此刻的 v3 根 AGENTS.md（与 run 时渲染的同一套层）；没有书或渲染出错 → '' */
+async function computeStackHash(env: ExecEnv, book: BookHandle | null): Promise<string> {
+  if (!book) return '';
   try {
-    const stack = await resolveStack({
+    const r = await renderAgentsMdV3({
       globalDir: env.paths.instructionsGlobal,
-      genreDirs: book ? book.genre.chain.map((g) => ({ id: g.id, dir: g.dir })) : [],
-      bookDir: book?.dir ?? null,
-      role,
-      taskKind: kind,
-      ownerNotes: [],
+      genreDirs: book.genre.chain.map((g) => ({ id: g.id, dir: g.dir, name: g.pack.name ?? g.id })),
+      bookDir: book.dir,
+      length: book.config.v3.length,
     });
-    return compileInstructions(stack, { nonces: 'placeholder' }).stackHash;
+    return r.stackHash;
   } catch {
     return '';
   }
 }
 
-/** outbox 投递（幂等）：followups + onTaskDone → enqueue；inbox；chapter 索引 */
+/** outbox 投递（幂等）：followups + onTaskDone → enqueue；inbox */
 export async function drainOutbox(env: ExecEnv, taskId: string): Promise<boolean> {
   const rows = (await env.db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1)) as TaskRow[];
   const task = rows[0];
   if (!task || !orchOf(task).outbox) return false;
-  const res = (task.result ?? {}) as { status?: string; followups?: TaskSpec[]; inbox?: Parameters<typeof createInboxItem>[2][]; chapter?: TaskResult['chapter']; summary?: Record<string, unknown> };
+  const clearFlag = () => env.db.update(tasks).set({ params: withOrch(task.params, { outbox: undefined }), updatedAt: new Date().toISOString() }).where(eq(tasks.id, taskId));
+  // 已删除的旧种类、旧书的任务（P3 D15）：只清标记——不打开书、不入队后续、不建待办（否则每个 tick 都会把旧的审批 / 拦截项建回来）
+  const legacyBook = task.bookId ? !isV3Meta((await env.db.select({ meta: books.meta }).from(books).where(eq(books.id, task.bookId)).limit(1))[0]?.meta) : false;
+  if (!isKnownKind(task.kind) || legacyBook) {
+    await clearFlag();
+    return true;
+  }
+  const res = (task.result ?? {}) as { status?: string; followups?: TaskSpec[]; inbox?: Parameters<typeof createInboxItem>[2][]; summary?: Record<string, unknown> };
   const orch = orchOf(task);
   try {
     const book = task.bookId ? await env.pipe.openBook(env.pdeps, task.bookId) : null;
     const ctx: PipelineContext = { deps: env.pdeps, book };
     const followups: TaskSpec[] = [...(res.followups ?? [])];
-    if (res.status === 'done') followups.push(...(await env.pipe.onTaskDone(ctx, task, { status: 'done', ...(res.summary ? { summary: res.summary } : {}), ...(res.followups ? { followups: res.followups } : {}), ...(res.chapter ? { chapter: res.chapter } : {}) })));
+    if (res.status === 'done') followups.push(...(await env.pipe.onTaskDone(ctx, task, { status: 'done', ...(res.summary ? { summary: res.summary } : {}), ...(res.followups ? { followups: res.followups } : {}) })));
     for (const f of followups) await enqueueSpec(env, ctx, { ...f, parentTaskId: f.parentTaskId ?? task.id });
     for (const i of res.inbox ?? []) {
       // v3 任务只放行 DESIGN §8.3 的几类（WP-3）
       if (isV3Kind(task.kind) && !v3InboxAllowed(i)) continue;
       await createInboxItem(env.db, env.bus, { ...i, bookId: i.bookId ?? task.bookId, relatedTaskId: i.relatedTaskId ?? task.id });
     }
-    if (task.kind === 'harness.canary' && ['done', 'failed', 'blocked'].includes(task.state)) await finishCanary(env, task, task.state === 'done');
     if (task.kind === 'publish' && res.status === 'done') await publishChapterEvents(env, task);
-    await env.db.update(tasks).set({ params: withOrch(task.params, { outbox: undefined }), updatedAt: new Date().toISOString() }).where(eq(tasks.id, taskId));
+    await clearFlag();
     return true;
   } catch (err) {
     env.log.warn({ err: (err as Error).message, taskId }, 'outbox drain failed');
     const errors = ((orch as unknown as { outboxErrors?: number }).outboxErrors ?? 0) + 1;
     await env.db.update(tasks).set({ params: withOrch(task.params, errors >= 10 ? { outbox: undefined } : ({ outboxErrors: errors } as unknown as Partial<OrchTaskState>)), updatedAt: new Date().toISOString() }).where(eq(tasks.id, taskId));
     return false;
-  }
-}
-
-async function finishCanary(env: ExecEnv, task: TaskRow, ok: boolean): Promise<void> {
-  const m = /^(.+)@(.*?):(.+)$/.exec(task.target);
-  if (!m) return;
-  const [, harness, version, isolation] = m as unknown as [string, string, string, string];
-  const writer = await writerHarnesses(env.db);
-  const applied = await applyCanaryResult(env.db, { harness, version, isolation, ok, writerHarness: writer.has(harness), now: env.nowFn() });
-  env.bus.publish({ type: 'circuit_changed', harness: harness as never, version, state: applied.state, reason: applied.reason });
-  if (applied.needsInbox) {
-    await createInboxItem(env.db, env.bus, {
-      kind: 'circuit',
-      bookId: null,
-      title: `主笔 harness ${harness}@${version} 建议熔断（30 分钟后生效）`,
-      body: { harness, version, isolation, reason: applied.reason, effectiveAt: applied.effectiveAt },
-      actions: [
-        { id: 'veto', label: '否决（继续运行）', danger: true },
-        { id: 'approve', label: '立即熔断' },
-      ],
-      dedupeKey: `circuit:${harness}:${version}:${isolation}`,
-    });
   }
 }
 
@@ -1655,8 +1224,8 @@ export async function reattach(env: ExecEnv, runRow: typeof runs.$inferSelect): 
   const log = new EventLog(env, runRow.id, runRow.accountId, () => undefined);
   const handle = await reattachRun(runRow.runDir, adapter, session.spec, log, fromSeq).catch(() => null);
   if (!handle) return null;
-  if (!ACTIVE_STATES.includes(task.state as (typeof ACTIVE_STATES)[number])) {
-    // 任务已被取消/完成：不复活，直接终止 harness，run 按 lost 收尾
+  // 任务已被取消/完成，或是已删除的旧种类 / 开机迁移取消的旧书任务（P3 M2）：不复活，直接终止 harness，run 按 lost 收尾
+  if (!ACTIVE_STATES.includes(task.state as (typeof ACTIVE_STATES)[number]) || !isKnownKind(task.kind) || task.waitReason === 'p3_legacy') {
     await handle.kill('user').catch(() => {});
     await log.close().catch(() => {});
     return null;
@@ -1672,7 +1241,7 @@ export async function reattach(env: ExecEnv, runRow: typeof runs.$inferSelect): 
   const finished = (async () => {
     const book = task.bookId ? await env.pipe.openBook(env.pdeps, task.bookId) : null;
     const ctx: PipelineContext = { deps: env.pdeps, book };
-    const handler = env.pipe.handlerFor(task.kind as TaskKind);
+    const handler = env.pipe.handlerFor(task.kind);
     const activeLink = path.join(env.paths.runsActive, runRow.id);
     const snapshot = book ? { dir: session.spec.bookDir, baseCommit: session.runCtx.baseCommit, bookDir: book.dir } : null;
     const result = await finishRun(env, ctx, handler, task, {
@@ -1685,7 +1254,6 @@ export async function reattach(env: ExecEnv, runRow: typeof runs.$inferSelect): 
       resolved: null,
       signal: new AbortController().signal,
       adapter,
-      tier: normalizeTierOrNull(task.tier),
     });
     await finishTask(env, task, result);
   })()
@@ -1705,8 +1273,7 @@ export async function markRunLost(env: ExecEnv, runRow: typeof runs.$inferSelect
   await env.db.update(runs).set({ state: 'lost', endedAt: now }).where(eq(runs.id, runRow.id));
   const session = await loadSession(runRow.runDir);
   if (session) {
-    await releaseReservations(env.db, session.reservationIds);
-    // v3：不收稿、不删快照——pending（stage 'run'）指着它，本书下一次执行任何 v3 任务时收
+    // v3：不收稿、不删快照——pending（stage 'run'）指着它，本书下一次执行任何 v3 任务时收。旧流程的 session（没有 contract）照旧删快照
     if (session.spec.bookDir && session.contract !== 'v3') {
       const rows = await env.db.select({ dir: books.slug }).from(books).where(eq(books.id, runRow.bookId ?? '')).limit(1);
       if (rows[0]) await removeRunSnapshot({ dir: session.spec.bookDir, baseCommit: session.runCtx.baseCommit, bookDir: path.join(env.paths.books, rows[0].dir) }).catch(() => {});

@@ -196,4 +196,14 @@ describe('decideNext', () => {
     expect(effortFor(w('finale', 3, 2) as never, defaults)).toBe('high');
     expect(effortFor({ kind: 'retro', from: 1, to: 20 }, defaults)).toBe('medium');
   });
+
+  it('closing effort (P3): the closing phase uses effort.closing when set, else finale (books written before P3); the finale batch always uses finale', () => {
+    const withClosing = zV3BookConfig.parse({ effort: { open: 'low', write: 'low', closing: 'medium', finale: 'high', retro: 'low' } });
+    expect(effortFor(w('write', 6, 5, 'closing') as never, withClosing)).toBe('medium');
+    expect(effortFor(w('write', 6, 5) as never, withClosing)).toBe('low');
+    expect(effortFor(w('finale', 11, 5) as never, withClosing)).toBe('high');
+    const without = zV3BookConfig.parse({ effort: { write: 'low', finale: 'medium' } });
+    expect(without.effort.closing).toBeUndefined();
+    expect(effortFor(w('write', 6, 5, 'closing') as never, without)).toBe('medium');
+  });
 });

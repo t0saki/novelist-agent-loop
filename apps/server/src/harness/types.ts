@@ -1,8 +1,8 @@
 /**
- * HarnessAdapter 契约（DESIGN §3.1）。Owner: lane A。
+ * HarnessAdapter 契约（DESIGN §3.1、v3 §3.1）。
  * adapter 是纯“翻译层”：账号/规格 → 命令行、stdout → 归一化事件、退出 → Outcome。
- * 指令物化（system channel / workspace doc 怎么交给 harness）由 lane C 的 instructions/materialize 实现，
- * adapter.materialize() 只是转调 `materializeFor(this.id, …)`。
+ * 约定（目录契约）：cwd = 可写的书快照，指令在快照根的 AGENTS.md（cc 经 CLAUDE.md 的 @AGENTS.md），任务在 ORDER.md，启动语是 V3_LAUNCH_PROMPT；
+ * 没有回执、schema、nonce，也没有 system channel。
  */
 import type {
   Account,
@@ -17,9 +17,7 @@ import type {
   Outcome,
   QuotaSnapshot,
   RoleId,
-  TaskKind,
 } from '@novelist/shared';
-import type { CompiledInstructions, MaterializeResult } from '../instructions/types.js';
 
 /** 已解密、可直接使用的账号（只在 runner 进程内存在；绝不序列化进日志/DB） */
 export interface ResolvedAccount extends Account {
@@ -44,38 +42,29 @@ export interface RunSpec {
   taskId: string;
   attempt: number;
   role: RoleId;
-  taskKind: TaskKind;
+  /** 任务种类原样（harness 不需要枚举；已删除的旧种类也能读） */
+  taskKind: string;
   harness: HarnessId;
   profileId: string;
   accountId: string | null;
   bookSlug: string | null;
   /** $RUN = $DATA/runs/YYYY-MM/<runId> */
   runDir: string;
-  /** $RUN/book：git worktree@base_commit；cwd；container 档下 harness 可写但只收割 outDir */
+  /** $RUN/book：git worktree@base_commit；cwd；作者可写（收割看整个快照的改动） */
   bookDir: string;
-  /** $RUN/book/work/<taskId>/attempt-<k>/out：唯一被收割的目录 */
+  /** $RUN/book/work/<taskId>/attempt-<k>/out：快照里可写的草稿目录 */
   outDir: string;
   inDir: string; // $RUN/in
   logDir: string; // $RUN/log
-  workOrderFile: string; // $RUN/in/workorder.md（同时复制到 work/<task>/workorder.md）
-  systemFile: string; // $RUN/in/system.md（首尾 nonce 只在这里）
-  receiptSchemaFile: string; // $RUN/in/receipt.<dialect>.json
+  /** 启动语文件 $RUN/in/launch.md（名字沿用旧称；stdin 读它的 harness 用它） */
+  workOrderFile: string;
   model: string;
   effort?: string;
   limits: RunLimits;
   session: { mode: 'fresh'; id: string } | { mode: 'resume' | 'fork'; id: string };
   persistSession: boolean;
   egress: { proxy?: string; allow: string[] };
-  mcp?: { socket: string; token: string };
-  subagents: boolean;
   extraArgs: string[];
-  /** 作者层通道：append（默认，追加到 harness 自带系统提示）/ replace（整体替换；需 caps.systemReplace） */
-  personaMode?: 'append' | 'replace';
-  /**
-   * 'v3': cwd = writable book snapshot, instructions via root AGENTS.md/CLAUDE.md, no receipt/schema/nonce. Absent = old contract.
-   * v3 下 workOrderFile 是启动语文件 $RUN/in/launch.md，systemFile 是空的 $RUN/in/system.md，receiptSchemaFile 指向不会写入的路径。
-   */
-  contract?: 'v3';
 }
 
 /** prepareHome 的产物：home 的配置部分（每 run 重生成）与需要的 env */
@@ -157,9 +146,7 @@ export interface HarnessAdapter {
   /** 列模型（agy models、codex 模型列表、cc 已知列表 + 账号 customModels） */
   listModels(acct: ResolvedAccount, inst: HarnessInstall): Promise<string[]>;
   prepareHome(acct: ResolvedAccount, inst: HarnessInstall, spec: RunSpec): Promise<HomeLayout>;
-  /** 转调 instructions.materializeFor(this.id, …)；返回需要追加的 argv/env/文件 */
-  materialize(spec: RunSpec, compiled: CompiledInstructions, caps: Capabilities, ctx?: { home: string }): Promise<MaterializeResult>;
-  buildInvocation(spec: RunSpec, caps: Capabilities, home: HomeLayout, mat: MaterializeResult, acct: ResolvedAccount, inst: HarnessInstall): Invocation;
+  buildInvocation(spec: RunSpec, caps: Capabilities, home: HomeLayout, acct: ResolvedAccount, inst: HarnessInstall): Invocation;
   createParser(spec: RunSpec): StreamParser;
   /** §3.3：只看终止事件与退出码；denial 只作遥测 */
   classify(exit: ExitInfo, events: NEvent[], stderrTail: string): Outcome;

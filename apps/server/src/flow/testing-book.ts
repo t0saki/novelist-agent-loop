@@ -42,6 +42,8 @@ export async function addV3Book(env: OrchTestEnv, slug = 'v3b', o: V3BookOpts = 
       publish: { ...V3_PUBLISH_DEFAULTS, ...(o.publish ?? {}) },
     } as never,
     premise: '种子。\n',
+    // 旧布局 = 今天这个夹具一直用的样子（不传 layout 时的默认）；改成 v3 布局是另一件事（P3 §4.A）
+    layout: 'legacy',
   });
   const files: { path: string; content: string }[] = [
     { path: 'bible.md', content: '# 《测试书》\n一句话：一个测试用的故事。\n标签：悬疑\n' },

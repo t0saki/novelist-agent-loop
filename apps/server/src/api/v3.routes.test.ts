@@ -8,6 +8,7 @@ import { chapterText } from '../flow/testing.js';
 import { commitOwnerEdit } from '../orchestrator/index.js';
 import { createBook, reindexBook } from '../services/books.js';
 import { createTestApp, TEST_ADMIN_PASSWORD, type TestApp } from '../testing.js';
+import { createLegacyBook } from '../book/testing-legacy.js';
 import { bookDir } from './helpers.js';
 
 let t: TestApp;
@@ -39,7 +40,7 @@ beforeAll(async () => {
   const r = await t.app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: TEST_ADMIN_PASSWORD } });
   cookie = String(r.headers['set-cookie'] ?? '').split(';')[0] ?? '';
   await v3Book('rt', 3, { 'drafts/c00002.rewrite.md': `# 第2章 新\n\n${chapterText(2, 1600, '', 77).replace(/^# [^\n]*\n+/, '')}`, 'drafts/scratch.md': '随手记\n' });
-  await createBook(t.deps, { title: '旧流程', slug: 'rt-v2', genre: 'xianxia', start: false });
+  await createLegacyBook(t.deps.db, t.deps.paths, 'rt-v2', { title: '旧流程' });
   // 收稿失败待处理（重试）
   const row = await rowOf('rt');
   const pending = { taskId: 'x', runId: 'run-p', attempt: 1, stage: 'harvested', runDir: '/r', inDir: '/r/in', snapshotDir: '/r/b', baseCommit: '', manifestFile: null, trailerKey: 'x@run-p', route: { profile: 'p', account: null, harness: 'fake', model: null, isolation: 'none', stackHash: 'h' }, failures: 3, createdAt: '2026-11-10T00:00:00.000Z' };
@@ -55,7 +56,7 @@ describe('v3 routes', () => {
     for (const [method, url, body] of ROUTES) expect((await anon(method, `/api/admin/books/rt/${url}`, body)).statusCode, url).toBe(401);
   });
 
-  it('409 not_v3 for a v2 book', async () => {
+  it('409 not_v3 for a legacy book', async () => {
     for (const [method, url, body] of ROUTES) {
       const res = await admin(method, `/api/admin/books/rt-v2/${url}`, body);
       expect(res.statusCode, url).toBe(409);
@@ -88,22 +89,23 @@ describe('v3 routes', () => {
 });
 
 describe('v3 chapter actions', () => {
-  it('rewrite without a note → 400; with a note → 200; on a completed book → 409 v3_finished; repair → 409 v3_unsupported; rewrite_from on v2 → 400', async () => {
+  it('rewrite without a note → 400; with a note → 200; on a completed book → 409 v3_finished; removed actions (repair …) → 400; rewrite_from on a legacy book → 409 legacy_book', async () => {
     await v3Book('ca', 4);
     const url = '/api/admin/books/ca/chapters/2/actions';
     expect((await admin('POST', url, { action: 'rewrite' })).statusCode).toBe(400);
     expect((await admin('POST', url, { action: 'rewrite', note: '  ' })).statusCode).toBe(400);
     expect((await admin('POST', url, { action: 'rewrite', note: '再紧一点' })).statusCode).toBe(200);
-    const repair = await admin('POST', url, { action: 'repair', note: 'x' });
-    expect(repair.statusCode).toBe(409);
-    expect(repair.json().code).toBe('v3_unsupported');
+    // 旧流程的章节操作已从接口删除（P3 WP-3）
+    for (const action of ['repair', 'reextract', 'approve', 'hold', 'unhold']) expect((await admin('POST', url, { action, note: 'x' })).statusCode, action).toBe(400);
     await t.deps.db.update(books).set({ status: 'completed' }).where(eq(books.slug, 'ca'));
     const done = await admin('POST', url, { action: 'rewrite', note: '再紧一点' });
     expect(done.statusCode).toBe(409);
     expect(done.json().code).toBe('v3_finished');
     expect((await admin('PUT', '/api/admin/books/ca/v3/message', { text: '再写一章' })).json().code).toBe('v3_finished');
-    await createBook(t.deps, { title: '旧', slug: 'ca-v2', genre: 'xianxia', start: false });
-    expect((await admin('POST', '/api/admin/books/ca-v2/chapters/1/actions', { action: 'rewrite_from' })).statusCode).toBe(400);
+    await createLegacyBook(t.deps.db, t.deps.paths, 'ca-v2', { title: '旧' });
+    const legacy = await admin('POST', '/api/admin/books/ca-v2/chapters/1/actions', { action: 'rewrite_from' });
+    expect(legacy.statusCode).toBe(409);
+    expect(legacy.json().code).toBe('legacy_book');
   });
 
   it('rewrite_from on a published chapter → 409; on an unpublished one → rewind to N−1', async () => {

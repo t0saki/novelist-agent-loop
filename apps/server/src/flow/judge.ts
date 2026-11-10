@@ -6,7 +6,7 @@
  */
 import type { ErrorClass, Outcome } from '@novelist/shared';
 import { INFRA_CLASSES } from '../orchestrator/actions.js';
-import type { TaskResult } from '../pipeline/types.js';
+import type { TaskResult } from '../runtime/types.js';
 
 export interface V3RunFacts {
   outcome: Pick<Outcome, 'status' | 'errorClass' | 'retryAfter' | 'message'>;

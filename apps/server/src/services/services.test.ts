@@ -5,8 +5,14 @@ import { randomBytes } from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
-import { bookEvents, books, chapters, readers, readingProgress, v1ImportMap } from '../db/schema.js';
-import { createTestApp, type TestApp } from '../testing.js';
+import { parse as yamlParse } from 'yaml';
+import { zV1ImportRequest } from '@novelist/shared';
+import { git } from '../book/git.js';
+import { TRASH_TOMBSTONE } from '../book/index.js';
+import { createLegacyBook } from '../book/testing-legacy.js';
+import { bookEvents, books, chapters, readers, readingProgress, tasks, v1ImportMap } from '../db/schema.js';
+import { readV3Meta } from '../flow/state.js';
+import { createTestApp, TEST_ADMIN_PASSWORD, type TestApp } from '../testing.js';
 import { buildEpub, buildTxt } from './export.js';
 import { hashPassword, passwordLookupId, verifyPassword } from './passwords.js';
 import { decrypt, encrypt, loadMasterKey, parseMasterKey } from './secrets.js';
@@ -129,7 +135,7 @@ describe('v1 import', () => {
   });
 
   it('imports readers, books, progress and is idempotent', async () => {
-    const job = await startV1Import(t.deps, { databaseUrl: 'postgresql://u:p@h/novelist', novels: 'all', readers: true, themes: true, includeDrafts: false, bootstrapExtract: false }, { connect, wait: true });
+    const job = await startV1Import(t.deps, { databaseUrl: 'postgresql://u:p@h/novelist', novels: 'all', readers: true, themes: true, includeDrafts: false }, { connect, wait: true });
     const { getV1Job } = await import('./v1-import.js');
     const done = await getV1Job(t.deps, job.id);
     expect(done.state).toBe('done');
@@ -159,11 +165,75 @@ describe('v1 import', () => {
 
     // 第二次导入：什么都不变
     const before = (await t.deps.db.select().from(v1ImportMap)).length;
-    const again = await startV1Import(t.deps, { databaseUrl: 'postgresql://u:p@h/novelist', novels: 'all', readers: true, themes: true, includeDrafts: false, bootstrapExtract: false }, { connect, wait: true });
+    const again = await startV1Import(t.deps, { databaseUrl: 'postgresql://u:p@h/novelist', novels: 'all', readers: true, themes: true, includeDrafts: false }, { connect, wait: true });
     const r2 = await getV1Job(t.deps, again.id);
     expect(r2.state).toBe('done');
     expect(r2.report?.books).toHaveLength(0);
     expect((await t.deps.db.select().from(v1ImportMap)).length).toBe(before);
+  });
+
+  it('imported books are legacy books: no tasks, the legacy layout, volume titles filled; readable through the API; the owner can take one over', async () => {
+    // 导入工具不再有“回溯抽取”的选项
+    expect('bootstrapExtract' in zV1ImportRequest.shape).toBe(false);
+    const row = (await t.deps.db.select().from(books).where(eq(books.slug, 'sword-song')))[0]!;
+    expect(await t.deps.db.select().from(tasks).where(eq(tasks.bookId, row.id))).toEqual([]);
+    const dir = path.join(t.dataDir, 'books/sword-song');
+    const y = yamlParse(await fs.readFile(path.join(dir, 'book.yaml'), 'utf8')) as Record<string, unknown>;
+    expect(y.flow).toBeUndefined();
+    // 和现有的约 130 本导入书一样的布局：根 AGENTS.md 占位入库、bible/premise.md
+    const tracked = (await git(dir, ['ls-files'])).split('\n');
+    expect(tracked).toEqual(expect.arrayContaining(['AGENTS.md', 'bible/premise.md', 'book.yaml', 'plan/volumes/v01.yaml', 'manuscript/c00001.md', 'notes/v1/bible.json']));
+    const chs = await t.deps.db.select().from(chapters).where(eq(chapters.bookId, row.id)).orderBy(chapters.no);
+    expect(chs.map((c) => [c.no, c.volume, c.volumeTitle])).toEqual([
+      [1, 'v01', '第一卷'],
+      [2, 'v01', '第一卷'],
+    ]);
+
+    // 管理端和读者端的读取（legacy.read 的断言，在真实导入出来的书上再跑一遍）
+    const login = await t.app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: TEST_ADMIN_PASSWORD } });
+    const cookie = String(login.headers['set-cookie'] ?? '').split(';')[0] ?? '';
+    const admin = (method: 'GET' | 'POST' | 'PUT', url: string, payload?: unknown) => t.app.inject({ method, url, headers: { cookie }, ...(payload === undefined ? {} : { payload: payload as object }) });
+    const list = (await admin('GET', '/api/admin/books?filter=legacy')).json() as { slug: string; legacy: boolean }[];
+    expect(list.find((b) => b.slug === 'sword-song')).toMatchObject({ legacy: true });
+    expect((await admin('GET', '/api/admin/books/sword-song')).json()).toMatchObject({ legacy: true, dirMissing: false });
+    expect(((await admin('GET', '/api/admin/books/sword-song/chapters')).json().items as { volumeTitle: string }[]).map((c) => c.volumeTitle)).toEqual(['第一卷', '第一卷']);
+    expect((await admin('GET', '/api/admin/books/sword-song/chapters/1')).json().text).toContain('少年出发');
+    const rb = (await admin('GET', '/api/reader/books/sword-song')).json() as { volumes: { title: string; chapters: unknown[] }[] };
+    expect(rb.volumes.map((v) => [v.title, v.chapters.length])).toEqual([['第一卷', 2]]);
+    expect((await admin('GET', '/api/reader/books/sword-song/chapters/2')).json()).toMatchObject({ volumeTitle: '第一卷' });
+    expect((await admin('GET', '/api/reader/books/sword-song/export.txt')).body).toContain('【第一卷】');
+    const ro = await admin('PUT', '/api/admin/books/sword-song/file', { path: 'bible/premise.md', content: 'x', baseSha: null });
+    expect(ro.json().code).toBe('legacy_read_only');
+
+    // 接手：book.yaml 变成新流程，书变成 v3，第一次写作是接手任务单
+    const d = await admin('GET', '/api/admin/books/sword-song/takeover');
+    expect(d.statusCode, d.body).toBe(200);
+    expect(d.json()).toMatchObject({ accepted: 2, batch: 5 });
+    const tk = await admin('POST', '/api/admin/books/sword-song/takeover', { length: 'short', target_cjk: 20_000, start: false });
+    expect(tk.statusCode, tk.body).toBe(200);
+    expect(tk.json()).toMatchObject({ legacy: false, flow: 'v3', status: 'paused' });
+    expect((yamlParse(await fs.readFile(path.join(dir, 'book.yaml'), 'utf8')) as Record<string, unknown>).flow).toBe('v3');
+    const after = (await t.deps.db.select().from(books).where(eq(books.slug, 'sword-song')))[0]!;
+    expect(readV3Meta(after.meta).takeover).toMatchObject({ from: 3, status: 'pending' });
+    // 卷标题还在，读者端照常
+    expect(((await admin('GET', '/api/reader/books/sword-song')).json() as { volumes: { title: string }[] }).volumes[0]?.title).toBe('第一卷');
+  });
+
+  it('a stale half-import (row without the import map) is moved to the trash with reason v1_import_stale', async () => {
+    await v1.exec(`insert into novels values (3, 'half-book', '半本书', 'writing', null, '', 'zh', false, '', '', '', '', 1, 3000, '[]', '{}', '{}', '', '[]', 10, null, now(), null);
+      insert into chapters (novel_id, index, title, content, word_count, summary, status, updated_at) values (3, 1, '一', '半本书第一章。', 5, '', 'done', now());`);
+    const stale = await createLegacyBook(t.deps.db, t.deps.paths, 'half-book-old', { chapters: 1 });
+    await t.deps.db.update(books).set({ v1Id: 3 }).where(eq(books.id, stale.id));
+    const job = await startV1Import(t.deps, { databaseUrl: 'postgresql://u:p@h/novelist', novels: [3], readers: false, themes: false, includeDrafts: false }, { connect, wait: true });
+    const { getV1Job } = await import('./v1-import.js');
+    expect((await getV1Job(t.deps, job.id)).state).toBe('done');
+    expect(await t.deps.db.select().from(books).where(eq(books.id, stale.id))).toEqual([]);
+    expect(await fs.stat(stale.dir).then(() => true, () => false)).toBe(false);
+    const trashed = (await fs.readdir(path.join(t.dataDir, 'trash/books'))).filter((n) => n.startsWith('half-book-old-'));
+    expect(trashed).toHaveLength(1);
+    const tomb = JSON.parse(await fs.readFile(path.join(t.dataDir, 'trash/books', trashed[0] as string, TRASH_TOMBSTONE), 'utf8'));
+    expect(tomb).toMatchObject({ kind: 'books', reason: 'v1_import_stale', v1Id: 3 });
+    expect((await t.deps.db.select().from(books).where(eq(books.v1Id, 3))).length).toBe(1);
   });
 
   it('legacy reader logs in with the v1 password once, then is upgraded to argon2id', async () => {

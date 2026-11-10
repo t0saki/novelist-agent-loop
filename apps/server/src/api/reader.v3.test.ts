@@ -6,6 +6,7 @@ import { books, chapters } from '../db/schema.js';
 import { commitOwnerEdit } from '../orchestrator/index.js';
 import { createBook, reindexBook } from '../services/books.js';
 import { createTestApp, TEST_ADMIN_PASSWORD, type TestApp } from '../testing.js';
+import { createLegacyBook } from '../book/testing-legacy.js';
 import { bookDir } from './helpers.js';
 
 let t: TestApp;
@@ -47,8 +48,10 @@ describe('reader chapter text', () => {
     expect(body.title).toBe('雨夜');
   });
 
-  it('v2 chapter text keeps its first "#" line (regression)', async () => {
-    await publishedBook('rv2', undefined, `# 第一章 旧事\n\n${PROSE}\n`);
+  it('legacy (imported) chapter text keeps its first "#" line (regression)', async () => {
+    // 旧书（P3）：导入书的样子，再把第 1 章换成带标题行的正文
+    const b = await createLegacyBook(t.deps.db, t.deps.paths, 'rv2', { chapters: 1, published: 1 });
+    await commitOwnerEdit(t.deps.db, openRepo(b.dir), b.id, { files: [{ path: P.manuscript(1), content: `# 第一章 旧事\n\n${PROSE}\n` }], message: 'test: chapter', baseSha: null });
     const res = await chapter('rv2');
     expect(res.statusCode).toBe(200);
     expect(res.json().text).toBe(`# 第一章 旧事\n\n${PROSE}\n`);

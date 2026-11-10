@@ -36,6 +36,8 @@ export interface FlowState {
   rewinding?: boolean;
   /** meta.v3.finaleNoMarker：上一个结局批没写（全书完）的次数（> 0 时结局批不再越过存稿上限） */
   finaleNoMarker?: number;
+  /** P3：meta.v3.writeNow（主人要求立即写下一批）：和等着的改写请求一样越过存稿上限、复盘往后放 */
+  writeNow?: boolean;
 }
 
 export type FlowStep =
@@ -145,7 +147,7 @@ export function decideNext(s: FlowState): FlowStep {
   });
   const finaleFirst = finaleBypassesBuffer(e.mode, s.finaleNoMarker);
   // 5. 存稿满了就停（有未收完的稿、主人要求改写、下一批是结局批时照样提出任务：执行任务才会消化 pending，且不会再开新 run）
-  const ownerReq = s.ownerRequestWaiting === true;
+  const ownerReq = s.ownerRequestWaiting === true || s.writeNow === true;
   const bufferStop = !s.pending && !ownerReq && !finaleFirst && (s.productionPaused || s.accepted - s.published >= s.maxBuffer);
   // 6. 复盘：存稿满了立刻做；还要写的书先写下一批，那一批入库后（sinceRetro = RETRO_EVERY + 1）再做
   if (s.retroDue && !s.pending && !ownerReq && !finaleFirst && s.retroRange && (bufferStop || (s.sinceRetro ?? 0) >= RETRO_EVERY + 1)) {
@@ -160,6 +162,6 @@ export function decideNext(s: FlowState): FlowStep {
 export function effortFor(step: FlowStep, cfg: V3BookConfig): 'low' | 'medium' | 'high' {
   if (step.kind === 'open') return cfg.effort.open;
   if (step.kind === 'retro') return cfg.effort.retro;
-  if (step.kind === 'write') return step.mode === 'finale' || step.phase === 'closing' ? cfg.effort.finale : cfg.effort.write;
+  if (step.kind === 'write') return step.mode === 'finale' ? cfg.effort.finale : step.phase === 'closing' ? (cfg.effort.closing ?? cfg.effort.finale) : cfg.effort.write;
   return cfg.effort.write;
 }

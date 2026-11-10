@@ -1,7 +1,0 @@
-# 章节长度带：min/max 是 length.total 的硬边界，count_mode 见 packages/shared 的 COUNT_MODES。
-schema: nv.pacing/1
-chapter_length: { min: 2400, target: 3000, max: 3800, count_mode: han }
-beats_per_chapter: [4, 7]
-arc_length: [10, 25]
-card_buffer: { min: 6, target: 12 }
-platform_ratio: 1.13

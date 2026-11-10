@@ -1,5 +1,6 @@
 /**
- * adapter 单测：fixture 回放（parser + classify）、argv/env 金样、认证模式、登录命令。全部离线，不调真实 CLI。
+ * adapter 单测：fixture 回放（parser + classify）、argv/env 金样（目录契约）、认证模式、登录命令。全部离线，不调真实 CLI。
+ * 目录契约：cwd = 可写的书快照，启动语 = V3_LAUNCH_PROMPT（stdin 读 $RUN/in/launch.md 或内联），不传 schema / system channel 参数。
  */
 import { readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -7,19 +8,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AuthMode, HarnessId, HarnessInstall, NEventBody } from '@novelist/shared';
-import { toJsonSchema, zReceipt } from '@novelist/shared';
+import { V3_LAUNCH_PROMPT } from '@novelist/shared';
 import { parse as parseToml } from 'smol-toml';
 import { parse as parseYaml } from 'yaml';
 import { describe, expect, it } from 'vitest';
-import type { MaterializeResult } from '../../instructions/types.js';
 import { stamp } from '../events.js';
+import { mountPlanFor } from '../isolation.js';
 import { defaultCapabilities } from '../probe.js';
 import { listAdapters, getAdapter } from '../registry.js';
 import { RunPrepareError } from '../runner.js';
 import type { ExitInfo, HomeLayout, Invocation, ResolvedAccount, RunSpec } from '../types.js';
 import { agySettings } from './agy.js';
-import { codexConfigToml, codexOutputSchema } from './codex.js';
-import { filterExtraArgs, parseModelLines, readSchemaFile, toolKindOf } from './common.js';
+import { codexConfigToml } from './codex.js';
+import { filterExtraArgs, parseModelLines, toolKindOf } from './common.js';
 import { dshAdapterPatch } from './dsh.js';
 
 const FIX = path.join(path.dirname(fileURLToPath(import.meta.url)), '__fixtures__');
@@ -33,7 +34,7 @@ function specFor(harness: HarnessId, o: Partial<RunSpec> = {}): RunSpec {
     taskId: 't1',
     attempt: 1,
     role: 'writer',
-    taskKind: 'chapter.write',
+    taskKind: 'book.write',
     harness,
     profileId: 'p',
     accountId: 'a1',
@@ -43,15 +44,12 @@ function specFor(harness: HarnessId, o: Partial<RunSpec> = {}): RunSpec {
     outDir: `${RUN}/book/work/t1/attempt-1/out`,
     inDir: `${RUN}/in`,
     logDir: `${RUN}/log`,
-    workOrderFile: `${RUN}/in/workorder.md`,
-    systemFile: `${RUN}/in/system.md`,
-    receiptSchemaFile: `${RUN}/in/receipt.lenient.json`,
+    workOrderFile: `${RUN}/in/launch.md`,
     model: 'some-model',
     limits: { wallMs: 600_000, idleMs: 120_000, maxTurns: 30 },
     session: { mode: 'fresh', id: '99999999-2222-4333-8444-555555555555' },
     persistSession: false,
     egress: { allow: [] },
-    subagents: false,
     extraArgs: [],
     ...o,
   };
@@ -81,15 +79,13 @@ function acctFor(harness: HarnessId, o: Partial<ResolvedAccount> = {}): Resolved
 }
 
 const INST = (id: HarnessId): HarnessInstall => ({ id, version: '9.9.9', binPath: `/opt/bin/${id}`, sha256: '', sha256Source: 'tofu', tier: 'probed', status: 'active' });
-const MAT = (o: Partial<MaterializeResult> = {}): MaterializeResult => ({ files: [], argv: [], env: {}, budget: { ok: true, bytes: 10, limit: null }, notes: [], ...o });
-
-async function build(harness: HarnessId, a: Partial<ResolvedAccount> = {}, s: Partial<RunSpec> = {}, m: Partial<MaterializeResult> = {}): Promise<{ inv: Invocation; home: HomeLayout }> {
+async function build(harness: HarnessId, a: Partial<ResolvedAccount> = {}, s: Partial<RunSpec> = {}): Promise<{ inv: Invocation; home: HomeLayout }> {
   const adapter = getAdapter(harness);
   const spec = specFor(harness, s);
   const acct = acctFor(harness, a);
   const home = await adapter.prepareHome(acct, INST(harness), spec);
   const caps = { ...defaultCapabilities(harness, '9.9.9', 'container'), structuredOutput: 'none' as const };
-  return { inv: adapter.buildInvocation(spec, caps, home, MAT(m), acct, INST(harness)), home };
+  return { inv: adapter.buildInvocation(spec, caps, home, acct, INST(harness)), home };
 }
 
 /** 给 authCheck / listModels 用的桩二进制 + 临时账号 home（离线） */
@@ -325,7 +321,7 @@ describe('claude-code 命令与认证', () => {
     expect(a).not.toContain('--dangerously-skip-permissions');
     expect(inv.env.CLAUDE_CONFIG_DIR).toBe('/data/accounts/a1/home/.claude');
     expect(inv.env.HOME).toBe('/data/accounts/a1/home');
-    expect(inv.stdin).toEqual({ file: `${RUN}/in/workorder.md` });
+    expect(inv.stdin).toEqual({ file: `${RUN}/in/launch.md` });
     expect(inv.cwd).toBe(`${RUN}/book`);
   });
 
@@ -383,20 +379,6 @@ describe('claude-code 命令与认证', () => {
     expect(inv.env.FOO).toBe('bar');
   });
 
-  it('adapter 权限设置并入 lane C 的 settings，只传一个 --settings', async () => {
-    const cPath = `${RUN}/in/cc.settings.json`;
-    const file = { path: cPath, content: JSON.stringify({ hooks: { Stop: [] }, permissions: { deny: ['X'] } }) };
-    const { inv } = await build('claude-code', {}, {}, { files: [file], argv: ['--settings', cPath, '--append-system-prompt-file', `${RUN}/in/system.md`] });
-    expect(inv.argv.filter((a) => a === '--settings')).toHaveLength(1);
-    expect(flagValue(inv.argv, '--settings')).toBe(cPath);
-    expect(flagValue(inv.argv, '--append-system-prompt-file')).toBe(`${RUN}/in/system.md`);
-    const merged = JSON.parse(file.content);
-    expect(merged.hooks).toBeDefined();
-    expect(merged.permissions.blockWritesOutsideWorkingDirectories).toBe(true);
-    expect(merged.permissions.blockReadsOutsideWorkingDirectories).toBe(true);
-    expect(merged.permissions.deny).toContain('X');
-    expect(merged.permissions.deny).toContain(`Write(/${RUN}/in/**)`);
-  });
 });
 
 describe('codex 命令与认证', () => {
@@ -410,7 +392,7 @@ describe('codex 命令与认证', () => {
     expect(flagValue(a, '-C')).toBe(`${RUN}/book`);
     expect(flagValue(a, '-o')).toBe(`${RUN}/log/last-message.json`);
     expect(a.at(-1)).toBe('-');
-    expect(inv.stdin).toEqual({ file: `${RUN}/in/workorder.md` });
+    expect(inv.stdin).toEqual({ file: `${RUN}/in/launch.md` });
     expect(inv.env.CODEX_HOME).toBe('/data/accounts/a1/home/.codex');
   });
 
@@ -475,63 +457,6 @@ describe('codex 命令与认证', () => {
     expect(home.configFiles[0]!.content).not.toContain('k-123456');
   });
 
-  it('--output-schema 指向收窄后的 receipt.codex.json：去掉 record 与严格模式不接受的关键字', async () => {
-    const strict = JSON.stringify(toJsonSchema(zReceipt, 'strict'));
-    expect(strict).toContain('propertyNames');
-    const narrowed = JSON.parse(codexOutputSchema(strict)!) as Record<string, any>;
-    const walk = (n: unknown): void => {
-      if (Array.isArray(n)) {
-        n.forEach(walk);
-        return;
-      }
-      if (typeof n !== 'object' || n === null) return;
-      const o = n as Record<string, any>;
-      expect(o.propertyNames).toBeUndefined();
-      expect(o.$schema).toBeUndefined();
-      if (o.properties) {
-        expect(o.additionalProperties).toBe(false);
-        expect(new Set(o.required)).toEqual(new Set(Object.keys(o.properties)));
-      }
-      Object.entries(o).forEach(([k, v]) => { if (k !== 'properties') walk(v); else Object.values(v as object).forEach(walk); });
-    };
-    walk(narrowed);
-    const selfCount = narrowed.properties.self_count;
-    const variants = (selfCount.anyOf ?? [selfCount]) as Record<string, any>[];
-    expect(variants.find((v) => v.properties)!.properties.beats).toBeUndefined();
-    expect(narrowed.properties.schema).toBeDefined();
-    expect(codexOutputSchema('{bad')).toBeNull();
-
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'nv-cx-'));
-    try {
-      const receiptSchemaFile = path.join(dir, 'receipt.strict.json');
-      await fs.writeFile(receiptSchemaFile, strict);
-      const adapter = getAdapter('codex');
-      const spec = specFor('codex', { receiptSchemaFile, inDir: dir });
-      const acct = acctFor('codex');
-      const home = await adapter.prepareHome(acct, INST('codex'), spec);
-      const caps = defaultCapabilities('codex', '9.9.9', 'container');
-      const inv = adapter.buildInvocation(spec, caps, home, MAT(), acct, INST('codex'));
-      expect(flagValue(inv.argv, '--output-schema')).toBe(path.join(dir, 'receipt.codex.json'));
-      expect(home.configFiles.map((f) => f.path)).toContain(path.join(dir, 'receipt.codex.json'));
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('readSchemaFile 去掉 $schema（cc 的校验器不认 draft 2020-12）', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'nv-cc-'));
-    try {
-      const receiptSchemaFile = path.join(dir, 'r.json');
-      await fs.writeFile(receiptSchemaFile, JSON.stringify(toJsonSchema(zReceipt, 'lenient')));
-      const inline = readSchemaFile(specFor('claude-code', { receiptSchemaFile }))!;
-      expect(JSON.parse(inline).$schema).toBeUndefined();
-      expect(JSON.parse(inline).properties.schema).toBeDefined();
-      expect(readSchemaFile(specFor('claude-code', { receiptSchemaFile: path.join(dir, 'none.json') }))).toBeNull();
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-
   it('非 custom 模式不写 provider；开子代理时不关 agents', () => {
     const cfg = parseToml(codexConfigToml({}, 'subscription_login')) as Record<string, any>;
     expect(cfg.model_provider).toBeUndefined();
@@ -541,10 +466,10 @@ describe('codex 命令与认证', () => {
 });
 
 describe('agy 命令与认证', () => {
-  it('workorder 只放路径（argv 上限），stream-json，settings 文件，HOME 隔离', async () => {
+  it('启动语内联（-p），stream-json，settings 文件，HOME 隔离', async () => {
     const { inv, home } = await build('agy', { authMode: 'subscription_login' });
     const a = inv.argv;
-    expect(flagValue(a, '-p')).toContain(`${RUN}/in/workorder.md`);
+    expect(flagValue(a, '-p')).toBe(V3_LAUNCH_PROMPT);
     expect(Buffer.byteLength(flagValue(a, '-p')!)).toBeLessThan(1024);
     expect(flagValue(a, '--output-format')).toBe('stream-json');
     expect(flagValue(a, '--settings')).toBe(`${RUN}/in/agy.settings.json`);
@@ -614,7 +539,7 @@ describe('grok / dsh / pi 命令', () => {
   it('grok：prompt-file、关闭 shell/网页、GROK_HOME 隔离', async () => {
     const { inv } = await build('grok', { authMode: 'subscription_login' });
     const a = inv.argv;
-    expect(flagValue(a, '--prompt-file')).toBe(`${RUN}/in/workorder.md`);
+    expect(flagValue(a, '--prompt-file')).toBe(`${RUN}/in/launch.md`);
     expect(flagValue(a, '--output-format')).toBe('streaming-json');
     expect(flagValue(a, '--disallowed-tools')).toContain('run_terminal_cmd');
     expect(a).toContain('--always-approve');
@@ -631,11 +556,12 @@ describe('grok / dsh / pi 命令', () => {
     expect(getAdapter('grok').classify(OK_EXIT, events, 'permission required: write').status).toBe('failed');
   });
 
-  it('dsh：启动器 flag 在 app flag 之前，patch 顺序 adapter → lane C', async () => {
+  it('dsh：启动器 flag 在 app flag 之前，只有 adapter 自己的 patch', async () => {
     await expect(build('dsh', { authMode: 'api_key' })).rejects.toMatchObject({ code: 'auth_config' });
-    const { inv } = await build('dsh', { authMode: 'api_key', secretEnv: { DEEPSEEK_API_KEY: 'd-123456' } }, {}, { argv: ['--patch', `${RUN}/in/dsh.patch.yml`] });
+    const { inv } = await build('dsh', { authMode: 'api_key', secretEnv: { DEEPSEEK_API_KEY: 'd-123456' } });
     const a = inv.argv;
-    expect(a.slice(1, 7)).toEqual(['--profile', 'headless', '--patch', `${RUN}/in/dsh.adapter.patch.yml`, '--patch', `${RUN}/in/dsh.patch.yml`]);
+    expect(a.slice(1, 6)).toEqual(['--profile', 'headless', '--patch', `${RUN}/in/dsh.adapter.patch.yml`, '--json']);
+    expect(a.filter((x) => x === '--patch')).toHaveLength(1);
     expect(a).toContain('--json');
     expect(a.at(-1)).toBe('-');
     expect(inv.env.DSH_HOME).toBe('/data/accounts/a1/home/.dsh');
@@ -643,7 +569,7 @@ describe('grok / dsh / pi 命令', () => {
   });
 
   it('dsh patch：模型、effort、关闭 session-log 与子代理', () => {
-    const rows = parseYaml(dshAdapterPatch({ model: 'deepseek-flash', effort: 'high', subagents: false })) as { id: string; disabled?: boolean; config?: Record<string, unknown> }[];
+    const rows = parseYaml(dshAdapterPatch({ model: 'deepseek-flash', effort: 'high' })) as { id: string; disabled?: boolean; config?: Record<string, unknown> }[];
     expect(rows.find((r) => r.id === 'agent-default-model')?.config).toMatchObject({ model: 'deepseek-flash', reasoningEffort: 'high' });
     expect(rows.find((r) => r.id === 'session-log-deepseek')?.disabled).toBe(true);
     expect(rows.find((r) => r.id === 'tool-subagent')?.disabled).toBe(true);
@@ -656,7 +582,7 @@ describe('grok / dsh / pi 命令', () => {
     expect(flagValue(a, '--tools')).not.toContain('bash');
     expect(a).toContain('--no-mcp');
     expect(flagValue(a, '--session-id')).toMatch(/^nv-/);
-    expect(a.at(-1)).toContain(`${RUN}/in/workorder.md`);
+    expect(a.at(-1)).toBe(V3_LAUNCH_PROMPT);
     expect(inv.env.PI_CODING_AGENT_DIR).toBe('/data/accounts/a1/home/.pi/agent');
   });
 });
@@ -742,5 +668,210 @@ describe('common 工具', () => {
 
   it('parseModelLines：slug\\tlabel、跳过提示行', () => {
     expect(parseModelLines('Fetching models...\ngemini-4-argon\tGemini 4 Argon\ngemini-3.8-flash-low\tFlash\n\ngemini-4-argon\tdup\n')).toEqual(['gemini-4-argon', 'gemini-3.8-flash-low']);
+  });
+});
+
+describe('目录契约：各 adapter', () => {
+  const acctOf = (h: HarnessId): Partial<ResolvedAccount> => (h === 'dsh' ? { authMode: 'api_key', secretEnv: { DEEPSEEK_API_KEY: 'd-123456' } } : {});
+  const run = (h: HarnessId, s: Partial<RunSpec> = {}) => build(h, acctOf(h), { effort: 'high', limits: { wallMs: 600_000, idleMs: 120_000, maxTurns: 90 }, ...s });
+
+  for (const h of REAL) {
+    it(`${h}：没有 --json-schema / --output-schema，也没有 system channel 参数；cwd = 书快照`, async () => {
+      const { inv, home } = await run(h);
+      expect(inv.argv).not.toContain('--json-schema');
+      expect(inv.argv).not.toContain('--output-schema');
+      expect(inv.argv.some((a) => a.includes('receipt.'))).toBe(false);
+      for (const f of ['--agent', '--append-system-prompt-file', '--append-system-prompt', '--system-prompt', '--system-prompt-file', '--rules']) expect(inv.argv).not.toContain(f);
+      expect(inv.argv.some((a) => a.includes('developer_instructions'))).toBe(false);
+      expect(inv.argv.some((a) => a.endsWith('/in/system.md'))).toBe(false);
+      expect(home.configFiles.some((f) => f.path.endsWith('receipt.codex.json'))).toBe(false);
+      expect(inv.cwd).toBe(`${RUN}/book`);
+    });
+  }
+
+  it('启动语：agy / pi 内联，claude / codex / dsh 走 stdin launch.md，grok 走 --prompt-file', async () => {
+    const launch = `${RUN}/in/launch.md`;
+    const agy = (await run('agy')).inv;
+    expect(flagValue(agy.argv, '-p')).toBe(V3_LAUNCH_PROMPT);
+    expect(agy.stdin).toBe('devnull');
+    expect((await run('pi')).inv.argv.at(-1)).toBe(V3_LAUNCH_PROMPT);
+    for (const h of ['claude-code', 'codex', 'dsh'] as const) expect((await run(h)).inv.stdin).toEqual({ file: launch });
+    expect(flagValue((await run('grok')).inv.argv, '--prompt-file')).toBe(launch);
+  });
+
+  it('--max-turns 取 limits；effort 取 spec.effort；agy 模型名的档位跟着 effort 换', async () => {
+    const cc = (await run('claude-code')).inv.argv;
+    expect(flagValue(cc, '--max-turns')).toBe('90');
+    expect(flagValue(cc, '--effort')).toBe('high');
+    expect(flagValue((await run('agy', { effort: 'low' })).inv.argv, '--effort')).toBe('low');
+    const agyHigh = (await run('agy', { model: 'gemini-4-argon-medium' })).inv.argv;
+    expect(flagValue(agyHigh, '--model')).toBe('gemini-4-argon-high');
+    expect(flagValue((await run('agy', { model: 'gpt-oss-120b' })).inv.argv, '--model')).toBe('gpt-oss-120b');
+    expect((await run('codex')).inv.argv).toContain('model_reasoning_effort="high"');
+    expect(flagValue((await run('grok')).inv.argv, '--reasoning-effort')).toBe('high');
+    expect(flagValue((await run('pi', { effort: 'medium' })).inv.argv, '--thinking')).toBe('medium');
+  });
+
+  it('fake：目录模式 argv（--v3 --launch），不传 --workorder / --system', async () => {
+    const adapter = getAdapter('fake');
+    const spec = specFor('fake');
+    const acct = acctFor('fake');
+    const inst: HarnessInstall = { ...INST('fake'), binPath: process.execPath };
+    const home = await adapter.prepareHome(acct, inst, spec);
+    const inv = adapter.buildInvocation(spec, defaultCapabilities('fake', '1.0.0', 'container'), home, acct, inst);
+    expect(inv.argv).toContain('--v3');
+    expect(flagValue(inv.argv, '--launch')).toBe(`${RUN}/in/launch.md`);
+    expect(inv.argv).not.toContain('--workorder');
+    expect(inv.argv).not.toContain('--system');
+    expect(flagValue(inv.argv, '--session')).toBe(spec.session.id);
+  });
+
+  it('挂载计划：书快照可写，$RUN/in 只读', () => {
+    const plan = mountPlanFor(specFor('agy'), [], []);
+    expect(plan.rw).toContain(`${RUN}/book`);
+    expect(plan.ro).not.toContain(`${RUN}/book`);
+    expect(plan.ro).toContain(`${RUN}/in`);
+    expect(plan.rw).not.toContain(`${RUN}/in`);
+  });
+
+  // argv 金样：与 P3 之前 v3 契约（contract: 'v3'）的 argv 逐字一致
+  it('argv 金样', async () => {
+    const out: Record<string, string[]> = {};
+    for (const h of REAL) out[h] = (await run(h)).inv.argv;
+    expect(out).toMatchInlineSnapshot(`
+      {
+        "agy": [
+          "/opt/bin/agy",
+          "-p",
+          "阅读 AGENTS.md 和 ORDER.md 并执行。Read AGENTS.md and ORDER.md and execute.",
+          "--output-format",
+          "stream-json",
+          "--model",
+          "some-model",
+          "--effort",
+          "high",
+          "--settings",
+          "/data/runs/2026-11/RUN/in/agy.settings.json",
+          "--add-dir",
+          "/data/runs/2026-11/RUN/in",
+          "--print-timeout",
+          "570s",
+          "--log-file",
+          "/data/runs/2026-11/RUN/log/agy.log",
+          "--dangerously-skip-permissions",
+          "--disable-slash-commands",
+        ],
+        "claude-code": [
+          "/opt/bin/claude-code",
+          "-p",
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--include-partial-messages",
+          "--session-id",
+          "99999999-2222-4333-8444-555555555555",
+          "--model",
+          "some-model",
+          "--effort",
+          "high",
+          "--permission-mode",
+          "acceptEdits",
+          "--permission-prompts",
+          "none",
+          "--tools",
+          "Read,Write,Edit,Glob,Grep",
+          "--disallowedTools",
+          "Bash,WebFetch,WebSearch,NotebookEdit,Agent,Task",
+          "--setting-sources",
+          "project",
+          "--strict-mcp-config",
+          "--settings",
+          "/data/runs/2026-11/RUN/in/cc.adapter.settings.json",
+          "--max-turns",
+          "90",
+          "--no-session-persistence",
+          "--add-dir",
+          "/data/runs/2026-11/RUN/in",
+        ],
+        "codex": [
+          "/opt/bin/codex",
+          "exec",
+          "--json",
+          "--skip-git-repo-check",
+          "-m",
+          "some-model",
+          "--color",
+          "never",
+          "-C",
+          "/data/runs/2026-11/RUN/book",
+          "-c",
+          "projects={"/data/runs/2026-11/RUN/book"={trust_level="trusted"}}",
+          "-c",
+          "agents.enabled=false",
+          "-c",
+          "features.multi_agent=false",
+          "-c",
+          "model_reasoning_effort="high"",
+          "--dangerously-bypass-approvals-and-sandbox",
+          "-o",
+          "/data/runs/2026-11/RUN/log/last-message.json",
+          "--ephemeral",
+          "-",
+        ],
+        "dsh": [
+          "/opt/bin/dsh",
+          "--profile",
+          "headless",
+          "--patch",
+          "/data/runs/2026-11/RUN/in/dsh.adapter.patch.yml",
+          "--json",
+          "--permission-mode",
+          "danger-full-access",
+          "--approval-policy",
+          "never",
+          "-",
+        ],
+        "grok": [
+          "/opt/bin/grok",
+          "--no-auto-update",
+          "--prompt-file",
+          "/data/runs/2026-11/RUN/in/launch.md",
+          "--cwd",
+          "/data/runs/2026-11/RUN/book",
+          "--output-format",
+          "streaming-json",
+          "-m",
+          "some-model",
+          "--reasoning-effort",
+          "high",
+          "--always-approve",
+          "--disallowed-tools",
+          "run_terminal_cmd,web_search,web_fetch,task",
+          "--disable-web-search",
+          "--no-wait-for-background",
+          "--no-subagents",
+          "--max-turns",
+          "90",
+          "-s",
+          "99999999-2222-4333-8444-555555555555",
+        ],
+        "pi": [
+          "/opt/bin/pi",
+          "--mode",
+          "json",
+          "--approve",
+          "--model",
+          "some-model",
+          "--thinking",
+          "high",
+          "--session-id",
+          "nv-99999999-2222-4333-8444-555555555555",
+          "--tools",
+          "read,write,edit,grep,find,ls",
+          "--no-mcp",
+          "阅读 AGENTS.md 和 ORDER.md 并执行。Read AGENTS.md and ORDER.md and execute.",
+        ],
+      }
+    `);
   });
 });

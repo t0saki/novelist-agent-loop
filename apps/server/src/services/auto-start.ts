@@ -2,24 +2,24 @@
  * 自动开书（DESIGN §8.1；p2-plan §3.3 D）。Owner: lane G。
  * 调度器 leader 每轮调用（开关默认关闭，见 createAutoStarter）：未完结的书少于上限、写手真的闲着、未超每日上限时，
  * 按“自动开过的书数 / 权重”最小挑题材包，再按目标分布补缺口最大的篇幅，开一本 v3 书；书名由作者在 bible.md 里起。
- * 题材内容归用户所有，这里只拼结构化的种子。v2 的 buildAutoSeed / autoScale 只剩测试在用（phase 3 删除）。
+ * 题材内容归用户所有，这里只拼结构化的种子。旧书（导入的、旧流程写的）既不算“未完结的自有书”，也不占着写手。
  */
 import { and, count, desc, eq, gte, inArray, isNotNull, like, or, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import type { AutoLength, ErrorClass, GenrePack, LengthMix, SystemSettings } from '@novelist/shared';
 import { AUTO_LENGTHS, V3_TITLE_PLACEHOLDER } from '@novelist/shared';
 import type { AppDeps } from '../app.js';
-import { bookBySlug, bookDir } from '../api/helpers.js';
-import { bookFiles, openRepo } from '../book/index.js';
+import { bookBySlug } from '../api/helpers.js';
+import { V3_BOOK_SQL } from '../book/index.js';
 import type { Db } from '../db/client.js';
-import { accounts, accountsState, bookEvents, books, circuitBreakers, runs, tasks } from '../db/schema.js';
+import { accounts, accountsState, bookEvents, books, runs, tasks } from '../db/schema.js';
 import { readV3Meta } from '../flow/state.js';
 import { listGenres } from '../genres/index.js';
 import { INFRA_CLASSES } from '../orchestrator/actions.js';
 import { ACTIVE_STATES } from '../orchestrator/queue.js';
-import { resolveRoute } from '../orchestrator/routing.js';
+import { resolveSlot } from '../orchestrator/routing.js';
 import type { LeaderHook } from '../orchestrator/scheduler.js';
-import { AUTO_CREATED_EVENT, createBook, patchBookYaml } from './books.js';
+import { AUTO_CREATED_EVENT, createBook } from './books.js';
 
 export const AUTO_TITLE_PREFIX = '待命名·';
 const AUTO_SLUG_PREFIX = 'auto-';
@@ -43,20 +43,6 @@ export function lengthClass(hint: string): AutoLength {
   return 'short';
 }
 
-/** 档位规模 → book.yaml scale；卷数按字数推算，题材包的最少章数是全书下限 */
-export function autoScale(size: { targetCjk: number; chaptersMin: number; chaptersMax: number }, minChapters: number | null, chapterTarget: number) {
-  // 实际章数 = 目标字数 / 单章字数，所以章数下限要换算成字数才生效
-  const targetCjk = Math.max(size.targetCjk, (minChapters ?? 0) * chapterTarget);
-  const volumes: [number, number] = [Math.max(1, Math.floor(targetCjk / 200_000)), Math.max(1, Math.ceil(targetCjk / 100_000))];
-  const chaptersMin = Math.max(size.chaptersMin, Math.ceil((minChapters ?? 0) / volumes[0]));
-  return {
-    target_cjk: targetCjk,
-    hard_max_cjk: Math.round(targetCjk * 1.5),
-    volumes,
-    chapters_per_volume: [chaptersMin, Math.max(size.chaptersMax, chaptersMin)] as [number, number],
-  };
-}
-
 /** 选项数两两互质（3/4/5/7），按序号取模时要 420 本才会重复同一组合，不用记状态也不用随机 */
 const DIVERSITY_AXES = [
   { name: '叙事视角', options: ['第一人称', '贴身第三人称', '多视角轮换'] },
@@ -67,74 +53,6 @@ const DIVERSITY_AXES = [
 
 export function diversityBrief(ordinal: number): string {
   return DIVERSITY_AXES.map((a) => `${a.name}${a.options[ordinal % a.options.length]}`).join('，');
-}
-
-/** premise 里的一句话卖点：比书名更能说明两本书是不是在写同一个故事 */
-export function premiseDigest(premise: string): string | null {
-  const lines = premise.split('\n').map((l) => l.trim());
-  const i = lines.findIndex((l) => /一句话|logline/i.test(l));
-  if (i < 0) return null;
-  const clean = (l: string) => l.replace(/^[#>*\s-]+/, '').replace(/\*\*/g, '').trim();
-  const inline = clean(lines[i] ?? '').split(/[:：]/).slice(1).join('：').trim();
-  const text = inline || clean(lines.slice(i + 1).find((l) => l && !l.startsWith('#')) ?? '');
-  return text ? text.slice(0, 100) : null;
-}
-
-export interface AutoSeedContext {
-  /** 这个题材包第几本自动开的书（从 0 起） */
-  ordinal: number;
-  sameGenre: { title: string; digest: string | null }[];
-}
-
-export function buildAutoSeed(pack: Pick<GenrePack, 'name' | 'auto'>, recentTitles: string[], ctx: AutoSeedContext = { ordinal: 0, sameGenre: [] }): string {
-  const auto = pack.auto;
-  const lines = [
-    '（自动开书）当前书名只是占位，请为这个故事自拟书名，并把 bible/premise.md 的第一行写成“# 《你拟的名字》”。',
-    '',
-    `题材：${pack.name}`,
-  ];
-  if (auto?.keywords.length) lines.push(`灵感关键词（不必全用）：${auto.keywords.join('、')}`);
-  if (auto?.length_hint) lines.push(`篇幅提示：${auto.length_hint}`);
-  lines.push(`本书写法（与题材要求冲突时以题材为准）：${diversityBrief(ctx.ordinal)}。`);
-  if (ctx.sameGenre.length) {
-    lines.push('同题材已有作品（主角设定、核心冲突和主线走向都要明显不同）：');
-    for (const b of ctx.sameGenre) lines.push(`- 《${b.title}》${b.digest ? `：${b.digest}` : ''}`);
-  }
-  if (recentTitles.length) lines.push(`近期已写作品（不要撞题）：${recentTitles.join('、')}`);
-  if (auto?.adult_only) lines.push('人物年龄：所有角色都是年满 18 岁的成年人，并在人物设定里写明年龄。');
-  lines.push('', '请据此原创一个完整的故事设想，不要沿用上面作品的人物和情节。');
-  return lines.join('\n');
-}
-
-/** 从 premise 里取规划师拟的书名；还没拟（仍是种子）时返回 null */
-export function extractAutoTitle(premise: string): string | null {
-  for (const line of premise.split('\n').slice(0, 40)) {
-    const m = /^#{1,3}\s*《([^《》]{1,40})》/.exec(line.trim()) ?? /^[#*\s-]*书名[:：]\s*\**《?([^《》*\n]{1,40})》?/.exec(line.trim());
-    const title = m?.[1]?.trim();
-    if (title && title !== '书名' && title !== '你拟的名字' && !title.startsWith(AUTO_TITLE_PREFIX)) return title;
-  }
-  return null;
-}
-
-/** 给还顶着占位名的自动开书改名 */
-export async function nameAutoBooks(deps: AppDeps): Promise<void> {
-  const rows = await deps.db
-    .select({ slug: books.slug })
-    .from(books)
-    .where(and(like(books.title, `${AUTO_TITLE_PREFIX}%`), inArray(books.status, ['planning', 'active', 'paused'])));
-  for (const { slug } of rows) {
-    try {
-      const repo = openRepo(bookDir(deps, slug));
-      const title = extractAutoTitle(await bookFiles(repo).premise());
-      if (!title) continue;
-      const row = await bookBySlug(deps, slug);
-      await patchBookYaml(deps, row, repo, (doc) => doc.setIn(['title'], title), 'auto-start: name book');
-      await deps.db.update(books).set({ title, updatedAt: new Date().toISOString() }).where(eq(books.id, row.id));
-      deps.bus.publish({ type: 'book_changed', book: slug });
-    } catch (err) {
-      deps.log.warn({ slug, err: (err as Error).message }, 'auto-start: naming failed');
-    }
-  }
 }
 
 // ───────────────────────── v3 自动开书（DESIGN §8.1；p2-plan §3.3 D） ─────────────────────────
@@ -180,20 +98,20 @@ export function buildAutoSeedV3(pack: Pick<GenrePack, 'name' | 'auto'>, ctx: { o
   return lines.join('\n');
 }
 
-/** 未完结的自有书：planning / active / paused，不含导入的书（meta.v1） */
+/** 未完结的自有书：planning / active / paused 的 v3 书，不含导入的书（meta.v1）和旧书 */
 export async function unfinishedOwnBooks(db: Db): Promise<number> {
   const [r] = await db
     .select({ n: count() })
     .from(books)
-    .where(and(inArray(books.status, ['planning', 'active', 'paused']), sql`${books.meta}->'v1' is null`));
+    .where(and(inArray(books.status, ['planning', 'active', 'paused']), sql`${books.meta}->'v1' is null`, V3_BOOK_SQL));
   return Number(r?.n ?? 0);
 }
 
 /**
- * 写手真的闲着（DESIGN §8.1）：没有账号在等额度或登录失效；写作这一路现在能路由（profile 启用、有账号、熔断没开）；
- * 写手的 harness 没有待定的熔断；没有在跑的写作任务；所有在写的自有书都存稿已满。不闲时 reason 说明是哪一条。
+ * 写手真的闲着（DESIGN §8.1）：没有账号在等额度或登录失效；写作位置现在能路由（profile 启用、有账号、没在冷却）；
+ * 没有在跑的写作任务；所有在写的自有书都存稿已满。不闲时 reason 说明是哪一条。
  */
-export async function writerIdle(db: Db, now: Date, opts: { allowFakeHarness?: boolean } = {}): Promise<{ idle: boolean; reason: string | null }> {
+export async function writerIdle(db: Db, now: Date, opts: { allowFakeHarness?: boolean; forced?: boolean } = {}): Promise<{ idle: boolean; reason: string | null }> {
   // (a) 账号在睡（额度、暂停）或登录失效
   const acct = await db.select({ id: accounts.id, enabled: accounts.enabled, sleepUntil: accountsState.sleepUntil, auth: accountsState.lastAuthCheck }).from(accounts).leftJoin(accountsState, eq(accountsState.accountId, accounts.id));
   for (const a of acct) {
@@ -201,12 +119,9 @@ export async function writerIdle(db: Db, now: Date, opts: { allowFakeHarness?: b
     if (a.sleepUntil && Date.parse(a.sleepUntil) > now.getTime()) return { idle: false, reason: `account_sleeping:${a.id}` };
     if ((a.auth as { ok?: unknown } | null)?.ok === false) return { idle: false, reason: `account_auth:${a.id}` };
   }
-  // (b) 写作这一路现在路由不到（只读，不占并发）
-  const route = await resolveRoute(db, { book: null, role: 'writer', tier: 'standard', ignoreConcurrency: true, now, ...(opts.allowFakeHarness ? { allowFakeHarness: true } : {}) });
+  // (b) 写作位置现在路由不到（只读，不占并发；fake 模式强制 fake）
+  const route = await resolveSlot(db, { slot: 'writer', book: null, ignoreConcurrency: true, now, ...(opts.allowFakeHarness ? { allowFakeHarness: true } : {}), ...(opts.forced ? { forced: true } : {}) });
   if (!route.profile || !route.harness) return { idle: false, reason: `no_route:${route.cause ?? 'no_route'}` };
-  // (c) 写手 harness 的熔断待定（canary 还没出结果）
-  const pending = await db.select({ h: circuitBreakers.harness }).from(circuitBreakers).where(and(eq(circuitBreakers.harness, route.harness), eq(circuitBreakers.state, 'pending_open'))).limit(1);
-  if (pending[0]) return { idle: false, reason: `circuit_pending:${route.harness}` };
   // (d) 有写作任务在跑
   const [busy] = await db.select({ n: count() }).from(tasks).where(and(eq(tasks.lane, 'write'), inArray(tasks.state, ACTIVE_STATES)));
   if (Number(busy?.n ?? 0) > 0) return { idle: false, reason: 'write_active' };
@@ -227,11 +142,11 @@ export async function writerIdle(db: Db, now: Date, opts: { allowFakeHarness?: b
       ),
     );
   if (Number(queued?.n ?? 0) > 0) return { idle: false, reason: 'write_pending' };
-  // (e) 还有在写的自有书没写满存稿
+  // (e) 还有在写的自有书没写满存稿（旧书从不开写，不占着写手）
   const open = await db
     .select({ id: books.id, pausedReason: books.pausedReason, meta: books.meta })
     .from(books)
-    .where(and(inArray(books.status, ['planning', 'active']), sql`${books.meta}->'v1' is null`));
+    .where(and(inArray(books.status, ['planning', 'active']), sql`${books.meta}->'v1' is null`, V3_BOOK_SQL));
   for (const b of open) {
     const v3 = (b.meta as { v3?: unknown } | null)?.v3;
     const full = v3 !== undefined && v3 !== null ? readV3Meta(b.meta).sched?.bufferFull === true : b.pausedReason === 'max_buffer';
@@ -270,7 +185,7 @@ export async function autoStartsToday(db: Db, now: Date): Promise<number> {
 export async function maybeStartBook(deps: AppDeps, now: Date, s: SystemSettings, opts: { rng?: () => number } = {}): Promise<string | null> {
   const cfg = s.autoStart;
   if ((await unfinishedOwnBooks(deps.db)) >= cfg.maxUnfinishedBooks) return null;
-  const idle = await writerIdle(deps.db, now, { allowFakeHarness: deps.config.allowFakeHarness });
+  const idle = await writerIdle(deps.db, now, { allowFakeHarness: deps.config.allowFakeHarness, forced: deps.config.fakeHarness });
   if (!idle.idle) {
     deps.log.debug({ reason: idle.reason }, 'auto-start: writer not idle');
     return null;
@@ -284,7 +199,7 @@ export async function maybeStartBook(deps: AppDeps, now: Date, s: SystemSettings
     .where(and(eq(books.status, 'draft'), like(books.slug, `${AUTO_SLUG_PREFIX}%`), or(like(books.title, `${AUTO_TITLE_PREFIX}%`), like(books.title, `${V3_TITLE_PLACEHOLDER}%`))))
     .limit(1);
   if (orphan) {
-    await deps.orchestrator.startBook(orphan.id, { interview: false });
+    await deps.orchestrator.startBook(orphan.id);
     await deps.db.insert(bookEvents).values({ bookId: orphan.id, kind: AUTO_EVENT, body: { genre: orphan.genre } });
     return orphan.slug;
   }
@@ -317,8 +232,8 @@ export async function maybeStartBook(deps: AppDeps, now: Date, s: SystemSettings
     slug: `${AUTO_SLUG_PREFIX}${id}`,
     genre: pack.id,
     seed: buildAutoSeedV3(pack, { ordinal: counts.get(pack.id) ?? 0, keywords }),
-    flow: 'v3',
-    v3: { length: len, target_cjk: cfg.lengths[len].targetCjk },
+    length: len,
+    target_cjk: cfg.lengths[len].targetCjk,
     start: true,
   });
   const row = await bookBySlug(deps, created.slug);
@@ -333,7 +248,6 @@ export function createAutoStarter(deps: AppDeps): LeaderHook {
   return async (now, settings) => {
     if (now.getTime() < nextAt) return;
     nextAt = now.getTime() + CHECK_INTERVAL_MS;
-    await nameAutoBooks(deps);
     if (!settings.autoStart.enabled) return;
     try {
       await maybeStartBook(deps, now, settings);

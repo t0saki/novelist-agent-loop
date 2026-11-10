@@ -1,11 +1,9 @@
 /**
  * adapter 公共件：可执行文件探测、基础 env 白名单、工具种类映射、标准 probe 骨架、extra_args 过滤。Owner: lane A。
  */
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Capabilities, HarnessInstall, NEventBody } from '@novelist/shared';
 import type { TOOL_KINDS } from '@novelist/shared';
-import { V3_LAUNCH_PROMPT } from '@novelist/shared';
 import { RunPrepareError, runShort } from '../runner.js';
 import type { CapabilityDefaults, HarnessAdapter, Invocation, ProbeContext, ResolvedAccount, RunSpec } from '../types.js';
 import { parseVersion, satisfies, whichSync } from '../util.js';
@@ -48,7 +46,7 @@ export function pathFor(binPath: string): string {
 export const PROTECTED_ENV = new Set(['PATH', 'HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GROK_HOME', 'DSH_HOME', 'PI_CODING_AGENT_DIR', 'LANG', 'TZ']);
 
 /**
- * 组装 run env：env -i 起步 → 基础白名单 → 账号 env（不得覆盖 PROTECTED_ENV）→ adapter 自己的变量（home.env、mat.env、extra）。
+ * 组装 run env：env -i 起步 → 基础白名单 → 账号 env（不得覆盖 PROTECTED_ENV）→ adapter 自己的变量（home.env、extra）。
  * egress 代理：HTTPS_PROXY/HTTP_PROXY/NO_PROXY（§3.5）。
  */
 export function buildEnv(
@@ -119,27 +117,6 @@ export function filterExtraArgs(args: string[], deny: RegExp[]): string[] {
     out.push(a);
   }
   return out;
-}
-
-/** 读 receipt schema（命令行内联用）。去掉 $schema：zod 4 产出 draft 2020-12 声明，cc 内置的校验器不认这个元 schema（本机 2.1.319 实测报错） */
-export function readSchemaFile(spec: RunSpec): string | null {
-  if (spec.contract === 'v3') return null;
-  try {
-    const { $schema: _dropped, ...schema } = JSON.parse(readFileSync(spec.receiptSchemaFile, 'utf8')) as Record<string, unknown>;
-    return JSON.stringify(schema);
-  } catch {
-    return null;
-  }
-}
-
-/** v3 没有回执：不传 --json-schema / --output-schema */
-export function wantsSchema(spec: RunSpec, caps: Capabilities): boolean {
-  return spec.contract !== 'v3' && caps.structuredOutput === 'native';
-}
-
-/** 启动语：v3 统一为 V3_LAUNCH_PROMPT，旧契约用 adapter 自己的工作单提示 */
-export function launchPrompt(spec: RunSpec, legacy: string): string {
-  return spec.contract === 'v3' ? V3_LAUNCH_PROMPT : legacy;
 }
 
 /** 通用 Invocation 骨架 */
@@ -227,18 +204,4 @@ export function parseModelLines(out: string): string[] {
     if (/^[A-Za-z0-9][\w.:/@-]*$/.test(slug) && /[a-z]/i.test(slug)) models.push(slug);
   }
   return [...new Set(models)];
-}
-
-/** adapter.materialize 的统一实现：转调 lane C 的 instructions.materializeFor */
-export async function materializeVia(
-  harness: HarnessAdapter['id'],
-  spec: RunSpec,
-  compiled: import('../../instructions/types.js').CompiledInstructions,
-  caps: Capabilities,
-  accountHome?: string,
-): Promise<import('../../instructions/types.js').MaterializeResult> {
-  const { materializeFor } = await import('../../instructions/index.js');
-  // canary 的 runDir 不在 $DATA/runs 下，优先用 runner 传入的账号 home
-  const home = accountHome ?? (spec.accountId ? path.join(path.resolve(spec.runDir, '..', '..', '..'), 'accounts', spec.accountId, 'home') : spec.inDir);
-  return materializeFor(harness, { harness, spec, compiled, caps, personaMode: spec.personaMode ?? 'append', home });
 }

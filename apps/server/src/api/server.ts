@@ -30,7 +30,7 @@ import { register as registerGenres } from './routes/admin/genres.js';
 import { register as registerHarness } from './routes/admin/harness.js';
 import { register as registerAccounts } from './routes/admin/accounts.js';
 import { register as registerRouting } from './routes/admin/routing.js';
-import { register as registerSchedule } from './routes/admin/schedule.js';
+import { registerUsage } from './routes/admin/usage.js';
 import { register as registerReaders } from './routes/admin/readers.js';
 import { register as registerSettings } from './routes/admin/settings.js';
 import { register as registerImport } from './routes/admin/import.js';
@@ -96,7 +96,7 @@ export async function buildServer(deps: AppDeps): Promise<FastifyInstance> {
 
   await app.register(async (scope) => {
     scope.addHook('preHandler', requireRole('admin'));
-    for (const reg of [registerBooks, registerV3, registerChapters, registerTasks, registerRuns, registerInbox, registerInstructions, registerGenres, registerHarness, registerAccounts, registerRouting, registerSchedule, registerReaders, registerSettings, registerImport]) {
+    for (const reg of [registerBooks, registerV3, registerChapters, registerTasks, registerRuns, registerInbox, registerInstructions, registerGenres, registerHarness, registerAccounts, registerRouting, registerUsage, registerReaders, registerSettings, registerImport]) {
       await reg(scope, deps);
     }
   });

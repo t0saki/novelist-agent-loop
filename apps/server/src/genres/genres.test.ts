@@ -43,15 +43,16 @@ describe('seedBuiltinGenres', () => {
     for (const p of packs) {
       const r = await loadGenre(paths, p.id);
       expect(r.chain.map((c) => c.id).at(-1)).toBe(p.id);
-      expect(r.pacing.chapter_length.target).toBeGreaterThan(1000);
-      expect(r.gates[0]?.genre).toBe('generic');
+      if (p.id !== 'generic') expect(r.chain[0]?.id).toBe('generic');
     }
     const x = await loadGenre(paths, 'xianxia');
     expect(x.chain.map((c) => c.id)).toEqual(['generic', 'xianxia']);
-    expect(x.lexicon.ban).toContain('恐怖如斯');
-    expect(x.lexicon.ban).toContain('嘴角勾起一抹');
-    expect(x.eventFamilies.death).toEqual(expect.arrayContaining(['死', '陨落']));
-    expect(x.pacing.arc_length).toEqual([12, 30]);
+    // event_families 原样留在各自的 pack 里（旧流程的合并已删除）
+    expect(x.pack.event_families.death).toEqual(expect.arrayContaining(['陨落']));
+    expect(x.chain[0]?.pack.event_families.death).toEqual(expect.arrayContaining(['死']));
+    // 内置包只剩 pack.yaml / AGENTS.md / roles/writer.md（gates / lexicon / pacing 只有旧流程读过）
+    for (const f of ['gates.yaml', 'lexicon.yaml', 'pacing.yaml', 'roles/planner.md']) expect(await fs.stat(path.join(paths.genres, 'xianxia', f)).then(() => true, () => false), f).toBe(false);
+    expect(await fs.readFile(path.join(paths.genres, 'xianxia', 'roles/writer.md'), 'utf8')).not.toBe('');
   });
 });
 
@@ -78,33 +79,22 @@ describe('loadGenre', () => {
     await expect(loadGenre(paths, 'bad')).rejects.toThrow(/id/);
   });
 
-  it('pacing 深合并（子包可只写一部分），无 pacing 时兜底', async () => {
-    await makePack('base', [], { 'pacing.yaml': 'schema: nv.pacing/1\nchapter_length: { min: 100, target: 200, max: 300 }\narc_length: [5, 6]\n' });
-    await makePack('kid', ['base'], { 'pacing.yaml': 'chapter_length: { target: 250 }\n' });
-    const r = await loadGenre(paths, 'kid');
-    expect(r.pacing.chapter_length).toMatchObject({ min: 100, target: 250, max: 300 });
-    expect(r.pacing.arc_length).toEqual([5, 6]);
-    await makePack('bare', []);
-    expect((await loadGenre(paths, 'bare')).pacing.chapter_length.target).toBe(3000);
-  });
-
-  it('lexicon 追加合并去重；gates 按链序；event_families 并集', async () => {
-    await makePack('base', [], {
-      'lexicon.yaml': 'schema: nv.lexicon/1\nban: [甲, 乙]\npatterns:\n  - { id: p1, regex: a, weight: 1 }\n',
-      'gates.yaml': 'schema: nv.gates/1\nrules:\n  lexicon: { level: soft }\n',
-    });
+  it('event_families 原样留在各自 pack 里（不再合并）', async () => {
+    await makePack('base', []);
     await fs.appendFile(path.join(paths.genres, 'base/pack.yaml'), 'event_families:\n  death: [死]\n');
-    await makePack('kid', ['base'], {
-      'lexicon.yaml': 'schema: nv.lexicon/1\nban: [乙, 丙]\nallow: [甲]\npatterns:\n  - { id: p1, regex: b, weight: 2 }\n',
-      'gates.yaml': 'schema: nv.gates/1\nrules:\n  lexicon: { level: hard }\n',
-    });
+    await makePack('kid', ['base']);
     await fs.appendFile(path.join(paths.genres, 'kid/pack.yaml'), 'event_families:\n  death: [陨落, 死]\n');
     const r = await loadGenre(paths, 'kid');
-    expect(r.lexicon.ban).toEqual(['甲', '乙', '丙']);
-    expect(r.lexicon.allow).toEqual(['甲']);
-    expect(r.lexicon.patterns).toEqual([expect.objectContaining({ id: 'p1', regex: 'b', weight: 2 })]);
-    expect(r.gates.map((g) => g.genre)).toEqual(['base', 'kid']);
-    expect(r.eventFamilies.death).toEqual(['死', '陨落']);
+    expect(r.chain.map((c) => c.pack.event_families.death)).toEqual([['死'], ['陨落', '死']]);
+    expect(Object.keys(r).sort()).toEqual(['chain', 'id', 'pack']);
+  });
+
+  it('a malformed gates.yaml / lexicon.yaml / pacing.yaml in a pack no longer breaks loadGenre', async () => {
+    await makePack('base', [], { 'gates.yaml': 'rules: [: broken', 'lexicon.yaml': 'schema: nv.lexicon/9\nban: 1\n' });
+    await makePack('kid', ['base'], { 'pacing.yaml': '{{{ not yaml' });
+    const r = await loadGenre(paths, 'kid');
+    expect(r.chain.map((c) => c.id)).toEqual(['base', 'kid']);
+    expect(r.pack.id).toBe('kid');
   });
 });
 

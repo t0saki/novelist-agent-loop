@@ -1,21 +1,21 @@
-/** /api/admin/profiles*、/api/admin/routing/*（D2 修订；契约见 @novelist/shared ROUTES）。Owner: lane G。 */
-import { eq } from 'drizzle-orm';
+/**
+ * /api/admin/profiles*、/api/admin/routing/slots*（契约见 @novelist/shared ROUTES）。
+ * 路由只剩两个位置（写作 / 杂活），各有主、备一个 profile（DESIGN §7）。旧的 preset / active / check 路由已删除；routing.active 行留着不动（上一版镜像要读）。
+ */
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { and, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
-import type { ActiveRouting, FeasibilityReport, Ok, Profile, RoutingPreset } from '@novelist/shared';
-import { DEFAULT_PRESET_ID, zPatchProfile, zProfile, zPutActiveRouting, zRoutingPreset, zSystemSettings } from '@novelist/shared';
+import type { HarnessId, Ok, Profile, RoutingSlotsView, SlotCanaryResult, SlotId } from '@novelist/shared';
+import { SLOT_IDS, zAccount, zCapabilities, zPatchProfile, zProfile, zPutRoutingSlots } from '@novelist/shared';
 import type { AppDeps } from '../../../app.js';
-import { books, profiles, routingPresets, settings } from '../../../db/schema.js';
-import { effectiveRouting, loadSystemSettings } from '../../../orchestrator/index.js';
+import { capabilities, profiles } from '../../../db/schema.js';
+import { defaultCapabilities, detectInstalls, getAdapter, probeIsolation, resolveAccount, runDirectoryCanary } from '../../../harness/index.js';
+import { loadSlots, loadSystemSettings, resolveSlot, saveSlots, slotStatus, toSlotStatus } from '../../../orchestrator/index.js';
 import { audit, domain, parseBody, parsePatch } from '../../helpers.js';
 import { badRequest, conflict, forbidden, notFound } from '../../problem.js';
 
 type IdParams = { Params: { id: string } };
-
-async function loadActive(deps: AppDeps): Promise<{ presetId: string; overrides: Record<string, unknown> }> {
-  const rows = await deps.db.select().from(settings).where(eq(settings.key, 'routing.active')).limit(1);
-  const v = (rows[0]?.value ?? {}) as { presetId?: string; overrides?: Record<string, unknown> };
-  return { presetId: v.presetId ?? DEFAULT_PRESET_ID, overrides: v.overrides ?? {} };
-}
 
 export async function register(app: FastifyInstance, deps: AppDeps): Promise<void> {
   // ── profiles ──
@@ -46,93 +46,70 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const rows = await deps.db.select().from(profiles).where(eq(profiles.id, req.params.id)).limit(1);
     if (!rows[0]) throw notFound(`profile ${req.params.id} `);
     if (rows[0].builtin) throw forbidden('内置 profile 不能删除，可以禁用', 'builtin_readonly');
+    const slots = await loadSlots(deps.db);
+    const using = SLOT_IDS.filter((s) => slots[s].primary === req.params.id || slots[s].fallback === req.params.id);
+    if (using.length) throw conflict(`profile ${req.params.id} 正用在路由位置（${using.join('、')}），先在模型页换掉`, 'profile_in_use');
     await deps.db.delete(profiles).where(eq(profiles.id, req.params.id));
     await audit(deps, req, 'profile.delete', req.params.id);
     return { ok: true };
   });
 
-  // ── presets ──
-  app.get('/api/admin/routing/presets', async (): Promise<RoutingPreset[]> => {
-    const rows = await deps.db.select().from(routingPresets).orderBy(routingPresets.id);
-    return rows
-      .map((r) => ({ ...(r.body as unknown as RoutingPreset), builtin: r.builtin }))
-      .filter((p) => p.id !== 'fake' || deps.config.allowFakeHarness)
-      .map((p) => (p.id === 'dev-cheap' ? { ...p, name: `${p.name}（仅测试）` } : p))
-      .sort((a, b) => Number(a.id === 'dev-cheap') - Number(b.id === 'dev-cheap'));
-  });
-
-  app.post('/api/admin/routing/presets', async (req, reply) => {
-    const body = parseBody(zRoutingPreset, req.body);
-    if ((await deps.db.select({ id: routingPresets.id }).from(routingPresets).where(eq(routingPresets.id, body.id)).limit(1))[0]) throw conflict(`preset ${body.id} 已存在`);
-    const stored = { ...body, builtin: false };
-    await deps.db.insert(routingPresets).values({ id: stored.id, name: stored.name, builtin: false, body: stored as unknown as Record<string, unknown> });
-    await audit(deps, req, 'preset.create', stored.id);
-    return reply.code(201).send(stored);
-  });
-
-  // 内置 preset 另存为副本 <id>-custom；返回的 id 可能与路径不同
-  app.put<IdParams>('/api/admin/routing/presets/:id', async (req): Promise<RoutingPreset> => {
-    const body = parseBody(zRoutingPreset, req.body);
-    const rows = await deps.db.select().from(routingPresets).where(eq(routingPresets.id, req.params.id)).limit(1);
-    if (!rows[0]) throw notFound(`preset ${req.params.id} `);
-    const nowIso = new Date().toISOString();
-    if (rows[0].builtin) {
-      const copyId = `${req.params.id}-custom`;
-      const stored = { ...body, id: copyId, builtin: false };
-      await deps.db.insert(routingPresets).values({ id: copyId, name: stored.name, builtin: false, body: stored as unknown as Record<string, unknown>, updatedAt: nowIso }).onConflictDoUpdate({ target: routingPresets.id, set: { name: stored.name, body: stored as unknown as Record<string, unknown>, updatedAt: nowIso } });
-      await audit(deps, req, 'preset.copy', copyId, { from: req.params.id });
-      // 编辑正在生效的内置 preset：副本要接替它，否则用户的修改根本不生效
-      const active = await loadActive(deps);
-      if (active.presetId === req.params.id) {
-        const value = { presetId: copyId, overrides: active.overrides };
-        await deps.db.insert(settings).values({ key: 'routing.active', value, updatedAt: nowIso }).onConflictDoUpdate({ target: settings.key, set: { value, updatedAt: nowIso } });
-        const sys = zSystemSettings.parse({ ...(await loadSystemSettings(deps.db)), activePreset: copyId });
-        await deps.db.update(settings).set({ value: sys, updatedAt: nowIso }).where(eq(settings.key, 'system'));
-      }
-      return stored;
-    }
-    const stored = { ...body, id: req.params.id, builtin: false };
-    await deps.db.update(routingPresets).set({ name: stored.name, body: stored as unknown as Record<string, unknown>, updatedAt: nowIso }).where(eq(routingPresets.id, stored.id));
-    await audit(deps, req, 'preset.update', stored.id);
-    return stored;
-  });
-
-  app.delete<IdParams>('/api/admin/routing/presets/:id', async (req): Promise<Ok> => {
-    const rows = await deps.db.select().from(routingPresets).where(eq(routingPresets.id, req.params.id)).limit(1);
-    if (!rows[0]) throw notFound(`preset ${req.params.id} `);
-    if (rows[0].builtin) throw forbidden('内置 preset 不能删除', 'builtin_readonly');
-    if ((await loadActive(deps)).presetId === req.params.id) throw conflict('该 preset 正在生效');
-    await deps.db.delete(routingPresets).where(eq(routingPresets.id, req.params.id));
-    await audit(deps, req, 'preset.delete', req.params.id);
-    return { ok: true };
-  });
-
-  const activeView = async (): Promise<ActiveRouting> => {
-    const a = await loadActive(deps);
-    return { presetId: a.presetId, overrides: a.overrides, effective: await effectiveRouting(deps.db, null) };
+  // ── 路由位置（写作 / 杂活） ──
+  const slotsView = async (): Promise<RoutingSlotsView> => {
+    const [slots, status, rows] = await Promise.all([loadSlots(deps.db), slotStatus(deps.db, new Date(), { allowFakeHarness: deps.config.allowFakeHarness, forced: deps.config.fakeHarness }), deps.db.select().from(profiles).orderBy(profiles.id)]);
+    return { slots, forced: deps.config.fakeHarness, status, profiles: rows.map((r) => r.body as unknown as Profile) };
   };
 
-  app.get('/api/admin/routing/active', async (): Promise<ActiveRouting> => activeView());
+  app.get('/api/admin/routing/slots', async (): Promise<RoutingSlotsView> => slotsView());
 
-  app.put('/api/admin/routing/active', async (req): Promise<ActiveRouting> => {
-    const body = parseBody(zPutActiveRouting, req.body);
-    if (!(await deps.db.select({ id: routingPresets.id }).from(routingPresets).where(eq(routingPresets.id, body.presetId)).limit(1))[0]) throw badRequest(`preset ${body.presetId} 不存在`);
-    const nowIso = new Date().toISOString();
-    const value = { presetId: body.presetId, overrides: body.overrides };
-    await deps.db.insert(settings).values({ key: 'routing.active', value, updatedAt: nowIso }).onConflictDoUpdate({ target: settings.key, set: { value, updatedAt: nowIso } });
-    const sys = zSystemSettings.parse({ ...(await loadSystemSettings(deps.db)), activePreset: body.presetId });
-    await deps.db.update(settings).set({ value: sys, updatedAt: nowIso }).where(eq(settings.key, 'system'));
-    await audit(deps, req, 'routing.active', body.presetId);
-    return activeView();
+  app.put('/api/admin/routing/slots', async (req): Promise<RoutingSlotsView> => {
+    // fake 模式（NOVELIST_FAKE_HARNESS=1）下两个位置被强制成 fake：这时改了也不生效，直接拒绝；不是 fake 模式启动时照常可改
+    if (deps.config.fakeHarness) throw conflict('fake 模式下两个位置都固定走 fake，不能修改', 'slots_forced');
+    const body = parseBody(zPutRoutingSlots, req.body);
+    const current = await loadSlots(deps.db);
+    const known = new Set((await deps.db.select({ id: profiles.id }).from(profiles)).map((r) => r.id));
+    for (const slot of SLOT_IDS) {
+      const next = body[slot];
+      if (next.primary && next.fallback && next.primary === next.fallback) throw badRequest(`${slot} 位置的主用和备用是同一个 profile`, 'same_profile');
+      // 只检查改动了的 id：留着指向已删除 profile 的另一个位置，不挡住保存这一个
+      for (const key of ['primary', 'fallback'] as const) {
+        const id = next[key];
+        if (id && id !== current[slot][key] && !known.has(id)) throw badRequest(`profile ${id} 不存在`, 'unknown_profile');
+      }
+    }
+    await saveSlots(deps.db, body);
+    await audit(deps, req, 'routing.slots', null, { writer: body.writer, utility: body.utility });
+    return slotsView();
   });
 
-  app.post<{ Querystring: { book?: string } }>('/api/admin/routing/check', async (req): Promise<FeasibilityReport> => {
-    let bookId: string | null = null;
-    if (req.query.book) {
-      const rows = await deps.db.select({ id: books.id }).from(books).where(eq(books.slug, req.query.book)).limit(1);
-      if (!rows[0]) throw notFound(`书 ${req.query.book} `);
-      bookId = rows[0].id;
+  app.post<{ Params: { slot: string } }>('/api/admin/routing/slots/:slot/canary', async (req): Promise<SlotCanaryResult> => {
+    const slot = req.params.slot as SlotId;
+    if (!(SLOT_IDS as readonly string[]).includes(slot)) throw notFound(`路由位置 ${req.params.slot} `);
+    const now = new Date();
+    const route = await resolveSlot(deps.db, { slot, book: null, now, ignoreConcurrency: true, allowFakeHarness: deps.config.allowFakeHarness, forced: deps.config.fakeHarness });
+    if (!route.profileObj || !route.harness) throw conflict(route.reason ?? '这个位置没有可用的模型', 'no_route');
+    const harness = route.harness as HarnessId;
+    const adapter = getAdapter(harness);
+    const inst = (await detectInstalls(deps.config.harnessDir)).find((i) => i.id === harness);
+    if (!inst) throw conflict(`${harness} 尚未安装`, 'harness_not_installed');
+    const settingsNow = await loadSystemSettings(deps.db);
+    const isolation = (await probeIsolation(settingsNow.isolation)).selected;
+    const account = route.accountObj ?? zAccount.parse({ id: 'fake-default', harness, authMode: 'none' });
+    const acct = await resolveAccount(account, deps.paths, deps.secrets);
+    const capRows = await deps.db.select().from(capabilities).where(and(eq(capabilities.harness, harness), eq(capabilities.version, inst.version), eq(capabilities.isolation, isolation))).limit(1);
+    const stored = capRows[0] ? zCapabilities.safeParse(capRows[0].body) : null;
+    const base = stored?.success ? stored.data : defaultCapabilities(harness, inst.version, isolation);
+    const scratchDir = await fs.mkdtemp(path.join(deps.paths.tmp, `canary-${slot}-`));
+    try {
+      const { caps, result } = await domain(() =>
+        runDirectoryCanary(adapter, inst, acct, { isolation, scratchDir, live: true, model: route.model as string, ...(route.profileObj?.effort ? { effort: route.profileObj.effort } : {}) }, base),
+      );
+      const at = new Date().toISOString();
+      await deps.db.insert(capabilities).values({ harness, version: inst.version, isolation, body: caps as unknown as Record<string, unknown>, verifiedAt: at }).onConflictDoUpdate({ target: [capabilities.harness, capabilities.version, capabilities.isolation], set: { body: caps as unknown as Record<string, unknown>, verifiedAt: at } });
+      await audit(deps, req, 'routing.slots.canary', slot, { profile: route.profile, ok: result.ok });
+      return { status: toSlotStatus(route), caps, result };
+    } finally {
+      await fs.rm(scratchDir, { recursive: true, force: true }).catch(() => {});
     }
-    return domain(() => deps.orchestrator.feasibility(bookId));
   });
 }

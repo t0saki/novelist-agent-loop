@@ -2,10 +2,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { NEvent } from '@novelist/shared';
-import { countCjk, zReceipt } from '@novelist/shared';
+import { countCjk } from '@novelist/shared';
 import { afterEach, describe, expect, it } from 'vitest';
 import { getAdapter } from './registry.js';
-import { RunPrepareError, logFiles, reattachRun, runShort, startRun } from './runner.js';
+import { logFiles, reattachRun, runShort, startRun } from './runner.js';
 import { makeRunFixture, type RunFixture } from './testing.js';
 import { sleep } from './util.js';
 
@@ -28,7 +28,7 @@ function collector() {
 }
 
 describe('runner + nv-shim + fake harness', () => {
-  it('happy path: writes chapter + receipt, events are sequenced, outcome completed', async () => {
+  it('happy path: writes the chapter into the book snapshot (directory contract), events are sequenced, outcome completed', async () => {
     const f = await fx();
     const c = collector();
     const h = await startRun(f.prepared, c.sink);
@@ -42,14 +42,11 @@ describe('runner + nv-shim + fake harness', () => {
     expect(r.eventCount).toBe(c.events.length);
     expect(c.events[0]!.t).toBe('init');
     expect(c.events.at(-1)!.t).toBe('result');
-    const draft = readFileSync(path.join(f.spec.outDir, 'manuscript/c00001.md'), 'utf8');
-    const n = countCjk(draft, 'han');
-    expect(n).toBeGreaterThanOrEqual(240);
-    expect(n).toBeLessThanOrEqual(360);
-    expect(draft).toMatch(/^<!-- beat:b1 -->$/m);
-    const receipt = zReceipt.parse(JSON.parse(readFileSync(path.join(f.spec.outDir, 'receipt.json'), 'utf8')));
-    expect(receipt.nonces).toEqual(['NV-C-HEAD-AAAAAAAAAAAA', 'NV-B-HEAD-BBBBBBBBBBBB', 'NV-B-TAIL-CCCCCCCCCCCC']);
-    expect(r.outcome.receipt).toMatchObject({ schema: 'nv.receipt/1' });
+    const chapter = readFileSync(path.join(f.spec.bookDir, 'manuscript/c00001.md'), 'utf8');
+    expect(chapter).toMatch(/^# 第1章 /);
+    expect(countCjk(chapter, 'han')).toBeGreaterThanOrEqual(300);
+    // 没有回执、没有 out/ 产物
+    expect(existsSync(path.join(f.spec.outDir, 'receipt.json'))).toBe(false);
     expect(r.outcome.usage.output).toBeGreaterThan(0);
     // spec.json 在 in/，秘密 env 文件已被 shim 删除
     expect(existsSync(path.join(f.spec.inDir, 'spec.json'))).toBe(true);
@@ -114,6 +111,19 @@ describe('runner + nv-shim + fake harness', () => {
     expect(c.activity()).toBeGreaterThan(0);
   });
 
+  it('home config files changed by the harness are reported by the post-run audit (out/ is not audited any more)', async () => {
+    const f = await fx({ fake: { sleepMs: 1500 } });
+    const base = getAdapter('fake');
+    const cfg = path.join(f.spec.inDir, 'fake.cfg');
+    const adapter = { ...base, prepareHome: async () => ({ home: f.prepared.account.home, configFiles: [{ path: cfg, content: 'x' }], stateDirs: [], env: { HOME: f.prepared.account.home } }) };
+    const h = await startRun({ ...f.prepared, adapter }, collector().sink);
+    await fs.writeFile(cfg, 'tampered');
+    await fs.writeFile(path.join(f.spec.outDir, 'stray.txt'), 'x');
+    const r = await h.wait();
+    expect(r.audit).toEqual({ ok: false, extraFiles: [], tamperedConfig: [cfg] });
+    expect(r.outcome).toMatchObject({ status: 'failed', errorClass: 'sandbox' });
+  });
+
   it('kill(user) → cancelled', async () => {
     const f = await fx({ fake: { sleepMs: 10_000, dripMs: 100 } });
     const h = await startRun(f.prepared, collector().sink);
@@ -134,20 +144,6 @@ describe('runner + nv-shim + fake harness', () => {
     expect(r.exit.signal).toBe('SIGKILL');
     expect(Date.now() - t0).toBeGreaterThanOrEqual(1800); // 1s SIGINT + 1s SIGTERM grace
     expect(r.outcome.status).toBe('cancelled');
-  });
-
-  it('extra files in out/ are reported by the post-run audit', async () => {
-    const f = await fx({ fake: { extraFile: 'stray.txt' } });
-    const r = await (await startRun(f.prepared, collector().sink)).wait();
-    expect(r.audit.ok).toBe(false);
-    expect(r.audit.extraFiles).toEqual(['stray.txt']);
-  });
-
-  it('missing artifact still completes at harness level (validators decide)', async () => {
-    const f = await fx({ fake: { skipArtifacts: ['manuscript/c00001.md'] } });
-    const r = await (await startRun(f.prepared, collector().sink)).wait();
-    expect(r.outcome.status).toBe('completed');
-    expect(existsSync(path.join(f.spec.outDir, 'manuscript/c00001.md'))).toBe(false);
   });
 
   it('malformed stdout lines become unknown events, never crash', async () => {
@@ -208,14 +204,6 @@ describe('runner + nv-shim + fake harness', () => {
     const f = await fx();
     const prepared = { ...f.prepared, spec: { ...f.spec, harness: 'pi' as const } };
     await expect(startRun(prepared, collector().sink)).rejects.toMatchObject({ code: 'not_allowed' });
-  });
-
-  it('budget overflow from materialize → RunPrepareError budget', async () => {
-    const f = await fx();
-    const adapter = { ...getAdapter('fake'), materialize: async () => ({ files: [], argv: [], env: {}, budget: { ok: false, bytes: 30_000, limit: 20_000, reason: '超限' }, notes: [] }) };
-    const err = await startRun({ ...f.prepared, adapter }, collector().sink).catch((e) => e);
-    expect(err).toBeInstanceOf(RunPrepareError);
-    expect(err.code).toBe('budget');
   });
 
   it('argv referencing a missing $RUN/in file is refused before spawn', async () => {

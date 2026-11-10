@@ -1,44 +1,36 @@
 /**
- * lane F 公共出口 + Orchestrator 门面（API / CLI 只通过它驱动编排）。Owner: lane F。
+ * orchestrator 公共出口 + Orchestrator 门面（API / CLI 只通过它驱动编排）。
+ * 只有 v3 书能开写；旧书（meta.v3 不是对象，book/legacy.ts）的一切写作 / 发布操作都回 409 legacy_book。
  */
-import { randomUUID } from 'node:crypto';
 import { and, count, eq, gt, inArray, like } from 'drizzle-orm';
-import { books, chapters, inbox as inboxTable, runs, settings, tasks } from '../db/schema.js';
-import { P } from '../book/layout.js';
+import { books, inbox as inboxTable, runs, settings, tasks } from '../db/schema.js';
 import { openRepo } from '../book/repo.js';
-import type { PipelineContext, TaskRow, TaskSpec } from '../pipeline/types.js';
-import type { BookAction, ChapterAction, FeasibilityReport, InboxItem } from './facade-types.js';
-import { V3DiscardRefused, commitOwnerEdit, revertPartialV3 } from './committer.js';
+import { isV3Meta } from '../book/legacy.js';
+import type { PipelineContext, TaskRow, TaskSpec } from '../runtime/types.js';
+import { isKnownKind } from '../runtime/registry.js';
+import type { BookAction, ChapterAction, InboxItem } from './facade-types.js';
+import { V3DiscardRefused, revertPartialV3 } from './committer.js';
 import type { EventBus } from './bus.js';
 import { enqueueSpec, execEnv, type ExecEnv, type ExecutorDeps } from './executor.js';
 import { actOnInbox } from './inbox.js';
 import { ACTIVE_STATES, QUEUED_STATES, retryTaskRow, setTaskState } from './queue.js';
-import { rewindBook } from './rewind.js';
 import { rewindV3, type RewindV3Result } from './rewind-v3.js';
 import { requestChapterRewrite } from '../flow/owner.js';
-import { chapterActionSpecs } from '../pipeline/next.js';
-import type { ChapterWorkflow } from '../pipeline/workflow.js';
-import { ROOT_AGENTS_PLACEHOLDER } from '../book/repo.js';
-import { TRAILER } from '../book/trailers.js';
 import { recoverOnStartup } from './recovery.js';
 import { notify } from './notify.js';
-import { checkFeasibility, loadSystemSettings, seedRouting } from './routing.js';
+import { loadSystemSettings, seedProfiles } from './routing.js';
 import { createScheduler, type Scheduler } from './scheduler.js';
 import { logFiles } from '../harness/index.js';
 import { ACTIVE_RUN_STATES } from './executor.js';
 import { promises as fs } from 'node:fs';
 import { HttpProblem } from '../api/problem.js';
-import type { BookRuntimeState } from '../pipeline/next.js';
 import { resumeZeroDiffAccount } from '../flow/accounts.js';
-import { clearPending, patchPending, readPending } from '../flow/state.js';
-
-/** v3 的 nextTasks 自己读 DB，不用 BookRuntimeState */
-const EMPTY_STATE: BookRuntimeState = { active: [], acceptedThrough: 0, cardsThrough: 0, publishedThrough: 0, auditedThrough: 0, productionPaused: false, openApprovals: [] };
+import { clearPending, patchPending, patchV3Meta, readPending, readV3Meta } from '../flow/state.js';
+import { BUFFER_FULL_WAIT } from '../flow/contract.js';
 
 const V3_FLOW_KINDS = ['book.open', 'book.write', 'book.retro'] as const;
 
-const v3Unsupported = (): HttpProblem => new HttpProblem(409, 'v3_unsupported', '新流程的书没有这个操作');
-
+const legacyBook = (): HttpProblem => new HttpProblem(409, 'legacy_book', '旧书不能开写；先在书页点“接手”');
 /**
  * v3 收稿连续失败后的“重试 / 放弃”（p2-plan §3.2 pendingAction）。重试 = failures 归零；放弃 = 先把这次运行已经提交的分章撤回到 drafts/，再清 pending
  * （收到的改动留在 work/ 下，GC 保留 30 天）。wakeTask：把这本书 blocked 的 v3 任务放回 ready（待办的旧入口由 actOnInbox 自己放）。返回给提示条的一句话。
@@ -100,7 +92,6 @@ export * from './bus.js';
 export * from './queue.js';
 export * from './routing.js';
 export * from './quota.js';
-export * from './circuit.js';
 export * from './committer.js';
 export * from './executor.js';
 export * from './scheduler.js';
@@ -112,7 +103,6 @@ export * from './orch-state.js';
 export { rewindV3, applyRewindDb, recoverRewinds, batchBaseFor, backfillBatchLog, ensureBatchLog, rewindPoints, type RewindV3Result } from './rewind-v3.js';
 export { planFailure, INFRA_CLASSES } from './actions.js';
 export { defaultPipeline, type PipelineBinding } from './binding.js';
-export type { BookRuntimeState } from '../pipeline/next.js';
 
 export interface OrchestratorStatus {
   owner: string;
@@ -122,12 +112,17 @@ export interface OrchestratorStatus {
   activeRuns: number;
 }
 
+export interface OrchestratorStartOptions {
+  /** 恢复（recoverOnStartup + sweepDirtyBooks）之后调用一次；出错只记日志，不影响启动 */
+  afterRecover?: () => Promise<unknown>;
+}
+
 export interface Orchestrator {
   bus: EventBus;
-  start(): Promise<void>;
+  start(opts?: OrchestratorStartOptions): Promise<void>;
   stop(opts?: { drain?: boolean }): Promise<void>;
-  /** 开书后入队首批任务 */
-  startBook(bookId: string, opts: { interview: boolean }): Promise<void>;
+  /** 开书后入队首批任务（旧书 → 409 legacy_book） */
+  startBook(bookId: string): Promise<void>;
   bookAction(bookId: string, action: BookAction): Promise<void>;
   chapterAction(bookId: string, no: number, action: ChapterAction): Promise<void>;
   /** v3：回退到第 to 章（p2-plan §2.6） */
@@ -139,7 +134,6 @@ export interface Orchestrator {
   killRun(runId: string): Promise<void>;
   actInbox(id: string, action: string, note?: string, payload?: Record<string, unknown>): Promise<InboxItem>;
   publishNow(bookId: string, through?: number, ignoreAudit?: boolean): Promise<void>;
-  feasibility(bookId: string | null): Promise<FeasibilityReport>;
   /** 测试：跑到空闲 */
   runUntilIdle(opts?: { maxTicks?: number }): Promise<void>;
   /** 全局暂停 / 恢复（写 settings.schedulerEnabled） */
@@ -162,6 +156,12 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
     const rows = await env.db.select({ slug: books.slug }).from(books).where(eq(books.id, bookId)).limit(1);
     if (rows[0]) env.bus.publish({ type: 'book_changed', book: rows[0].slug });
   };
+  /** 以数据库为准（P3 D1）：旧书什么写作 / 发布操作都不做，book.yaml 坏了也一样回 409 */
+  const assertV3Book = async (bookId: string): Promise<void> => {
+    const row = (await env.db.select({ meta: books.meta }).from(books).where(eq(books.id, bookId)).limit(1))[0];
+    if (!row) throw new Error(`book not found: ${bookId}`);
+    if (!isV3Meta(row.meta)) throw legacyBook();
+  };
 
   async function enqueueOne(bookId: string, spec: TaskSpec): Promise<string> {
     return (await enqueueSpec(env, await ctxFor(bookId), spec)).id;
@@ -170,7 +170,33 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
   /** v3：只把 draft / paused 改成 planning（已在写或已完结的书不重置），然后按 nextTasks 入队（只有 0 章时才会是 book.open） */
   async function startV3(bookId: string, ctx: PipelineContext): Promise<void> {
     await env.db.update(books).set({ status: 'planning', pausedReason: null, updatedAt: new Date().toISOString() }).where(and(eq(books.id, bookId), inArray(books.status, ['draft', 'paused'])));
-    for (const spec of await env.pipe.nextTasks(ctx, EMPTY_STATE)) await enqueueSpec(env, ctx, spec);
+    for (const spec of await env.pipe.nextTasks(ctx)) await enqueueSpec(env, ctx, spec);
+  }
+
+  /**
+   * 立即写下一批（DESIGN §9 书页状态栏）：meta.v3.writeNow = true（decideNext、任务单的存稿检查、claimNext 的 max_buffer 暂停都放行一批 book.write，
+   * 这一批有新章入库就清掉）；暂停中的书一并恢复；已经有排着的写作任务就不再加，因存稿满在等的那个马上重新认领。
+   */
+  async function writeNow(bookId: string, now: string): Promise<void> {
+    const row = (await env.db.select({ status: books.status, meta: books.meta, accepted: books.acceptedThrough }).from(books).where(eq(books.id, bookId)).limit(1))[0];
+    if (!row) throw new Error(`book not found: ${bookId}`);
+    if (row.status === 'completed' || row.status === 'archived') throw new HttpProblem(409, 'completed', '这本书已经完结（或已归档），没有下一批可写');
+    const meta = readV3Meta(row.meta);
+    if (meta.rewinding) throw new HttpProblem(409, 'rewinding', '回退进行中，等它结束再写');
+    if (row.accepted === 0) {
+      // 还没开书：等同“开始”
+      await startV3(bookId, await ctxFor(bookId));
+      return;
+    }
+    await patchV3Meta(env.db, bookId, (m) => ({ patch: m.writeNow ? null : { writeNow: true }, result: undefined }));
+    await env.db.update(books).set({ status: 'active', pausedReason: null, updatedAt: now }).where(and(eq(books.id, bookId), eq(books.status, 'paused')));
+    await env.db.update(books).set({ status: 'planning', updatedAt: now }).where(and(eq(books.id, bookId), eq(books.status, 'draft')));
+    await env.db
+      .update(tasks)
+      .set({ notBefore: now, updatedAt: now })
+      .where(and(eq(tasks.bookId, bookId), eq(tasks.kind, 'book.write'), eq(tasks.state, 'waiting'), eq(tasks.waitReason, BUFFER_FULL_WAIT)));
+    const ctx = await ctxFor(bookId);
+    for (const spec of await env.pipe.nextTasks(ctx)) await enqueueSpec(env, ctx, spec);
   }
 
   async function setSystemEnabled(enabled: boolean): Promise<void> {
@@ -182,18 +208,21 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
   return {
     bus: deps.bus,
     scheduler,
-    async start() {
-      await seedRouting(env.db);
+    async start(opts) {
+      await seedProfiles(env.db);
       unsubscribeNotify = env.bus.subscribe(
         (e) => {
           void loadSystemSettings(env.db)
             .then((settings) => notify(env.db, settings, e))
             .catch((err) => env.log.warn({ err: (err as Error).message }, 'notify failed'));
         },
-        (e) => e.type === 'inbox_new' || e.type === 'circuit_changed' || e.type === 'quota_wait',
+        (e) => e.type === 'inbox_new' || e.type === 'quota_wait',
       );
       const recovered = await recoverOnStartup(env, reattached);
       if (recovered.reattached.length || recovered.lost.length || recovered.replayed.length) env.log.info(recovered, 'orchestrator recovered');
+      if (opts?.afterRecover) {
+        await opts.afterRecover().catch((err: Error) => env.log.error({ err: err.message }, 'post-recovery step failed'));
+      }
       if (env.config.schedulerEnabled !== false) await scheduler.start();
     },
     async stop(opts) {
@@ -202,152 +231,55 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
       unsubscribeNotify = null;
       if (opts?.drain) await Promise.all([...reattached]);
     },
-    async startBook(bookId, opts) {
-      const ctx = await ctxFor(bookId);
-      const book = ctx.book as NonNullable<PipelineContext['book']>;
-      if (book.config.flow === 'v3') {
-        await startV3(bookId, ctx);
-        await notifyBook(bookId);
-        return;
-      }
-      await env.db.update(books).set({ status: 'planning', updatedAt: new Date().toISOString() }).where(and(eq(books.id, bookId), inArray(books.status, ['draft', 'paused'])));
-      for (const spec of env.pipe.initialTasks(book, opts)) await enqueueSpec(env, ctx, spec);
+    async startBook(bookId) {
+      await assertV3Book(bookId);
+      await startV3(bookId, await ctxFor(bookId));
       await notifyBook(bookId);
     },
     async bookAction(bookId, a) {
       const now = new Date().toISOString();
+      await assertV3Book(bookId);
       switch (a.action) {
-        case 'start': {
-          const ctx = await ctxFor(bookId);
-          const book = ctx.book as NonNullable<PipelineContext['book']>;
-          if (book.config.flow === 'v3') {
-            await startV3(bookId, ctx);
-            break;
-          }
-          await env.db.update(books).set({ status: 'planning', pausedReason: null, updatedAt: now }).where(eq(books.id, bookId));
-          for (const spec of env.pipe.initialTasks(book, { interview: a.interview === true })) await enqueueSpec(env, ctx, spec);
+        case 'start':
+          await startV3(bookId, await ctxFor(bookId));
           break;
-        }
         case 'pause':
           await env.db.update(books).set({ status: 'paused', pausedReason: 'owner', updatedAt: now }).where(eq(books.id, bookId));
+          // 暂停就撤掉还没用上的“立即写下一批”（恢复后按存稿规则写）
+          await patchV3Meta(env.db, bookId, (m) => ({ patch: m.writeNow ? { writeNow: false } : null, result: undefined }));
+          break;
+        case 'write_now':
+          await writeNow(bookId, now);
           break;
         case 'resume':
           await env.db.update(books).set({ status: 'active', pausedReason: null, updatedAt: now }).where(eq(books.id, bookId));
           break;
-        case 'drain':
-          // 停止派发新任务（等当前 run 结束）：先暂停，已在跑的不打断
-          await env.db.update(books).set({ status: 'paused', pausedReason: 'drain', updatedAt: now }).where(eq(books.id, bookId));
-          break;
         case 'reindex':
-          await enqueueOne(bookId, { kind: 'index.rebuild', bookId, target: 'book', lane: 'system' });
-          break;
-        case 'rewind': {
-          // 只为认出 v3：打不开的书（book.yaml 不合法、题材包没了）照旧走 v2 的回退，回退本身不需要解析配置
-          const isV3 = await ctxFor(bookId).then(
-            (c) => c.book?.config.flow === 'v3',
-            () => false,
-          );
-          if (a.to === undefined) throw new Error('rewind 需要 to');
-          if (isV3) {
-            await rewindV3(env, bookId, a.to, { reason: 'rewind' });
-            break;
-          }
-          await rewindBook(env, bookId, a.to, a.confirm === true);
-          break;
-        }
-        case 'migrate':
-          await enqueueOne(bookId, { kind: 'index.rebuild', bookId, target: 'migrate', lane: 'system', params: { migrate: true } });
+          throw new HttpProblem(400, 'bad_request', 'reindex 由 API 直接处理');
+        case 'rewind':
+          if (a.to === undefined) throw new HttpProblem(400, 'bad_request', 'rewind 需要 to');
+          await rewindV3(env, bookId, a.to, { reason: 'rewind', ...(a.note?.trim() ? { note: a.note } : {}) });
           break;
       }
       await notifyBook(bookId);
     },
     async chapterAction(bookId, no, a) {
-      const target = `c${String(no).padStart(5, '0')}`;
-      const now = new Date().toISOString();
-      const ownerNote = a.note ? { source: `chapter-action:${a.action}`, text: a.note } : undefined;
-      const noteParams = a.note ? { ownerNote: a.note, _orch: { ownerNotes: [ownerNote] } } : {};
-      const requeue = async (spec: TaskSpec): Promise<void> => {
-        const { id, created } = await enqueueSpec(env, await ctxFor(bookId), spec);
-        if (!created) await retryTaskRow(env.db, id, { force: true, ...(ownerNote ? { ownerNote } : {}) });
-      };
-      const chapterRows = await env.db.select().from(chapters).where(and(eq(chapters.bookId, bookId), eq(chapters.no, no))).limit(1);
-      const chapterRow = chapterRows[0];
-      const bookHandle = (await ctxFor(bookId)).book as NonNullable<PipelineContext['book']>;
-      const workflow = (chapterRow?.workflow ?? {}) as Partial<ChapterWorkflow>;
-      if (bookHandle.config.flow === 'v3') {
-        // 带意见重写：记一条改写请求，并入下一批写作（不单开运行）；从这里起重写 = 回退到上一章再写
-        if (a.action === 'rewrite') {
+      await assertV3Book(bookId);
+      switch (a.action) {
+        // 带意见重写：记一条改写请求，并入下一批写作（不单开运行）
+        case 'rewrite':
           if (!a.note?.trim()) throw new HttpProblem(400, 'bad_request', '带意见重写需要写一句意见');
           await requestChapterRewrite(env.db, bookId, no, a.note, env.nowFn());
-          await notifyBook(bookId);
-          return;
-        }
-        if (a.action === 'rewrite_from') {
+          break;
+        // 从这里起重写 = 回退到上一章再写
+        case 'rewrite_from': {
           const pub = (await env.db.select({ p: books.publishedThrough }).from(books).where(eq(books.id, bookId)).limit(1))[0]?.p ?? 0;
           if (no <= pub) throw new HttpProblem(409, 'published', '已发布的章节只能直接修改');
           await rewindV3(env, bookId, no - 1, { ...(a.note ? { note: a.note } : {}), reason: 'rewrite_from' });
-          await notifyBook(bookId);
-          return;
-        }
-        if (a.action === 'repair' || a.action === 'reextract') throw v3Unsupported();
-      } else if (a.action === 'rewrite_from') throw new HttpProblem(400, 'bad_request', '旧流程不支持');
-      const instance = `${a.action}-${randomUUID().slice(0, 12)}`;
-      const assertNotFrozen = (): void => {
-        if (chapterRow?.publishedAt && bookHandle.config.publish.freeze_on_publish && !a.confirm) throw new Error(`第 ${no} 章已发布，受 freeze_on_publish 保护；确认要修改请带 confirm=true`);
-      };
-      switch (a.action) {
-        case 'rewrite': {
-          assertNotFrozen();
-          const accepted = (await env.db.select({ a: books.acceptedThrough }).from(books).where(eq(books.id, bookId)).limit(1))[0]?.a ?? 0;
-          if (no <= accepted) {
-            // 已验收章节：写新稿 → reextract → cascadeReplay，不走前沿 accept（否则 acceptedThrough 回退、账本错位）
-            await enqueueOne(bookId, { kind: 'chapter.repair', bookId, target, lane: 'side', priority: 10, params: { instance, conflicts: [a.note?.trim() || 'owner 要求重写本章'], ...(a.note?.trim() ? { ownerNotes: [a.note] } : {}), ...(chapterRow?.publishedAt ? { allowPublished: true } : {}) } });
-            break;
-          }
-          const liveTasks = await env.db.select({ id: tasks.id, state: tasks.state }).from(tasks).where(and(eq(tasks.bookId, bookId), eq(tasks.target, target), eq(tasks.lane, 'write'), inArray(tasks.state, [...ACTIVE_STATES, ...QUEUED_STATES])));
-          if (liveTasks.some((t) => (ACTIVE_STATES as string[]).includes(t.state))) throw new Error('本章有任务正在执行，请先取消或等待结束');
-          for (const t of liveTasks) await setTaskState(env.db, t.id, 'cancelled', { waitReason: 'owner_rewrite' });
-          const planned = chapterActionSpecs(bookHandle, no, 'rewrite', { ...(a.note ? { note: a.note } : {}), instance, workflow });
-          if (planned.chapter) await env.db.insert(chapters).values({ bookId, no, chapterId: target, state: planned.chapter.state, workflow: planned.chapter.workflow ?? {}, updatedAt: now }).onConflictDoUpdate({ target: [chapters.bookId, chapters.no], set: { state: planned.chapter.state, workflow: planned.chapter.workflow ?? {}, updatedAt: now } });
-          // 前沿章由 writeLane 按 workflow.next 派发（已入队的同实例幂等）；只有前沿章才立即入队
-          if (no === accepted + 1) for (const spec of planned.specs) await enqueueOne(bookId, spec);
-          break;
-        }
-        case 'repair':
-          assertNotFrozen();
-          await requeue({ kind: 'chapter.repair', bookId, target, lane: 'side', params: { ...noteParams, instance, conflicts: [a.note?.trim() || '人工要求修补'], ...(chapterRow?.publishedAt ? { allowPublished: true } : {}) }, priority: 10 });
-          break;
-        case 'reextract':
-          await requeue({ kind: 'chapter.reextract', bookId, target, lane: 'side', params: { ...noteParams, instance } });
-          break;
-        case 'hold':
-          await env.db.update(chapters).set({ state: 'held', workflow: { ...workflow, heldFrom: chapterRow?.state ?? 'planned' }, updatedAt: now }).where(and(eq(chapters.bookId, bookId), eq(chapters.no, no)));
-          break;
-        case 'unhold':
-        case 'approve': {
-          // 找这一章的待处理项：body.target 或 related task 的 target
-          const open = await env.db.select().from(inboxTable).where(and(eq(inboxTable.bookId, bookId), eq(inboxTable.state, 'open'), inArray(inboxTable.kind, ['hold', 'block', 'approval'])));
-          let item = open.find((row) => (row.body as { target?: string }).target === target);
-          if (!item) {
-            const ids = open.map((row) => row.relatedTaskId).filter((x): x is string => !!x);
-            const related = ids.length ? await env.db.select({ id: tasks.id, target: tasks.target }).from(tasks).where(inArray(tasks.id, ids)) : [];
-            const match = related.find((r) => r.target === target);
-            if (match) item = open.find((row) => row.relatedTaskId === match.id);
-          }
-          if (item) {
-            const known = (item.actions as { id: string }[]).map((x) => x.id);
-            // unhold 只是 approve 的别名：hold/block 的 Inbox 动作是 approve/rewrite
-            await actOnInbox(env.db, env.bus, item.id, known.includes(a.action) ? a.action : 'approve', a.note);
-          } else if (a.action === 'unhold') {
-            // 手工 hold（无 Inbox 项）：恢复进 hold 之前的状态，writeLane 按 workflow.next 继续
-            const restored = (workflow as { heldFrom?: string }).heldFrom ?? 'planned';
-            const { heldFrom: _dropped, ...rest } = workflow as { heldFrom?: string };
-            await env.db.update(chapters).set({ state: restored, workflow: rest, updatedAt: now }).where(and(eq(chapters.bookId, bookId), eq(chapters.no, no)));
-          }
           break;
         }
         case 'publish_now':
-          await enqueueOne(bookId, { kind: 'publish', bookId, target: `through-${no}`, lane: 'system', params: { through: no, ignoreAudit: a.ignoreAudit === true, manual: true } });
+          await enqueueOne(bookId, { kind: 'publish', bookId, target: `through-${no}`, lane: 'system', params: { through: no, ignoreAudit: false, manual: true } });
           break;
       }
       await notifyBook(bookId);
@@ -363,6 +295,10 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
       return detail;
     },
     async retryTask(taskId) {
+      const row = (await env.db.select({ kind: tasks.kind, bookId: tasks.bookId }).from(tasks).where(eq(tasks.id, taskId)).limit(1))[0];
+      // 已删除的旧种类、旧书的任务：不再复活
+      if (row && !isKnownKind(row.kind)) throw new HttpProblem(409, 'unknown_kind', `这个任务的种类已经不存在了：${row.kind}`);
+      if (row?.bookId) await assertV3Book(row.bookId);
       // 取消后本进程还在收尾（杀 harness、收稿、提交）：这时复活同一个任务会让两份执行去收同一个快照
       if (scheduler.inFlight().some((x) => x.taskId === taskId)) throw new Error(`任务还在收尾，稍后再重试：${taskId}`);
       if (!(await retryTaskRow(env.db, taskId))) throw new Error(`任务不可重试：${taskId}`);
@@ -411,44 +347,18 @@ export function createOrchestrator(deps: ExecutorDeps): Orchestrator {
       if (dedupe.startsWith('v3_pending:') && row?.bookId && (action === 'retry' || action === 'discard')) {
         await v3PendingAction(env, row.bookId, action, { runId: String((row.body as { runId?: unknown }).runId ?? '') });
       }
-      if (row?.kind === 'agents_md_edit' && action === 'migrate' && row.bookId && row.state === 'open') {
-        const bookRows = await env.db.select({ slug: books.slug }).from(books).where(eq(books.id, row.bookId)).limit(1);
-        if (bookRows[0]) {
-          const repo = openRepo(`${env.paths.books}/${bookRows[0].slug}`);
-          const current = (await repo.readFile(P.agentsMd)) ?? '';
-          const existing = (await repo.readFile(P.instructionsAgents)) ?? '';
-          // 同一提交里把根 AGENTS.md 恢复成占位并带 migration trailer，否则篡改判定不解除，所有 promote 继续被拒
-          await commitOwnerEdit(env.db, repo, row.bookId, {
-            files: [
-              { path: P.instructionsAgents, content: `${existing}\n\n<!-- 自根 AGENTS.md 迁移 -->\n${current}` },
-              { path: P.agentsMd, content: ROOT_AGENTS_PLACEHOLDER },
-            ],
-            message: 'owner: migrate root AGENTS.md edits to instructions/AGENTS.md',
-            baseSha: null,
-            extraTrailers: { [TRAILER.migration]: 'agents-md' },
-          });
-        }
-      }
       const item = await actOnInbox(env.db, env.bus, id, action, note, payload);
-      if (row?.kind === 'agents_md_edit' && action === 'migrate' && row.bookId) {
-        // 篡改期间被拒收的任务可能不止一个（side lane 并发），Inbox 按 dedupe 只关联第一个；其余一并放回队列，否则永远 blocked
-        const rejected = await env.db.select({ id: tasks.id }).from(tasks).where(and(eq(tasks.bookId, row.bookId), eq(tasks.state, 'blocked'), eq(tasks.waitReason, 'agents_md_edit')));
-        for (const t of rejected) await retryTaskRow(env.db, t.id);
-      }
       if (row?.bookId) await notifyBook(row.bookId);
       return item;
     },
     async publishNow(bookId, through, ignoreAudit) {
+      await assertV3Book(bookId);
       let target = through;
       if (target === undefined) {
         const rows = await env.db.select({ a: books.acceptedThrough }).from(books).where(eq(books.id, bookId)).limit(1);
         target = rows[0]?.a ?? 0;
       }
       await enqueueOne(bookId, { kind: 'publish', bookId, target: `through-${target}`, lane: 'system', params: { through: target, ignoreAudit: ignoreAudit === true, manual: true } });
-    },
-    async feasibility(bookId) {
-      const book = bookId ? await env.pipe.openBook(env.pdeps, bookId) : null;
-      return checkFeasibility(env.db, book, { allowFakeHarness: env.config.allowFakeHarness });
     },
     runUntilIdle: (opts) => scheduler.runUntilIdle(opts),
     pauseAll: () => setSystemEnabled(false),

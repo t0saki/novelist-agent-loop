@@ -1,0 +1,1 @@
+ALTER TABLE "chapters" ADD COLUMN "volume_title" text DEFAULT '' NOT NULL;

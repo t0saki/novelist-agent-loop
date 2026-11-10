@@ -9,10 +9,10 @@
  */
 import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import type { Lane, TaskState } from '@novelist/shared';
-import { chapterId } from '@novelist/shared';
+import { TASK_KINDS } from '@novelist/shared';
 import type { Db } from '../db/client.js';
-import { books, chapters, tasks } from '../db/schema.js';
-import type { TaskResult, TaskRow, TaskSpec, Manifest } from '../pipeline/types.js';
+import { books, tasks } from '../db/schema.js';
+import type { TaskResult, TaskRow, TaskSpec, Manifest } from '../runtime/types.js';
 import { orchOf, withOrch, type OrchTaskState } from './orch-state.js';
 
 export interface EnqueueInput {
@@ -42,14 +42,14 @@ export async function enqueue(db: Db, input: EnqueueInput): Promise<{ id: string
       target: spec.target,
       lane: spec.lane ?? 'side',
       role: spec.role ?? null,
-      tier: spec.tier ?? null,
       priority: spec.priority ?? 0,
       deps,
       state,
       baseCommit,
       hardManifest: manifest.hard,
       softManifest: manifest.soft,
-      rebaseValidators: manifest.rebaseValidators,
+      // 旧流程的 rebase 校验已删除：列照旧写空数组（上一版镜像读得到）
+      rebaseValidators: [],
       params: spec.params ?? {},
       maxAttempts: spec.maxAttempts ?? 6,
       notBefore: spec.notBefore ?? null,
@@ -92,10 +92,14 @@ export async function claimNext(db: Db, f: ClaimFilter): Promise<TaskRow | null>
       or(eq(tasks.state, 'ready'), and(eq(tasks.state, 'waiting'), isNotNull(tasks.notBefore))),
       or(isNull(tasks.notBefore), lte(tasks.notBefore, now)),
       sql`(${books.id} is null or ${books.status} in ('active','planning','completed') or ${tasks.kind} = 'publish')`,
-      // v3：有主人改写请求在等的书，max_buffer 暂停也放行一批 book.write（改写要在这一批里做）；
+      // 只认现有的任务种类，只跑 v3 书的任务（旧书、已删除的旧种类留在表里，永远认领不到；P3 D1）
+      inArray(tasks.kind, [...TASK_KINDS]),
+      sql`(${books.id} is null or jsonb_typeof(${books.meta}->'v3') = 'object')`,
+      // v3：有主人改写请求在等、或主人要求立即写下一批（meta.v3.writeNow）的书，max_buffer 暂停也放行一批 book.write（改写要在这一批里做）；
       // 结局批也放行（不受存稿上限限制；prepare 里 buildOrderSpec 按 DB 重算，参数过时最多白跑一次 prepare）
-      sql`not (coalesce(${books.pausedReason}, '') = 'max_buffer' and ${tasks.kind} in ('chapter.write','book.write')
+      sql`not (coalesce(${books.pausedReason}, '') = 'max_buffer' and ${tasks.kind} in ('book.write')
         and not (${tasks.kind} = 'book.write' and (coalesce(${tasks.params}->>'mode', '') = 'finale'
+          or coalesce(${books.meta}->'v3'->>'writeNow', '') = 'true'
           or jsonb_path_exists(coalesce(${books.meta}->'v3'->'ownerRequests', '[]'::jsonb), '$[*] ? (@.status == "waiting")'))))`,
     ];
     if (f.lanes && f.lanes.length > 0) conds.push(inArray(tasks.lane, f.lanes));
@@ -166,10 +170,6 @@ export async function completeTask(db: Db, taskId: string, result: TaskResult, o
   const task = rows[0];
   if (!task) throw new Error(`completeTask: no such task ${taskId}`);
   const orch: OrchTaskState = { ...orchOf(task) };
-  if (result.avoidProfile) orch.avoidProfiles = [...new Set([...(orch.avoidProfiles ?? []), result.avoidProfile])];
-  if (result.avoidProfile && result.errorClass === 'output_contract') {
-    orch.contractFailures = { ...orch.contractFailures, [result.avoidProfile]: (orch.contractFailures?.[result.avoidProfile] ?? 0) + 1 };
-  }
   delete orch.recover;
 
   let state: TaskState;
@@ -186,10 +186,6 @@ export async function completeTask(db: Db, taskId: string, result: TaskResult, o
     case 'blocked':
       state = 'blocked';
       waitReason = result.message ?? 'blocked';
-      break;
-    case 'hold':
-      state = 'blocked';
-      waitReason = result.message ?? 'hold';
       break;
     case 'waiting':
       state = 'waiting';
@@ -214,14 +210,11 @@ export async function completeTask(db: Db, taskId: string, result: TaskResult, o
     ...(result.errorClass ? { errorClass: result.errorClass } : {}),
     ...(result.followups?.length ? { followups: result.followups } : {}),
     ...(result.inbox?.length ? { inbox: result.inbox } : {}),
-    ...(result.chapter ? { chapter: result.chapter } : {}),
   };
-  // outbox：完成后还要投递的副作用（followups/inbox/章节索引/onTaskDone）；崩溃后 tick 补投
-  // canary 的任何终态都要落到熔断器（finishCanary 在 outbox 里执行），否则 pending_open / half_open 永远卡住
-  const canaryTerminal = task.kind === 'harness.canary' && (state === 'done' || state === 'failed' || state === 'blocked');
-  if (result.status === 'done' || result.followups?.length || result.inbox?.length || result.chapter || canaryTerminal) orch.outbox = true;
+  // outbox：完成后还要投递的副作用（followups/inbox/onTaskDone）；崩溃后 tick 补投
+  if (result.status === 'done' || result.followups?.length || result.inbox?.length) orch.outbox = true;
 
-  // tasks 终态与 chapters.state/workflow 同一事务：后继任务一入队就可能被 claim，必须已能读到最新 workflow
+  // tasks 终态在一个事务里落地（后继任务由 outbox 投递）
   await db.transaction(async (tx) => {
     await tx
       .update(tasks)
@@ -240,13 +233,6 @@ export async function completeTask(db: Db, taskId: string, result: TaskResult, o
         updatedAt: now,
       })
       .where(eq(tasks.id, taskId));
-    if (result.chapter && task.bookId) {
-      const ch = result.chapter;
-      await tx
-        .insert(chapters)
-        .values({ bookId: task.bookId, no: ch.no, chapterId: chapterId(ch.no), state: ch.state, ...(ch.workflow ? { workflow: ch.workflow } : {}), updatedAt: now })
-        .onConflictDoUpdate({ target: [chapters.bookId, chapters.no], set: { state: ch.state, ...(ch.workflow ? { workflow: ch.workflow } : {}), updatedAt: now } });
-    }
   });
   return state;
 }
@@ -317,13 +303,12 @@ export async function advancePending(db: Db): Promise<string[]> {
 }
 
 /** owner 手动重试：不论 failed/blocked/cancelled/stale 都回到 ready，attempts 归零，代数 +1；依赖它而 blocked 的任务回到 pending */
-export async function retryTaskRow(db: Db, taskId: string, opts?: { force?: boolean; ownerNote?: { source: string; text: string } }): Promise<boolean> {
+export async function retryTaskRow(db: Db, taskId: string, opts?: { force?: boolean }): Promise<boolean> {
   const rows = (await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1)) as TaskRow[];
   const task = rows[0];
   if (!task || (!opts?.force && !['failed', 'blocked', 'cancelled', 'stale', 'waiting'].includes(task.state))) return false;
   if (opts?.force && ['leased', 'running', 'finalizing'].includes(task.state)) return false;
   const orch = orchOf(task);
-  const ownerNotes = opts?.ownerNote ? [...(orch.ownerNotes ?? []), opts.ownerNote] : orch.ownerNotes;
   const now = new Date().toISOString();
   await db
     .update(tasks)
@@ -336,7 +321,7 @@ export async function retryTaskRow(db: Db, taskId: string, opts?: { force?: bool
       leaseOwner: null,
       leaseExpiresAt: null,
       finishedAt: null,
-      params: withOrch(task.params, { generation: (orch.generation ?? 1) + 1, transient: 0, classCounts: {}, avoidProfiles: [], contractFailures: {}, recover: undefined, ...(ownerNotes ? { ownerNotes } : {}), outbox: undefined }),
+      params: withOrch(task.params, { generation: (orch.generation ?? 1) + 1, transient: 0, classCounts: {}, recover: undefined, outbox: undefined }),
       updatedAt: now,
     })
     .where(eq(tasks.id, taskId));

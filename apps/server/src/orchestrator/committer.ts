@@ -1,11 +1,10 @@
 /**
- * 唯一 committer（DESIGN §4.4、§7.7）。Owner: lane F。
+ * 唯一 committer（DESIGN §4.4、§7.7）。
  * 每仓库互斥锁 = 进程内队列 + 文件锁 $BOOK/.git/novelist.lock +（pg 时）pg_advisory_xact_lock(hash(book))。
- * promote：VALIDATED.json 已写 → 取锁 → stale check（hard 变化 → stale；只有 soft 变化 → handler.rebase）→
- *          resolveTmpIds → 写临时文件+fsync+rename → git commit（trailer）+ tag → 释放锁 → dbEffects。
- * 幂等：取锁后先按 Novelist-Task trailer 查已提交的 commit（崩溃重入、重复认领都走这条）。
- * 崩溃恢复（持锁）：git log --grep "Novelist-Task: <id>" 已提交 → 重放第 7 步；否则 reset --hard + clean，再用 VALIDATED.json 重来。
- * 根 AGENTS.md 被手改（非 Novelist 提交）→ 拒收，由 executor 发 Inbox agents_md_edit（一键迁移到 instructions/AGENTS.md）。
+ * promoteV3：一章一个提交（Novelist-Part trailer），主人在运行期间改过的文件逐个裁决（以主人为准），最后一个提交之后在同一事务里跑 db effect。
+ * 幂等：取锁后先按 trailer 查已提交的 commit（崩溃重入、重复认领都走这条）。
+ * 崩溃恢复（持锁）：已提交 → 重放 db effect；否则 reset --hard + clean，下次执行从 pending 记录重新收稿。
+ * 主人直接改文件走 commitOwnerEdit（Novelist-Owner-Edit trailer）。
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
@@ -15,29 +14,24 @@ import { parseDocument } from 'yaml';
 import { chapterId } from '@novelist/shared';
 import { books, tasks } from '../db/schema.js';
 import type { Db, Tx } from '../db/client.js';
-import type { InboxInput, PromotePlan, TaskRow, TaskSpec, Manifest } from '../pipeline/types.js';
+import type { InboxInput, PromotePlan, TaskRow } from '../runtime/types.js';
 import { NothingToCommitError, type BookRepo, type FileChange } from '../book/repo.js';
 import { P } from '../book/layout.js';
 import { TRAILER, parseTrailers } from '../book/trailers.js';
 import { gitRaw } from '../book/git.js';
 import { ignoredPaths } from '../book/harvest.js';
-import { buildTmpIdContext, resolveTmpIds } from '../state/index.js';
-import { runDbEffect, type DbEffectExtra } from '../pipeline/effects.js';
+import { runDbEffect, type DbEffectExtra } from '../runtime/effects.js';
 import { isFrozenChapter } from '../flow/contract.js';
 import { clearPending, readV3Meta } from '../flow/state.js';
 import type { V3CommitPart, V3CommitPlan } from '../flow/types.js';
-import { REBASE_VALIDATORS } from '../validators/index.js';
 import { orchOf, taskTrailerValue, withOrch } from './orch-state.js';
 
 export interface PromoteOutcome {
   status: 'committed' | 'rebased' | 'stale' | 'rejected';
   commit: string | null;
   reason?: string;
-  tmpIdMapping?: Record<string, string>;
-  /** 已存在对应 commit（崩溃重入）：dbEffects 需要重放 */
+  /** 已存在对应 commit（崩溃重入）：db effect 需要重放 */
   replay?: boolean;
-  /** rebase 不通过时 handler 提议的 followups（card.repair 等） */
-  followups?: TaskSpec[];
 }
 
 export interface PromoteMeta {
@@ -46,11 +40,6 @@ export interface PromoteMeta {
   isolation?: string;
   instructionsHash?: string;
   snapshotHash?: string;
-}
-
-export interface PromoteOptions {
-  /** soft deps 变化时在 HEAD 上重跑确定性 validators（handler.rebase） */
-  rebase?: (head: string) => Promise<{ ok: boolean; reason?: string; followups?: TaskSpec[] }>;
 }
 
 // ───────────────────────── 仓库锁 ─────────────────────────
@@ -192,159 +181,15 @@ export async function withRepoLock<T>(db: Db, bookId: string, repo: BookRepo, fn
   }
 }
 
-// ───────────────────────── promote ─────────────────────────
+// ───────────────────────── 提交后的 DB 效果 ─────────────────────────
 
-async function agentsMdTampered(repo: BookRepo): Promise<boolean> {
-  try {
-    const { items } = await repo.log({ limit: 1, path: P.agentsMd });
-    const last = items[0];
-    if (!last) return false;
-    return !Object.keys(last.trailers).some((k) => k === TRAILER.task || k === TRAILER.owner || k === TRAILER.migration);
-  } catch {
-    return false;
-  }
-}
-
-function contentString(c: FileChange['content']): string | null {
-  return c === null ? null : typeof c === 'string' ? c : c.toString('utf8');
-}
-
-/** append-only（*.jsonl）的三方合并：把 plan 相对 base 新增的行追加到 HEAD 内容之后 */
-export function mergeAppendOnly(base: string, head: string, ours: string): string {
-  const baseLines = new Set(base.split('\n').filter((l) => l.trim() !== ''));
-  const headLines = new Set(head.split('\n').filter((l) => l.trim() !== ''));
-  const add = ours.split('\n').filter((l) => l.trim() !== '' && !baseLines.has(l) && !headLines.has(l));
-  if (add.length === 0) return head;
-  return `${head.replace(/\n*$/, '')}${head.trim() ? '\n' : ''}${add.join('\n')}\n`;
-}
-
-/** 写写冲突：plan 要写的路径在 base..HEAD 之间被改过。jsonl 三方合并；其余判 stale（重跑比覆盖别人的写入安全） */
-async function resolveWriteConflicts(repo: BookRepo, plan: PromotePlan, head: string): Promise<{ files: FileChange[]; conflicts: string[] }> {
-  if (!plan.baseCommit || plan.baseCommit === head) return { files: plan.files, conflicts: [] };
-  const paths = plan.files.map((f) => f.path);
-  const [baseShas, headShas] = await Promise.all([repo.blobShas(paths, plan.baseCommit), repo.blobShas(paths, head)]);
-  const conflicts: string[] = [];
-  const files: FileChange[] = [];
-  for (const f of plan.files) {
-    if ((baseShas[f.path] ?? '') === (headShas[f.path] ?? '')) {
-      files.push(f);
-      continue;
-    }
-    const text = contentString(f.content);
-    if (text !== null && f.path.endsWith('.jsonl')) {
-      const [base, cur] = await Promise.all([repo.readFile(f.path, plan.baseCommit), repo.readFile(f.path, head)]);
-      files.push({ path: f.path, content: mergeAppendOnly(base ?? '', cur ?? '', text) });
-      continue;
-    }
-    conflicts.push(f.path);
-  }
-  return { files, conflicts };
-}
-
-/** soft deps 变化时在 HEAD（已写入本次产物）上重跑命名 validator；未知名字 = 无法校验，不静默提交 */
-async function runRebaseValidators(repo: BookRepo, names: string[], task: TaskRow, plan: PromotePlan): Promise<{ ok: true } | { ok: false; reason: string; followups: TaskSpec[] }> {
-  for (const name of names) {
-    const validator = REBASE_VALIDATORS[name];
-    if (!validator) return { ok: false, reason: `未知的 rebase validator：${name}`, followups: [] };
-    const r = await validator(repo.dir, task.target);
-    if (r.ok) continue;
-    const reason = `${name}: ${r.reason ?? '未通过'}`;
-    const stale = name === 'card.projected_pre' ? [...new Set((r.reason ?? '').match(/c\d{5}/g) ?? [])].sort() : [];
-    const followups: TaskSpec[] = stale.length ? [{ kind: 'card.repair', bookId: plan.bookId, target: stale[0] as string, params: { cards: stale, reasons: Object.fromEntries(stale.map((id) => [id, [reason]])), instance: `rebase-${task.id.slice(0, 8)}` } }] : [];
-    return { ok: false, reason, followups };
-  }
-  return { ok: true };
-}
-
-export async function promote(db: Db, repo: BookRepo, task: TaskRow, manifest: Manifest, plan: PromotePlan, meta: PromoteMeta, opts?: PromoteOptions): Promise<PromoteOutcome> {
-  const generation = orchOf(task).generation;
-  const trailerValue = taskTrailerValue(plan.taskId, generation);
-  const outcome = await withRepoLock<PromoteOutcome>(db, plan.bookId, repo, async () => {
-    const existing = await repo.findCommitByTrailer(TRAILER.task, trailerValue);
-    if (existing) {
-      // commit 成功、tag 前崩溃：幂等补打（tag -f）
-      for (const t of plan.tags) await withGitLockRetry(repo, () => repo.tag(t, existing));
-      return { status: 'committed', commit: existing, replay: true };
-    }
-    if (await agentsMdTampered(repo)) return { status: 'rejected', commit: null, reason: 'agents_md_edit' };
-    const head = await repo.head();
-    const hardNow = await repo.blobShas(Object.keys(manifest.hard), head);
-    const hardChanged = Object.keys(manifest.hard).filter((p) => (manifest.hard[p] ?? '') !== (hardNow[p] ?? ''));
-    if (hardChanged.length > 0) return { status: 'stale', commit: null, reason: `hard deps changed: ${hardChanged.join(', ')}` };
-
-    const softNow = await repo.blobShas(Object.keys(manifest.soft), head);
-    const softChanged = Object.keys(manifest.soft).filter((p) => (manifest.soft[p] ?? '') !== (softNow[p] ?? ''));
-    let rebased = false;
-    if (softChanged.length > 0 && opts?.rebase) {
-      const r = await opts.rebase(head);
-      if (!r.ok) return { status: 'rejected', commit: null, reason: r.reason ?? 'rebase validators failed', ...(r.followups?.length ? { followups: r.followups } : {}) };
-      rebased = true;
-    }
-    const validateSoft = softChanged.length > 0 && !opts?.rebase && manifest.rebaseValidators.length > 0;
-
-    const conflict = await resolveWriteConflicts(repo, plan, head);
-    if (conflict.conflicts.length > 0) return { status: 'stale', commit: null, reason: `write conflict: ${conflict.conflicts.join(', ')}` };
-
-    let files = conflict.files;
-    let tmpIdMapping: Record<string, string> | undefined;
-    if (plan.resolveTmpIds) {
-      const r = resolveTmpIds(files, await buildTmpIdContext(repo));
-      files = r.files;
-      tmpIdMapping = r.mapping;
-    }
-
-    const trailers: Record<string, string> = {
-      ...plan.trailers,
-      [TRAILER.task]: trailerValue,
-      ...(plan.runId ? { [TRAILER.run]: plan.runId } : {}),
-      ...(meta.harness ? { [TRAILER.harness]: meta.harness } : {}),
-      ...(meta.model ? { [TRAILER.model]: meta.model } : {}),
-      ...(meta.instructionsHash ? { [TRAILER.instructions]: meta.instructionsHash } : {}),
-      ...(meta.isolation ? { [TRAILER.isolation]: meta.isolation } : {}),
-      ...(meta.snapshotHash ? { [TRAILER.snapshotHash]: meta.snapshotHash } : {}),
-    };
-    let commit: string;
-    try {
-      await repo.writeFiles(files);
-      if (validateSoft) {
-        const r = await runRebaseValidators(repo, manifest.rebaseValidators, task, plan);
-        if (!r.ok) {
-          await repo.resetHard();
-          return { status: 'rejected', commit: null, reason: r.reason, ...(r.followups.length ? { followups: r.followups } : {}) };
-        }
-        rebased = true;
-      }
-      commit = await withGitLockRetry(repo, async () => {
-        try {
-          return await repo.commit({ message: plan.message, trailers, paths: files.map((f) => f.path), tags: plan.tags });
-        } catch (e) {
-          if (!(e instanceof NothingToCommitError)) throw e;
-          // 内容完全一致（崩溃重入或 no-op 重跑）：写一个空提交，保证 trailer 可查
-          return repo.commit({ message: plan.message, trailers, paths: [], tags: plan.tags, allowEmpty: true });
-        }
-      });
-    } catch (e) {
-      // 半途失败（ENOSPC、git 错误）：清掉工作树和 index，否则下一次提交会夹带这批改动
-      await repo.resetHard().catch(() => {});
-      throw e;
-    }
-    return { status: rebased ? 'rebased' : 'committed', commit, ...(tmpIdMapping ? { tmpIdMapping } : {}) };
-  });
-
-  if ((outcome.status === 'committed' || outcome.status === 'rebased') && outcome.commit) {
-    await applyDbEffects(db, plan, outcome.commit);
-  }
-  return outcome;
-}
-
-/** §7.7 第 7 步：dbEffects + books.head_commit + tasks.params._orch.effectsCommit（同一事务，exactly-once） */
-export async function applyDbEffects(db: Db, plan: { bookId: string; taskId: string; effect?: PromotePlan['effect']; dbEffects?: PromotePlan['dbEffects'] }, commit: string, extra?: DbEffectExtra): Promise<void> {
+/** §7.7 第 7 步：db effect + books.head_commit + tasks.params._orch.effectsCommit（同一事务，exactly-once） */
+export async function applyDbEffects(db: Db, plan: { bookId: string; taskId: string; effect?: PromotePlan['effect'] }, commit: string, extra?: DbEffectExtra): Promise<void> {
   await db.transaction(async (tx: Tx) => {
     const rows = await tx.select({ params: tasks.params }).from(tasks).where(eq(tasks.id, plan.taskId)).limit(1).for('update');
     const row = rows[0];
     const already = row ? orchOf(row).effectsCommit === commit : false;
     if (!already && plan.effect) await runDbEffect(tx, commit, plan.effect, extra);
-    else if (!already && plan.dbEffects) await plan.dbEffects(tx, commit);
     await tx.update(books).set({ headCommit: commit, updatedAt: new Date().toISOString() }).where(eq(books.id, plan.bookId));
     if (row && !already) await tx.update(tasks).set({ params: withOrch(row.params, { effectsCommit: commit }), updatedAt: new Date().toISOString() }).where(eq(tasks.id, plan.taskId));
   });
@@ -588,6 +433,21 @@ async function ownerCommitLocked(repo: BookRepo, input: OwnerEditInput): Promise
 export async function commitOwnerEdit(db: Db, repo: BookRepo, bookId: string, input: OwnerEditInput): Promise<{ commit: string; invalidated: string[] }> {
   const commit = await withRepoLock(db, bookId, repo, () => ownerCommitLocked(repo, input));
   return afterOwnerCommit(db, bookId, input, commit);
+}
+
+/**
+ * 同 commitOwnerEdit，但先在仓库锁里跑 guard（例如清残留 git 锁、确认工作树干净、复查书没在忙）；guard 返回 false 时什么都不写、返回 null。
+ * input 由 build 在锁里生成（读的是锁内的文件），返回 null 表示不需要提交。开机迁移 M4b 用。
+ */
+export async function commitOwnerEditIf(db: Db, repo: BookRepo, bookId: string, guard: () => Promise<boolean>, build: () => Promise<OwnerEditInput | null>): Promise<{ commit: string; invalidated: string[] } | 'refused' | 'unchanged'> {
+  const out = await withRepoLock(db, bookId, repo, async () => {
+    if (!(await guard())) return 'refused' as const;
+    const input = await build();
+    if (!input) return 'unchanged' as const;
+    return { input, commit: await ownerCommitLocked(repo, input) };
+  });
+  if (typeof out === 'string') return out;
+  return afterOwnerCommit(db, bookId, out.input, out.commit);
 }
 
 /** 主人编辑提交之后：动到硬清单的排队任务作废，记下 HEAD */

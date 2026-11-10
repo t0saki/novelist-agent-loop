@@ -86,7 +86,7 @@ describe('dropPublishedRequests', () => {
 describe('publish task re-checks waiting rewrite requests under the row lock', () => {
   it('a publish queued through-10 before a request on chapter 8 stops at 7; a manual publish still goes through', async () => {
     const { execEnv } = await import('../orchestrator/executor.js');
-    const { publish } = await import('../pipeline/handlers/system.js');
+    const { publish } = await import('../runtime/publish.js');
     const env = execEnv(t.deps);
     const b = await addV3Book(t, 'pubreq', { chapters: 10, published: 5 });
     // 入队时还没有请求（publisher 算出 through-10）；执行之前主人对第 8 章提了改写

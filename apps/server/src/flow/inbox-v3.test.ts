@@ -6,7 +6,7 @@ import { execEnv, type ExecEnv } from '../orchestrator/executor.js';
 import { actOnInbox, createInboxItem, dismissInbox } from '../orchestrator/inbox.js';
 import { enqueue } from '../orchestrator/queue.js';
 import { createOrchTestEnv, type OrchTestEnv } from '../orchestrator/testing.js';
-import type { InboxInput } from '../pipeline/types.js';
+import type { InboxInput } from '../runtime/types.js';
 import { bumpZeroDiff, resumeZeroDiffAccount } from './accounts.js';
 import { QUOTA_AWAKE_END_MS, QUOTA_INBOX_AFTER_MS, lowBufferStuck, nextQuotaStreak, reconcileV3Inbox, v3InboxAllowed, type LowBufferRow, type QuotaStreak } from './inbox-v3.js';
 import { addV3Book } from './testing-book.js';

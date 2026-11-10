@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { BookHandle, RunContext, TaskRow } from '../pipeline/types.js';
+import type { BookHandle, RunContext, TaskRow } from '../runtime/types.js';
 import { buildPromote } from './commit.js';
 import { planHarvest } from './map.js';
 import { chapterText, file, mapInput, notesFor, orderSpec } from './testing.js';

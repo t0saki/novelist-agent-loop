@@ -1,3 +1,5 @@
+> 历史文档（Novelist 2）。现行设计见 [docs/v3/DESIGN.md](../v3/DESIGN.md)。
+
 # Novelist 2.0 实现契约（IMPL）
 
 状态：骨架已建立（2026-11-08，architect 步骤）。本文件是 8 条并行 lane 之间**唯一的协调机制**。

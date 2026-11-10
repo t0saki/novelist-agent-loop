@@ -2,11 +2,19 @@
 import { and, asc, eq, isNotNull } from 'drizzle-orm';
 import JSZip from 'jszip';
 import type { AppDeps } from '../app.js';
-import { bookFiles, openRepo, type BookRepo } from '../book/index.js';
+import { promises as fs } from 'node:fs';
+import { openRepo, type BookRepo } from '../book/index.js';
 import { chapters } from '../db/schema.js';
 import type { BookRow } from '../api/helpers.js';
 import { bookDir } from '../api/helpers.js';
+import { HttpProblem } from '../api/problem.js';
 import { collectManuscripts } from './books.js';
+
+/** 书目录不在（手工移走过）：正文和导出回受控的 404 book_dir_missing；数据库里的书目、章节列表照常可读 */
+export async function assertBookDir(deps: Pick<AppDeps, 'paths'>, slug: string): Promise<void> {
+  const ok = await fs.stat(bookDir(deps, slug)).then((st) => st.isDirectory(), () => false);
+  if (!ok) throw new HttpProblem(404, 'book_dir_missing', `书目录不存在：${slug}`);
+}
 
 export interface ExportChapter {
   no: number;
@@ -108,18 +116,20 @@ export function buildTxt(book: ExportBook): string {
 
 /** 读者端：published=true 只含已发布；管理端 ?scope=accepted 含全部已验收。vol 限定单卷。 */
 export async function collectExport(deps: AppDeps, book: BookRow, opts: { published: boolean; volume?: string | undefined; author: string; blurb: string; cover?: Buffer | undefined }): Promise<ExportBook> {
+  await assertBookDir(deps, book.slug);
   const repo: BookRepo = openRepo(bookDir(deps, book.slug));
   const where = opts.published ? and(eq(chapters.bookId, book.id), isNotNull(chapters.publishedAt)) : and(eq(chapters.bookId, book.id), eq(chapters.state, 'accepted'));
-  const rows = await deps.db.select({ no: chapters.no, title: chapters.title, volume: chapters.volume }).from(chapters).where(where).orderBy(asc(chapters.no));
+  const rows = await deps.db.select({ no: chapters.no, title: chapters.title, volume: chapters.volume, volumeTitle: chapters.volumeTitle }).from(chapters).where(where).orderBy(asc(chapters.no));
   const selected = opts.volume ? rows.filter((r) => r.volume === opts.volume) : rows;
-  const volumes = await bookFiles(repo).volumes().catch(() => []);
-  const titles = new Map(volumes.map((v) => [v.id, v.title]));
+  // 卷标题来自 chapters.volume_title（没有就用卷 id）
+  const titleOf = (r: { volume: string; volumeTitle: string }): string => r.volumeTitle || r.volume;
   const texts = await collectManuscripts(repo, selected.map((r) => r.no));
   const chaptersOut: ExportChapter[] = [];
   for (const r of selected) {
     const text = texts.get(r.no);
     if (text === undefined) continue;
-    chaptersOut.push({ no: r.no, title: r.title || `第${r.no}章`, volumeTitle: titles.get(r.volume) ?? r.volume, text });
+    chaptersOut.push({ no: r.no, title: r.title || `第${r.no}章`, volumeTitle: titleOf(r), text });
   }
-  return { slug: book.slug, title: opts.volume ? `${book.title} ${titles.get(opts.volume) ?? opts.volume}` : book.title, author: opts.author, blurb: opts.blurb, chapters: chaptersOut, ...(opts.cover ? { cover: opts.cover } : {}) };
+  const volTitle = opts.volume ? (selected[0] ? titleOf(selected[0]) : opts.volume) : '';
+  return { slug: book.slug, title: opts.volume ? `${book.title} ${volTitle}` : book.title, author: opts.author, blurb: opts.blurb, chapters: chaptersOut, ...(opts.cover ? { cover: opts.cover } : {}) };
 }

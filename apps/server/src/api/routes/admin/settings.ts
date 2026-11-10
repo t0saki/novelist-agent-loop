@@ -1,44 +1,26 @@
 /** /api/admin/settings、system、doctor、events（契约见 @novelist/shared ROUTES）。Owner: lane G。 */
-import { eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
-import type { DoctorReport, Ok, SseEvent, SystemInfo, SystemSettings } from '@novelist/shared';
-import { zChangeAdminPassword, zPutSettings, zSystemSettings } from '@novelist/shared';
+import type { DoctorReport, Ok, SseEvent, SystemInfo, SystemSettingsView } from '@novelist/shared';
+import { zChangeAdminPassword } from '@novelist/shared';
 import type { AppDeps } from '../../../app.js';
-import { routingPresets, settings } from '../../../db/schema.js';
 import { loadSystemSettings } from '../../../orchestrator/index.js';
 import { runDoctor } from '../../../services/doctor.js';
+import { putSettings, readSettingsView } from '../../../services/settings.js';
 import { changeAdminPassword } from '../../auth.js';
-import { audit, parseBody, parsePatch } from '../../helpers.js';
-import { badRequest } from '../../problem.js';
+import { audit, parseBody } from '../../helpers.js';
 import { openSse } from '../../sse.js';
 
 /** 全局流默认不含高频事件（run_event/login_output 走各自的 stream），?verbose=1 全量 */
 const HIGH_VOLUME: ReadonlySet<SseEvent['type']> = new Set(['run_event', 'login_output']);
 
 export async function register(app: FastifyInstance, deps: AppDeps): Promise<void> {
-  app.get('/api/admin/settings', async (): Promise<SystemSettings> => loadSystemSettings(deps.db));
+  app.get('/api/admin/settings', async (): Promise<SystemSettingsView> => readSettingsView(deps));
 
-  app.put('/api/admin/settings', async (req): Promise<SystemSettings> => {
-    // 失控兜底倍数：0（关闭）或 ≥ 2（schema 只是把旧值抬到 2，新保存的直接拒收）
-    const rawFactor = (req.body as { v3?: { runawayFactor?: unknown } } | null)?.v3?.runawayFactor;
-    if (typeof rawFactor === 'number' && rawFactor > 0 && rawFactor < 2) throw badRequest('失控兜底倍数要么是 0（关闭），要么不小于 2', 'invalid_runaway_factor');
-    const patch = parsePatch(zPutSettings, req.body);
-    const current = await loadSystemSettings(deps.db);
-    const next = zSystemSettings.parse({ ...current, ...patch });
-    // 自动开书的篇幅分布：四档按本数的百分比，必须加起来是 100（schema 上不能 refine，否则 zPutSettings = partial() 会坏）
-    const mix = next.autoStart.lengthMix;
-    if (Math.abs(mix.short + mix.medium + mix.long + mix.epic - 100) > 1e-9) throw badRequest('篇幅分布四档加起来要等于 100', 'invalid_length_mix');
-    if (next.activePreset !== current.activePreset) {
-      const exists = await deps.db.select({ id: routingPresets.id }).from(routingPresets).where(eq(routingPresets.id, next.activePreset)).limit(1);
-      if (!exists[0]) throw badRequest(`preset ${next.activePreset} 不存在`);
-      const nowIso = new Date().toISOString();
-      const value = { presetId: next.activePreset, overrides: {} };
-      await deps.db.insert(settings).values({ key: 'routing.active', value, updatedAt: nowIso }).onConflictDoUpdate({ target: settings.key, set: { value, updatedAt: nowIso } });
-    }
-    const nowIso = new Date().toISOString();
-    await deps.db.insert(settings).values({ key: 'system', value: next, updatedAt: nowIso }).onConflictDoUpdate({ target: settings.key, set: { value: next, updatedAt: nowIso } });
-    await audit(deps, req, 'settings.update', 'system', { fields: Object.keys(patch) });
-    return next;
+  // 按节合并 + baseUpdatedAt（services/settings.ts）；activePreset 只剩旧设置页在发：不再读、不再镜像到 routing.active
+  app.put('/api/admin/settings', async (req): Promise<SystemSettingsView> => {
+    const { view, fields } = await putSettings(deps, req.body);
+    await audit(deps, req, 'settings.update', 'system', { fields });
+    return view;
   });
 
   app.put('/api/admin/settings/admin-password', async (req): Promise<Ok> => {

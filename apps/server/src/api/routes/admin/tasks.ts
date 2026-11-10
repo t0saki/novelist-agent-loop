@@ -1,7 +1,7 @@
 /** /api/admin/tasks*（契约见 @novelist/shared ROUTES）。Owner: lane G。 */
 import { and, desc, eq, lt, or, type SQL } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
-import type { ErrorClass, Ok, Page, TaskKind, TaskRow, TaskState } from '@novelist/shared';
+import type { ErrorClass, Ok, Page, TaskRow, TaskState } from '@novelist/shared';
 import { zPageQuery } from '@novelist/shared';
 import type { AppDeps } from '../../../app.js';
 import { books, tasks } from '../../../db/schema.js';
@@ -29,10 +29,9 @@ export async function register(app: FastifyInstance, deps: AppDeps): Promise<voi
     const items: TaskRow[] = rows.slice(0, q.limit).map((t) => ({
       id: t.id,
       bookSlug: t.bookId ? (slugs.get(t.bookId) ?? null) : null,
-      kind: t.kind as TaskKind,
+      kind: t.kind,
       target: t.target,
       lane: t.lane,
-      tier: t.tier,
       state: t.state as TaskState,
       priority: t.priority,
       attempts: t.attempts,

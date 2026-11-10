@@ -4,6 +4,7 @@ import { zPatchAccount } from '@novelist/shared';
 import { accountPatch } from '../src/lib/accounts';
 import { invalidationsFor } from '../src/lib/invalidation';
 import { buildAlerts } from '../src/lib/alerts';
+import { inboxKind, roleLabel, taskKindLabel } from '../src/lib/labels';
 import { stripAnsi } from '../src/lib/ansi';
 import { fmtCjk, fmtRel, toRatio } from '../src/lib/format';
 import { parseChapterNo } from '../src/lib/chapterId';
@@ -168,6 +169,12 @@ describe('accountPatch', () => {
     expect(parsed).toMatchObject({ label: '主号', plan: 'max', enabled: false, concurrency: 3, reservePct: 10, customModels: ['m1'], notes: '备注', riskAck: ['a', 'b'] });
     expect(parsed.windows).toHaveLength(1);
   });
+
+  it('carries the removed reservation fields through unchanged (not editable, not reset to the default)', () => {
+    const a = { id: 'x', harness: 'codex', authMode: 'api_key', label: '主号', plan: 'max', enabled: true, files: [], customModels: [], concurrency: 1, reservePct: 10, maxWeeklyUtilPct: 70, windows: [], riskAck: [], notes: '', env: [], state: null, riskNotes: [] } as never;
+    const parsed = zPatchAccount.parse(accountPatch(a, { label: '改名' }));
+    expect(parsed).toMatchObject({ label: '改名', reservePct: 10, maxWeeklyUtilPct: 70 });
+  });
 });
 
 describe('sse invalidation', () => {
@@ -179,13 +186,28 @@ describe('sse invalidation', () => {
 });
 
 describe('alerts', () => {
-  it('orders severe alerts first and flags low buffers', () => {
+  it('flags low buffers and sleeping accounts; legacy books and harness state never alert', () => {
     const alerts = buildAlerts({
-      books: [{ slug: 'a', title: 'A', status: 'active', frontiers: { bufferDays: 1 }, waiting: null } as never],
-      harness: [{ id: 'codex', displayName: 'Codex', circuit: { state: 'open', reason: 'canary', effectiveAt: null } } as never],
+      books: [
+        { slug: 'a', title: 'A', status: 'active', legacy: false, frontiers: { bufferDays: 1 }, waiting: null } as never,
+        { slug: 'old', title: '旧', status: 'active', legacy: true, frontiers: { bufferDays: 0 }, waiting: null } as never,
+      ],
+      quota: [{ accountId: 'acc', sleepUntil: '2026-11-11T10:00:00Z', sleepReason: null, windows: [] } as never],
     });
-    expect(alerts[0]).toMatchObject({ tone: 'danger', to: '/admin/harness' });
-    expect(alerts[1]?.text).toContain('存稿仅够 1.0 天');
+    expect(alerts.map((x) => x.id).sort()).toEqual(['b-a', 's-acc']);
+    expect(alerts.find((x) => x.id === 'b-a')?.text).toContain('存稿仅够 1.0 天');
+    expect(alerts.find((x) => x.id === 's-acc')?.to).toBe('/admin/models');
+  });
+});
+
+describe('labels', () => {
+  it('fall back to the raw string for removed roles, kinds and inbox kinds', () => {
+    expect(roleLabel('writer')).toBe('主笔');
+    expect(roleLabel('extractor_v9')).toBe('extractor_v9');
+    expect(taskKindLabel('book.write')).toBe('写作');
+    expect(taskKindLabel('chapter.extract')).toBe('chapter.extract');
+    expect(inboxKind('auth').label).toBe('认证失效');
+    expect(inboxKind('gone_kind')).toEqual({ label: 'gone_kind', tone: 'neutral' });
   });
 });
 

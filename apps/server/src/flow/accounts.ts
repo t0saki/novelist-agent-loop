@@ -6,7 +6,7 @@
 import { eq, sql } from 'drizzle-orm';
 import type { Db } from '../db/client.js';
 import { accountsState, settings } from '../db/schema.js';
-import type { InboxInput } from '../pipeline/types.js';
+import type { InboxInput } from '../runtime/types.js';
 
 /** backstop only; the inbox "恢复" action is the normal way out */
 export const ZERO_DIFF_PAUSE_MS = 7 * 24 * 3600_000;

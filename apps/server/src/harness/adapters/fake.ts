@@ -1,14 +1,8 @@
 /**
- * 通用 fake adapter（DESIGN §3.5 fake、§10.4 第 3 条）。Owner: lane A。
+ * 通用 fake adapter（DESIGN §10 测试用的假 harness）。
  * - 可执行文件：harness/fake/fake-harness.ts（node 直接跑，或经 tsx）。
- * - 行为：读 workOrderFile 的 frontmatter（nv.workorder/1），按 artifacts 声明在 out_dir 写出“看起来合法”的产物：
- *   chapter_draft → 带 beat 标记、长度落在 length 区间的中文填充；check/delta → 最小合法 nv.check/1（ev 取自草稿逐字）；
- *   receipt → nv.receipt/1，nonces 取自 systemFile 中所有 NV-*-HEAD/TAIL-* 串；其他 kind → schema 最小合法样例。
- * - 场景注入（frontmatter.fake 或 $RUN/in/fake.json）：{ fail?: ErrorClass, exitCode?, sleepMs?, dripMs?, skipArtifacts?: string[],
- *   dropTailNonce?: string, writeOutside?: string, readRunIn?: boolean, ignoreSigterm?: boolean, malformedJson?: boolean,
- *   rateLimit?: {window, utilization, resetsAt} } —— 用于 chaos/故障注入测试。
- *   另有：noResult（无终止事件 → drift）、failAfterWrite、extraFile、draftChars、verdict、content{path:内容}、expand{glob:[ids]}、
- *   start、volume、arc、chapters、genre、title（见 fake/fake-harness.ts 的 FakeScenario）。
+ * - 行为：“目录模式”——读 cwd（书快照）下的 ORDER.md，照任务单在书目录里写文件；故障开关见 fake-harness.ts 的 dirMain / $RUN/in/fake.json。
+ *   ORDER.md 是目录探测（canary）时只写 canary.txt。
  * - stdout：每行一个已经是 NEvent 形状的 JSON（{t:'init'…}…{t:'result'}），parser 只需补 seq/ts/runId。
  * 认证：none。另提供 subscription_login 的演示登录（fake-harness --login），供登录 UI 的 e2e 测试。
  */
@@ -98,21 +92,13 @@ export const fakeAdapter: HarnessAdapter = {
   async prepareHome(acct): Promise<HomeLayout> {
     return { home: acct.home, configFiles: [], stateDirs: [], env: { HOME: acct.home } };
   },
-  async materialize(spec, compiled) {
-    // v3：指令只在工作区 AGENTS.md，不传 --system
-    if (spec.contract === 'v3') return { files: [], argv: [], env: {}, budget: { ok: true, bytes: 0, limit: null }, notes: [] };
-    return { files: [], argv: ['--system', spec.systemFile], env: {}, budget: { ok: true, bytes: compiled.bytes, limit: null }, notes: [] };
-  },
-  buildInvocation(spec, _caps, home, mat, acct, inst) {
-    // v3 “目录模式”：读 cwd 下的 ORDER.md，直接在书目录里写文件（fake-harness.ts dirMain）
-    const argv =
-      spec.contract === 'v3'
-        ? [inst.binPath, fakeScriptPath(), '--v3', '--launch', spec.workOrderFile, '--model', spec.model, '--session', spec.session.id || spec.runId]
-        : [inst.binPath, fakeScriptPath(), '--workorder', spec.workOrderFile, ...mat.argv, '--model', spec.model, '--session', spec.session.id || spec.runId];
+  buildInvocation(spec, _caps, home, acct, inst) {
+    // “目录模式”：读 cwd 下的 ORDER.md，直接在书目录里写文件（fake-harness.ts dirMain）
+    const argv = [inst.binPath, fakeScriptPath(), '--v3', '--launch', spec.workOrderFile, '--model', spec.model, '--session', spec.session.id || spec.runId];
     const scenario = path.join(spec.inDir, 'fake.json');
     if (existsSync(scenario)) argv.push('--scenario', scenario);
     argv.push(...filterExtraArgs(spec.extraArgs, []));
-    const env = buildEnv(spec, inst, acct.secretEnv, home.env, mat.env);
+    const env = buildEnv(spec, inst, acct.secretEnv, home.env);
     return invocation(spec, argv, env, 'devnull', [
       { signal: 'SIGINT', graceMs: 1000 },
       { signal: 'SIGTERM', graceMs: 1000 },

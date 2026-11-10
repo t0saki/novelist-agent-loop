@@ -8,6 +8,7 @@ import { books, runs, tasks } from '../db/schema.js';
 import { readV3Meta } from '../flow/state.js';
 import { createBook } from '../services/books.js';
 import { createTestApp, TEST_ADMIN_PASSWORD, type TestApp } from '../testing.js';
+import { createLegacyBook } from '../book/testing-legacy.js';
 import { bookDir } from './helpers.js';
 
 let t: TestApp;
@@ -15,7 +16,7 @@ let cookie: string;
 
 const admin = (method: 'GET' | 'PUT', url: string, payload?: unknown) => t.app.inject({ method, url, headers: { cookie }, ...(payload === undefined ? {} : { payload: payload as object }) });
 const rowOf = async (slug: string) => (await t.deps.db.select().from(books).where(eq(books.slug, slug)))[0]!;
-const yamlOf = async (slug: string) => yamlParse((await openRepo(bookDir(t.deps, slug)).readFile(P.bookYaml)) as string) as { v3: Record<string, unknown>; publish: Record<string, unknown> };
+const yamlOf = async (slug: string) => yamlParse((await openRepo(bookDir(t.deps, slug)).readFile(P.bookYaml)) as string) as { v3: Record<string, unknown>; publish: Record<string, unknown>; routing?: Record<string, unknown>; budgets?: Record<string, unknown> };
 const view = async (slug: string): Promise<V3BookView> => {
   const res = await admin('GET', `/api/admin/books/${slug}/v3`);
   expect(res.statusCode, res.body).toBe(200);
@@ -27,10 +28,10 @@ beforeAll(async () => {
   const r = await t.app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: TEST_ADMIN_PASSWORD } });
   cookie = String(r.headers['set-cookie'] ?? '').split(';')[0] ?? '';
   await createBook(t.deps, { title: '新书', slug: 'fresh', genre: 'xianxia', flow: 'v3', v3: { length: 'medium' }, start: false });
-  await createBook(t.deps, { title: '旧流程', slug: 'old-v2', genre: 'xianxia', start: false });
+  await createLegacyBook(t.deps.db, t.deps.paths, 'old-v2', { title: '旧流程' });
   // 跑两批（开书 1–5、写作 6–10）的中篇
   await createBook(t.deps, { title: '两批', slug: 'two', genre: 'xianxia', flow: 'v3', v3: { length: 'medium', batch: 5, min_chapter_cjk: 500 }, start: false });
-  await t.deps.orchestrator.startBook((await rowOf('two')).id, { interview: false });
+  await t.deps.orchestrator.startBook((await rowOf('two')).id);
   for (let i = 0; i < 2; i += 1) {
     for (const task of await t.deps.db.select().from(tasks)) {
       if (task.state === 'waiting') await t.deps.db.update(tasks).set({ notBefore: new Date(Date.now() - 1000).toISOString() }).where(eq(tasks.id, task.id));
@@ -80,8 +81,10 @@ describe('GET /api/admin/books/:slug/v3', () => {
       target_cjk: y.v3.target_cjk,
       min_chapter_cjk: 3000,
       batch: 5,
-      effort: { open: 'medium', write: 'medium', finale: 'high', retro: 'medium' },
+      effort: { open: 'medium', write: 'medium', closing: 'high', finale: 'high', retro: 'medium' },
       publish: { mode: y.publish.mode, cadence: y.publish.cadence, timezone: y.publish.timezone, per_slot: y.publish.per_slot, max_buffer: y.publish.max_buffer },
+      writer_profile: null,
+      budgets: { priority: 0, monthly_usd_cap: null, max_window_util_pct: null },
     });
     for (const f of v.story) expect(f).toMatchObject({ path: expect.any(String), size: expect.any(Number), over: false });
   });
@@ -131,14 +134,15 @@ describe('GET /api/admin/books/:slug/v3', () => {
 });
 
 describe('GET /api/admin/books', () => {
-  it('BookSummary.flow and v3 (sentence, cost); v2 book v3 null', async () => {
-    const list = (await admin('GET', '/api/admin/books')).json() as BookSummary[];
+  it('BookSummary.flow and v3 (sentence, cost); legacy book: flow v2, v3 null, legacy true', async () => {
+    const list = (await admin('GET', '/api/admin/books?filter=all')).json() as BookSummary[];
     const two = list.find((b) => b.slug === 'two')!;
     expect(two.flow).toBe('v3');
     expect(two.v3).toMatchObject({ length: 'medium', targetCjk: 60_000, plannedChapters: 15, status: { kind: expect.any(String), sentence: expect.any(String) }, cost: { runs: 2 } });
     expect(two.v3!.cost.outputTokens).toBeGreaterThan(0);
     expect(list.find((b) => b.slug === 'fresh')).toMatchObject({ flow: 'v3', v3: { status: { kind: 'draft', sentence: '还没开始' } } });
-    expect(list.find((b) => b.slug === 'old-v2')).toMatchObject({ flow: 'v2', v3: null });
+    expect(list.find((b) => b.slug === 'old-v2')).toMatchObject({ flow: 'v2', v3: null, legacy: true });
+    expect(two.legacy).toBe(false);
   });
 });
 
@@ -164,6 +168,51 @@ describe('PUT /api/admin/books/:slug/v3/settings', () => {
     expect(res.json().code).toBe('invalid_publish');
     expect(await yamlOf('fresh')).toEqual(before);
     expect((await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, batch: 9 })).statusCode).toBe(400);
+  });
+
+  it('closing effort: shown as finale when book.yaml has none; written once it differs', async () => {
+    const s = await base('fresh');
+    expect(s.effort.closing).toBe(s.effort.finale);
+    let res = await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, effort: { ...s.effort, closing: 'medium' } });
+    expect(res.statusCode, res.body).toBe(200);
+    expect((res.json() as V3BookView).settings.effort.closing).toBe('medium');
+    expect((await yamlOf('fresh')).v3).toMatchObject({ effort: { closing: 'medium', finale: 'high' } });
+    res = await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, effort: { ...s.effort, closing: 'high' } });
+    expect((res.json() as V3BookView).settings.effort.closing).toBe('high');
+  });
+
+  it('writer override: an existing profile is written to routing.writer_profile, an unknown one → 400, null deletes the key', async () => {
+    const s = await base('fresh');
+    const profiles = (await admin('GET', '/api/admin/profiles')).json() as { id: string }[];
+    const pick = profiles[0]!.id;
+    let res = await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, writer_profile: pick });
+    expect(res.statusCode, res.body).toBe(200);
+    expect((res.json() as V3BookView).settings.writer_profile).toBe(pick);
+    expect((await yamlOf('fresh')).routing).toMatchObject({ writer_profile: pick });
+    res = await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, writer_profile: 'no-such-profile' });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe('unknown_profile');
+    expect((await yamlOf('fresh')).routing).toMatchObject({ writer_profile: pick });
+    res = await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, writer_profile: null });
+    expect(res.statusCode).toBe(200);
+    expect((await yamlOf('fresh')).routing?.writer_profile).toBeUndefined();
+    expect((res.json() as V3BookView).settings.writer_profile).toBeNull();
+  });
+
+  it('book budgets round trip: priority mirrors to books.priority, null deletes the cap keys', async () => {
+    const s = await base('fresh');
+    let res = await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, budgets: { priority: 7, monthly_usd_cap: 12.5, max_window_util_pct: 40 } });
+    expect(res.statusCode, res.body).toBe(200);
+    expect((res.json() as V3BookView).settings.budgets).toEqual({ priority: 7, monthly_usd_cap: 12.5, max_window_util_pct: 40 });
+    expect((await yamlOf('fresh')).budgets).toMatchObject({ priority: 7, monthly_usd_cap: 12.5, max_window_util_pct: 40 });
+    expect((await rowOf('fresh')).priority).toBe(7);
+    res = await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, budgets: { priority: 0, monthly_usd_cap: null, max_window_util_pct: null } });
+    expect(res.statusCode).toBe(200);
+    const b = (await yamlOf('fresh')).budgets ?? {};
+    expect('monthly_usd_cap' in b).toBe(false);
+    expect('max_window_util_pct' in b).toBe(false);
+    expect((await rowOf('fresh')).priority).toBe(0);
+    expect((await admin('PUT', '/api/admin/books/fresh/v3/settings', { ...s, budgets: { priority: 0, monthly_usd_cap: -1, max_window_util_pct: null } })).statusCode).toBe(400);
   });
 
   it('a target change recomputes the planned chapters and resets runawayBatches', async () => {

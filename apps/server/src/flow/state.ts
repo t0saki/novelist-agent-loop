@@ -32,6 +32,7 @@ export function emptyV3Meta(): V3BookMeta {
     ownerMessage: null,
     ownerMessages: [],
     ownerRequests: [],
+    takeover: null,
   };
 }
 
@@ -146,7 +147,16 @@ export function readV3Meta(meta: unknown): V3BookMeta {
     ownerMessage: readOwnerMessage(raw.ownerMessage),
     ownerMessages: Array.isArray(raw.ownerMessages) ? raw.ownerMessages.map(readOwnerMessage).filter((m): m is V3OwnerMessageMeta => m !== null) : [],
     ownerRequests: readOwnerRequests(raw.ownerRequests),
+    takeover: readTakeover(raw.takeover),
+    ...(raw.writeNow === true ? { writeNow: true } : {}),
   };
+}
+
+function readTakeover(v: unknown): V3BookMeta['takeover'] {
+  if (!v || typeof v !== 'object') return null;
+  const t = v as Record<string, unknown>;
+  if (typeof t.from !== 'number' || !Number.isInteger(t.from) || t.from < 1) return null;
+  return { at: typeof t.at === 'string' ? t.at : '', from: t.from, status: t.status === 'done' ? 'done' : 'pending' };
 }
 
 /** meta.v3 合并一个对象（meta.v3 不存在时先建空对象）：jsonb_set(meta,'{v3}', coalesce(meta->'v3','{}') || patch) */
@@ -241,12 +251,15 @@ export async function markRetro(db: Db, bookId: string, r: { status: 'done' | 'f
 /**
  * meta.v3 的读-改-写（主人的操作用）：一个事务里 select … for update 锁住书行，fn 返回要合并进 meta.v3 的字段（null = 不写）。
  * 与 'v3.batch' 效果同一把行锁，所以不会和收稿互相覆盖。返回 fn 的第二个结果。
+ * 旧书（meta.v3 不是对象，P3 D1）什么都不写：主人的操作不能顺手把旧书变成没有接手标记的 v3 书（只有开书、接手、开机补 meta 会建 meta.v3）。
  */
 export async function patchV3Meta<R>(db: Db | Tx, bookId: string, fn: (meta: V3BookMeta, row: typeof books.$inferSelect) => { patch: Partial<V3BookMeta> | null; result: R }): Promise<R> {
   const run = async (tx: Tx | Db): Promise<R> => {
     const row = (await tx.select().from(books).where(eq(books.id, bookId)).limit(1).for('update'))[0];
     if (!row) throw new Error(`书不存在：${bookId}`);
     const { patch, result } = fn(readV3Meta(row.meta), row);
+    const v3 = (row.meta as { v3?: unknown } | null)?.v3;
+    if (!v3 || typeof v3 !== 'object' || Array.isArray(v3)) return result;
     if (patch) await tx.update(books).set({ meta: v3Merge(sql`${JSON.stringify(patch)}::jsonb`) }).where(eq(books.id, bookId));
     return result;
   };

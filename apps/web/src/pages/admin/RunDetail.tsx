@@ -108,7 +108,7 @@ export function RunDetailPage({ id }: { id: string }) {
   const usage = useMemo(() => totalUsage(events), [events]);
 
   async function confirmKill() {
-    if (await confirmDialog({ title: '终止这个 run？', body: '任务会按错误处理重新调度或进入 Inbox。', danger: true, okText: '终止' })) kill.mutate();
+    if (await confirmDialog({ title: '终止这个 run？', body: '任务会按错误处理重新调度，或者进待办。', danger: true, okText: '终止' })) kill.mutate();
   }
 
   return (
@@ -301,34 +301,6 @@ function RunInfo({ run }: { run: RunDetail }) {
               <Pre>{run.argvPreview.join(' \\\n  ')}</Pre>
             </Details>
           </div>
-        )}
-      </Card>
-      <Card title="指令 nonce 回显">
-        {run.nonceReport && run.nonceReport.length > 0 ? (
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th>层</th>
-                <th>头</th>
-                <th>尾</th>
-              </tr>
-            </thead>
-            <tbody>
-              {run.nonceReport.map((n) => (
-                <tr key={n.layer}>
-                  <td>{n.layer}</td>
-                  <td>
-                    <Badge tone={n.head ? 'ok' : 'danger'}>{n.head ? '有' : '缺失'}</Badge>
-                  </td>
-                  <td>
-                    <Badge tone={n.tail ? 'ok' : 'danger'}>{n.tail ? '有' : '缺失'}</Badge>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        ) : (
-          <Empty>暂无 nonce 报告。</Empty>
         )}
       </Card>
       {run.outcome && (

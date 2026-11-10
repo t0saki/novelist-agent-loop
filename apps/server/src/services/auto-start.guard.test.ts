@@ -11,6 +11,11 @@ import { zSystemSettings } from '@novelist/shared';
 const SELF = fileURLToPath(import.meta.url);
 const SERVER = path.resolve(path.dirname(SELF), '../..');
 const PATTERN = /autoStart[^\n]{0,80}enabled:\s*true/;
+/**
+ * 例外（P3 WP-3）：控制台流程测试要验证“开关”这一个请求能打开、也能关上（在它自己的临时安装里，同一个用例里立刻关回去）。
+ * 例外文件必须在同一个文件里把它关回去，并断言最后读回来是 false。
+ */
+const TOGGLE_ROUND_TRIP = new Set(['src/api/console.flows.test.ts']);
 
 async function testFiles(dir: string, out: string[] = []): Promise<string[]> {
   for (const e of await fs.readdir(dir, { withFileTypes: true }).catch(() => [])) {
@@ -34,7 +39,10 @@ describe('auto-start stays disabled by default', () => {
     const offenders: string[] = [];
     for (const f of files) {
       const text = await fs.readFile(f, 'utf8');
-      if (PATTERN.test(text)) offenders.push(path.relative(SERVER, f));
+      const rel = path.relative(SERVER, f);
+      if (!PATTERN.test(text)) continue;
+      if (TOGGLE_ROUND_TRIP.has(rel) && /autoStart: \{ enabled: false \}/.test(text) && /autoStart\.enabled\)\.toBe\(false\)/.test(text)) continue;
+      offenders.push(rel);
     }
     expect(offenders).toEqual([]);
   });

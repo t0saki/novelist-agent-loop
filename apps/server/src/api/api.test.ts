@@ -4,8 +4,9 @@ import { eq } from 'drizzle-orm';
 import JSZip from 'jszip';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ROUTES } from '@novelist/shared';
-import { createFixtureBook, openRepo } from '../book/index.js';
-import { books, chapters, secrets } from '../db/schema.js';
+import { openRepo, TRASH_TOMBSTONE } from '../book/index.js';
+import { createLegacyBook } from '../book/testing-legacy.js';
+import { books, chapters, profiles, secrets, settings, tasks } from '../db/schema.js';
 import { reindexBook } from '../services/books.js';
 import { createTestApp, TEST_ADMIN_PASSWORD, type TestApp } from '../testing.js';
 
@@ -122,25 +123,27 @@ describe('books and files', () => {
     expect(res.json().code).toBe('unknown_genre');
   });
 
-  it('creates, reads and edits a book through git', async () => {
-    const res = await admin('POST', '/api/admin/books', { title: '测试之书', slug: 'book-a', genre: 'xianxia', seed: '一个种子', tier: 'lite', start: false });
+  it('creates (always a v3 book), reads and edits a book through git', async () => {
+    // 旧请求里的 tier / flow 不再起作用：新书一律是 v3
+    const res = await admin('POST', '/api/admin/books', { title: '测试之书', slug: 'book-a', genre: 'xianxia', seed: '一个种子', tier: 'standard', start: false });
     expect(res.statusCode).toBe(201);
-    expect(res.json().tier).toBe('lite');
-    expect(res.json().status).toBe('draft');
+    expect(res.json()).toMatchObject({ status: 'draft', flow: 'v3', legacy: false });
 
     const overview = await admin('GET', '/api/admin/books/book-a');
     expect(overview.statusCode).toBe(200);
     expect(overview.json().config.title).toBe('测试之书');
+    expect(overview.json().config.flow).toBe('v3');
+    expect(overview.json().dirMissing).toBe(false);
 
-    const premise = (await admin('GET', '/api/admin/books/book-a/file?path=bible/premise.md')).json();
+    const premise = (await admin('GET', '/api/admin/books/book-a/file?path=seed.md')).json();
     expect(premise.content).toBe('一个种子');
 
-    const saved = await admin('PUT', '/api/admin/books/book-a/file', { path: 'bible/premise.md', content: '新种子', baseSha: premise.sha });
+    const saved = await admin('PUT', '/api/admin/books/book-a/file', { path: 'seed.md', content: '新种子', baseSha: premise.sha });
     expect(saved.statusCode).toBe(200);
     expect(saved.json().content).toBe('新种子');
     expect(saved.json().sha).not.toBe(premise.sha);
 
-    const stale = await admin('PUT', '/api/admin/books/book-a/file', { path: 'bible/premise.md', content: 'x', baseSha: premise.sha });
+    const stale = await admin('PUT', '/api/admin/books/book-a/file', { path: 'seed.md', content: 'x', baseSha: premise.sha });
     expect(stale.statusCode).toBe(409);
     expect(stale.json().code).toBe('stale_base');
 
@@ -156,43 +159,44 @@ describe('books and files', () => {
     expect(r.json().code).toBe('generated_path');
   });
 
-  it('validates book.yaml edits and refuses slug changes', async () => {
-    const doc = (await admin('GET', '/api/admin/books/book-a/config')).json();
-    expect(doc.errors).toEqual([]);
-    const bad = await admin('PUT', '/api/admin/books/book-a/config', { raw: 'title: 123\n', baseSha: doc.sha });
+  it('validates book.yaml edits (through the file editor) and refuses slug changes', async () => {
+    const doc = (await admin('GET', '/api/admin/books/book-a/file?path=book.yaml')).json();
+    const bad = await admin('PUT', '/api/admin/books/book-a/file', { path: 'book.yaml', content: 'title: 123\n', baseSha: doc.sha });
     expect(bad.statusCode).toBe(422);
-    const renamed = await admin('PUT', '/api/admin/books/book-a/config', { raw: doc.raw.replace('slug: book-a', 'slug: other'), baseSha: doc.sha });
+    const renamed = await admin('PUT', '/api/admin/books/book-a/file', { path: 'book.yaml', content: doc.content.replace('slug: book-a', 'slug: other'), baseSha: doc.sha });
     expect(renamed.statusCode).toBe(400);
-    const ok = await admin('PUT', '/api/admin/books/book-a/config', { raw: doc.raw.replace('测试之书', '改名之书'), baseSha: doc.sha });
+    const ok = await admin('PUT', '/api/admin/books/book-a/file', { path: 'book.yaml', content: doc.content.replace('测试之书', '改名之书'), baseSha: doc.sha });
     expect(ok.statusCode).toBe(200);
-    expect((await admin('GET', '/api/admin/books')).json().find((b: { slug: string }) => b.slug === 'book-a').title).toBe('改名之书');
+    expect((await admin('GET', '/api/admin/books?filter=all')).json().find((b: { slug: string }) => b.slug === 'book-a').title).toBe('改名之书');
   });
 
-  it('publish config writes back to book.yaml', async () => {
-    const before = (await admin('GET', '/api/admin/books/book-a/publish')).json();
-    expect(before.config.mode).toBe('scheduled');
-    const res = await admin('PUT', '/api/admin/books/book-a/publish', { max_buffer: 80 });
-    expect((await admin('PUT', '/api/admin/books/book-a/publish', { max_buffer: 80 })).statusCode).toBe(200); // 无改动的重复保存不能 500
-    expect(res.statusCode).toBe(200);
-    expect(res.json().config.max_buffer).toBe(80);
-    const doc = (await admin('GET', '/api/admin/books/book-a/config')).json();
-    expect(doc.parsed.publish.max_buffer).toBe(80);
+  it('the raw book.yaml editor, the old publish page routes and the schedule page are gone (P3 WP-3)', async () => {
+    expect((await admin('GET', '/api/admin/books/book-a/config')).statusCode).toBe(404);
+    expect((await admin('PUT', '/api/admin/books/book-a/config', { raw: 'x', baseSha: 'y' })).statusCode).toBe(404);
+    expect((await admin('GET', '/api/admin/books/book-a/publish')).statusCode).toBe(404);
+    expect((await admin('PUT', '/api/admin/books/book-a/publish', { max_buffer: 80 })).statusCode).toBe(404);
+    expect((await admin('GET', '/api/admin/schedule')).statusCode).toBe(404);
+    // 立即发布还在（v3 书的章节页用它）
+    expect((await admin('POST', '/api/admin/books/book-a/publish/now', {})).statusCode).toBe(409);
   });
 
-  it('book file tree and plan overview', async () => {
+  it('book file tree; the old plan / state / quality / reviews / audits / debts views are gone', async () => {
     const tree = (await admin('GET', '/api/admin/books/book-a/tree')).json();
-    expect(tree.some((e: { path: string; type: string }) => e.path === 'bible' && e.type === 'dir')).toBe(true);
-    const plan = await admin('GET', '/api/admin/books/book-a/plan');
-    expect(plan.statusCode).toBe(200);
-    expect(plan.json().cards).toEqual([]);
-    expect(plan.json().compassApproved).toBe(false);
+    expect(tree.some((e: { path: string; type: string }) => e.path === 'manuscript' && e.type === 'dir')).toBe(true);
+    for (const p of ['plan', 'state', 'quality', 'reviews', 'audits', 'debts']) expect((await admin('GET', `/api/admin/books/book-a/${p}`)).statusCode, p).toBe(404);
   });
 
-  it('delete requires confirm and removes the repo', async () => {
+  it('delete requires confirm and moves the repo to the trash (with a tombstone)', async () => {
     await admin('POST', '/api/admin/books', { title: '待删', slug: 'book-del', genre: 'xianxia', start: false });
     expect((await admin('DELETE', '/api/admin/books/book-del')).statusCode).toBe(400);
     expect((await admin('DELETE', '/api/admin/books/book-del?confirm=book-del')).statusCode).toBe(200);
     expect(await fs.stat(path.join(t.dataDir, 'books/book-del')).then(() => true, () => false)).toBe(false);
+    const trashed = (await fs.readdir(path.join(t.dataDir, 'trash/books'))).filter((n) => n.startsWith('book-del-'));
+    expect(trashed).toHaveLength(1);
+    const tomb = JSON.parse(await fs.readFile(path.join(t.dataDir, 'trash/books', trashed[0] as string, TRASH_TOMBSTONE), 'utf8'));
+    expect(tomb).toMatchObject({ kind: 'books', name: 'book-del', slug: 'book-del', title: '待删' });
+    expect(await fs.readFile(path.join(t.dataDir, 'trash/books', trashed[0] as string, 'book.yaml'), 'utf8')).toContain('slug: book-del');
+    expect((await t.deps.db.select().from(books).where(eq(books.slug, 'book-del')))).toEqual([]);
   });
 });
 
@@ -201,13 +205,10 @@ describe('reader flow', () => {
   let bookId: string;
 
   beforeAll(async () => {
-    const dir = path.join(t.dataDir, 'books/pub-book');
-    const { head } = await createFixtureBook(dir, { slug: 'pub-book', cards: 4, accepted: 3 });
-    bookId = 'book-pub';
-    await t.deps.db.insert(books).values({ id: bookId, slug: 'pub-book', title: '已发布之书', genre: 'xianxia', status: 'active', headCommit: head });
+    // 读者端和导出跑在旧书上（约 130 本导入书的样子）：卷标题在 reindex 时从 plan/volumes 回填
+    const b = await createLegacyBook(t.deps.db, t.deps.paths, 'pub-book', { chapters: 3, published: 2, title: '已发布之书', volumes: [{ id: 'v01', title: '第一卷 风起', from: 1, to: 3 }] });
+    bookId = b.id;
     await reindexBook(t.deps, 'pub-book');
-    await t.deps.db.update(chapters).set({ publishedAt: new Date().toISOString() }).where(eq(chapters.no, 1));
-    await t.deps.db.update(chapters).set({ publishedAt: new Date().toISOString() }).where(eq(chapters.no, 2));
     const r = await admin('POST', '/api/admin/readers', { label: '小明', password: 'reader-pass' });
     expect(r.statusCode).toBe(201);
     readerCookie = (await loginAs('reader-pass')).cookie;
@@ -231,7 +232,10 @@ describe('reader flow', () => {
     expect(ch.prev).toBe(1);
     expect(ch.next).toBeNull();
     expect(ch.text).not.toContain('<!-- beat:');
+    expect(ch.volumeTitle).toBe('第一卷 风起');
     const detail = (await reader('GET', '/api/reader/books/pub-book')).json();
+    expect(detail.volumes).toHaveLength(1);
+    expect(detail.volumes[0]).toMatchObject({ id: 'v01', title: '第一卷 风起' });
     expect(detail.volumes[0].chapters).toHaveLength(2);
   });
 
@@ -281,7 +285,7 @@ describe('reader flow', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  it('manual text edit updates the index and enqueues re-extraction', async () => {
+  it('manual text edit on a legacy book commits as the owner, updates the index and creates no task', async () => {
     const detail = (await admin('GET', '/api/admin/books/pub-book/chapters/2')).json();
     expect(detail.text).toBeTruthy();
     const repo = openRepo(path.join(t.dataDir, 'books/pub-book'));
@@ -289,16 +293,10 @@ describe('reader flow', () => {
     const res = await admin('PUT', '/api/admin/books/pub-book/chapters/2/text', { text: '手改之后的正文，这里有中文。', baseSha: blob, confirm: true });
     expect(res.statusCode).toBe(200);
     expect(res.json().text).toContain('手改之后');
-    const rows = await t.deps.db.select().from(chapters).where(eq(chapters.no, 2));
-    expect(rows[0]?.revisedAt).toBeTruthy();
-    const tasks = (await admin('GET', '/api/admin/tasks?kind=chapter.reextract')).json();
-    expect(tasks.items.length).toBeGreaterThan(0);
-  });
-
-  it('state view folds the ledger', async () => {
-    const r = await admin('GET', '/api/admin/books/pub-book/state');
-    expect(r.statusCode).toBe(200);
-    expect(r.json().snapshot.through).toBe('c00003');
+    const rows = await t.deps.db.select().from(chapters).where(eq(chapters.bookId, bookId));
+    expect(rows.find((r) => r.no === 2)?.revisedAt).toBeTruthy();
+    expect((await repo.log({ limit: 1 })).items[0]?.trailers['Novelist-Owner-Edit']).toBe('true');
+    expect(await t.deps.db.select().from(tasks).where(eq(tasks.bookId, bookId))).toEqual([]);
   });
 });
 
@@ -382,38 +380,44 @@ describe('accounts', () => {
 });
 
 describe('routing and settings', () => {
-  it('defaults: agy-argon preset exists; active routing is switchable', async () => {
-    const presets = (await admin('GET', '/api/admin/routing/presets')).json();
-    expect(presets.some((p: { id: string }) => p.id === 'agy-argon')).toBe(true);
-    expect((await admin('PUT', '/api/admin/routing/active', { presetId: 'nope' })).statusCode).toBe(400);
-    const sw = await admin('PUT', '/api/admin/routing/active', { presetId: 'cc-only' });
-    expect(sw.statusCode).toBe(200);
-    expect(sw.json().presetId).toBe('cc-only');
-    expect((await admin('GET', '/api/admin/settings')).json().activePreset).toBe('cc-only');
-    await admin('PUT', '/api/admin/routing/active', { presetId: 'fake' });
+  it('routing slots: view, PUT validation, a slot left on a deleted profile does not block saving the other, profile in a slot cannot be deleted, canary', async () => {
+    const view = (await admin('GET', '/api/admin/routing/slots')).json();
+    expect(view.slots).toMatchObject({ schema: 'nv.slots/1', writer: { primary: 'fake', fallback: null }, utility: { primary: 'fake', fallback: null } });
+    expect(view.forced).toBe(false);
+    expect(view.status.writer).toMatchObject({ slot: 'writer', profile: 'fake', harness: 'fake', usedFallback: false, waitUntil: null, reason: null });
+    expect(view.profiles.some((p: { id: string }) => p.id === 'agy-argon')).toBe(true);
+    const keep = { writer: { primary: 'fake', fallback: null }, utility: { primary: 'fake', fallback: null } };
+    const bad = await admin('PUT', '/api/admin/routing/slots', { ...keep, writer: { primary: 'nope', fallback: null } });
+    expect([bad.statusCode, bad.json().code]).toEqual([400, 'unknown_profile']);
+    const same = await admin('PUT', '/api/admin/routing/slots', { ...keep, writer: { primary: 'fake', fallback: 'fake' } });
+    expect([same.statusCode, same.json().code]).toEqual([400, 'same_profile']);
+    expect((await admin('POST', '/api/admin/profiles', { id: 'tmp-fake', harness: 'fake', model: 'fake-model' })).statusCode).toBe(201);
+    const withFb = await admin('PUT', '/api/admin/routing/slots', { ...keep, writer: { primary: 'fake', fallback: 'tmp-fake' } });
+    expect(withFb.statusCode).toBe(200);
+    expect(withFb.json().slots.writer).toEqual({ primary: 'fake', fallback: 'tmp-fake' });
+    const inUse = await admin('DELETE', '/api/admin/profiles/tmp-fake');
+    expect([inUse.statusCode, inUse.json().code]).toEqual([409, 'profile_in_use']);
+    // 绕过 API 删掉它（例如旧库里早就没了）：写作位置还指着它，照样能保存杂活位置
+    await t.deps.db.delete(profiles).where(eq(profiles.id, 'tmp-fake'));
+    const other = await admin('PUT', '/api/admin/routing/slots', { writer: { primary: 'fake', fallback: 'tmp-fake' }, utility: { primary: 'agy-flash-check', fallback: null } });
+    expect(other.statusCode).toBe(200);
+    expect((await admin('PUT', '/api/admin/routing/slots', keep)).statusCode).toBe(200);
+    // 试跑：用这个位置当前的 profile 跑一次目录探测
+    const canary = await admin('POST', '/api/admin/routing/slots/writer/canary');
+    expect(canary.statusCode).toBe(200);
+    expect(canary.json().status).toMatchObject({ slot: 'writer', profile: 'fake' });
+    expect(canary.json().result).toMatchObject({ ok: true, wroteFile: true, honouredAgents: true });
+    expect(canary.json().caps.workspaceDocLoaded).toBe(true);
+    expect((await admin('POST', '/api/admin/routing/slots/nope/canary')).statusCode).toBe(404);
   });
 
-  it('editing a builtin preset saves a copy', async () => {
-    const preset = (await admin('GET', '/api/admin/routing/presets')).json().find((p: { id: string }) => p.id === 'cc-only');
-    const res = await admin('PUT', '/api/admin/routing/presets/cc-only', { ...preset, name: '我的' });
-    expect(res.statusCode).toBe(200);
-    expect(res.json().id).toBe('cc-only-custom');
-    expect(res.json().builtin).toBe(false);
-    const again = (await admin('GET', '/api/admin/routing/presets')).json();
-    expect(again.find((p: { id: string }) => p.id === 'cc-only').name).not.toBe('我的');
-    expect((await admin('DELETE', '/api/admin/routing/presets/cc-only')).statusCode).toBe(403);
-    expect((await admin('DELETE', '/api/admin/routing/presets/cc-only-custom')).statusCode).toBe(200);
-  });
-
-  it('editing the active builtin preset hands the active slot to its copy', async () => {
-    const before = (await admin('GET', '/api/admin/routing/active')).json().presetId;
-    const list = (await admin('GET', '/api/admin/routing/presets')).json() as { id: string }[];
-    const builtin = list.find((p) => p.id === 'codex-only') as object;
-    expect((await admin('PUT', '/api/admin/routing/active', { presetId: 'codex-only', overrides: {} })).statusCode).toBe(200);
-    expect((await admin('PUT', '/api/admin/routing/presets/codex-only', builtin)).json().id).toBe('codex-only-custom');
-    expect((await admin('GET', '/api/admin/routing/active')).json().presetId).toBe('codex-only-custom');
-    expect((await admin('PUT', '/api/admin/routing/active', { presetId: before, overrides: {} })).statusCode).toBe(200);
-    expect((await admin('DELETE', '/api/admin/routing/presets/codex-only-custom')).statusCode).toBe(200);
+  it('settings PUT no longer mirrors activePreset into routing.active (that row is only for the previous image)', async () => {
+    const before = await t.deps.db.select().from(settings).where(eq(settings.key, 'routing.active'));
+    expect((await admin('PUT', '/api/admin/settings', { activePreset: 'cc-only' })).statusCode).toBe(200);
+    expect(await t.deps.db.select().from(settings).where(eq(settings.key, 'routing.active'))).toEqual(before);
+    // activePreset 已从 schema 删掉：存进去的设置里也没有它
+    expect((await admin('GET', '/api/admin/settings')).json()).not.toHaveProperty('activePreset');
+    expect((await admin('GET', '/api/admin/routing/slots')).json().slots.writer.primary).toBe('fake');
   });
 
   it('profiles: create, patch, builtin protected', async () => {
@@ -463,16 +467,20 @@ describe('routing and settings', () => {
 
   it('instruction files: layers, writes commit to git, builtin read-only', async () => {
     const builtin = (await admin('GET', '/api/admin/instructions/files?scope=builtin')).json();
-    expect(builtin.some((f: { path: string; layer: string }) => f.path === 'contract.md' && f.layer === 'S0')).toBe(true);
-    expect((await admin('PUT', '/api/admin/instructions/file', { scope: 'builtin', path: 'contract.md', content: 'x', baseSha: null })).statusCode).toBe(403);
+    // 内置层只剩 v3 的约定、篇幅要领和 writer.md（旧流程的 contract.md 与角色随 P3 删除）
+    expect(builtin.some((f: { path: string; layer: string }) => f.path === 'v3/contract.md' && f.layer === 'S0')).toBe(true);
+    expect(builtin.some((f: { path: string }) => f.path === 'contract.md')).toBe(false);
+    expect((await admin('PUT', '/api/admin/instructions/file', { scope: 'builtin', path: 'v3/contract.md', content: 'x', baseSha: null })).statusCode).toBe(403);
     const w = await admin('PUT', '/api/admin/instructions/file', { scope: 'global', path: 'AGENTS.md', content: '全局指令', baseSha: null });
     expect(w.statusCode).toBe(200);
     expect(w.json().commit).toMatch(/^[0-9a-f]{40}$/);
     const r = (await admin('GET', '/api/admin/instructions/file?scope=global&path=AGENTS.md')).json();
     expect(r.content).toBe('全局指令');
-    const preview = await admin('POST', '/api/admin/instructions/preview', { role: 'writer', harness: 'fake' });
+    // v3 预览：按题材包 + 篇幅渲染根 AGENTS.md，全局层的字节数就是刚写的内容
+    const preview = await admin('POST', '/api/admin/instructions/preview', { genre: 'xianxia', length: 'short' });
     expect(preview.statusCode).toBe(200);
-    expect(preview.json().systemMd).toContain('全局指令');
+    expect(preview.json().text).toContain('全局指令');
+    expect(preview.json().layers.find((l: { id: string }) => l.id === 'L1')?.bytes).toBe(Buffer.byteLength('全局指令'));
     expect((await admin('DELETE', '/api/admin/instructions/file?scope=global&path=AGENTS.md')).statusCode).toBe(200);
   });
 
@@ -495,10 +503,12 @@ describe('routing and settings', () => {
     expect((await admin('DELETE', '/api/admin/genres/custom-a')).statusCode).toBe(200);
   });
 
-  it('feasibility and harness status', async () => {
+  it('harness status and probe; the old feasibility routes are gone', async () => {
     const harness = (await admin('GET', '/api/admin/harness')).json();
     expect(harness.find((h: { id: string }) => h.id === 'fake').installed).toBe(true);
-    expect((await admin('POST', '/api/admin/routing/check')).statusCode).toBe(200);
+    expect((await admin('POST', '/api/admin/routing/check')).statusCode).toBe(404);
+    expect((await admin('GET', '/api/admin/routing/presets')).statusCode).toBe(404);
+    expect((await admin('GET', '/api/admin/routing/active')).statusCode).toBe(404);
     expect((await admin('GET', '/api/admin/harness/fake/models')).statusCode).toBe(200);
     const probe = await admin('POST', '/api/admin/harness/fake/probe');
     expect(probe.statusCode).toBe(200);

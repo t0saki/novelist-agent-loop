@@ -3,18 +3,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
-  FIXTURE,
   NothingToCommitError,
   P,
   TRAILER,
   bookFiles,
-  createFixtureBook,
   createRunSnapshot,
   ensureGitRepo,
   formatFrontmatter,
   formatTrailers,
   gitBlobSha,
-  harvestOut,
   initBookRepo,
   openRepo,
   parseFrontmatter,
@@ -22,8 +19,10 @@ import {
   pathOwner,
   pruneWorktrees,
   removeRunSnapshot,
+  slugifyName,
 } from './index.js';
 import { CanonicalParseError } from './canonical.js';
+import type { BookRepo } from './repo.js';
 
 let tmp: string;
 beforeAll(async () => {
@@ -71,10 +70,38 @@ describe('frontmatter', () => {
   });
 });
 
+/** 小书：旧布局 + 两章正文 + live 树里的 .index/x（运行快照照旧复制 .index） */
+async function smallBook(dir: string): Promise<{ repo: BookRepo; head: string }> {
+  const { repo } = await initBookRepo(dir, { config: { slug: path.basename(dir), title: '小书', genre: 'xianxia' }, premise: '林枫的种子', layout: 'legacy' });
+  await repo.writeFiles([
+    { path: P.manuscript(1), content: '# 第1章 铜牌\n\n林枫把那枚铜牌收进袖中。\n' },
+    { path: P.manuscript(2), content: '# 第2章 下山\n\n他下了山。\n' },
+  ]);
+  const head = await repo.commit({ message: 'fixture: two chapters', trailers: {} });
+  await fs.mkdir(path.join(dir, P.indexDir), { recursive: true });
+  await fs.writeFile(path.join(dir, P.indexDir, 'x'), 'idx');
+  return { repo, head };
+}
+
 describe('repo', () => {
-  it('initBookRepo writes layout, symlink and first commit', async () => {
+  it("initBookRepo layout 'v3': anchored generated files in .gitignore, seed.md, book layer, no root AGENTS.md committed", async () => {
+    const dir = path.join(tmp, 'init-v3');
+    const { repo, commit } = await initBookRepo(dir, { config: { slug: 'demo3', title: '演示', genre: 'xianxia', flow: 'v3' }, premise: '种子\n原样', layout: 'v3' });
+    expect(commit).toMatch(/^[0-9a-f]{40}$/);
+    expect(await repo.readFile('seed.md')).toBe('种子\n原样');
+    expect(await repo.readFile(P.premise)).toBeNull();
+    expect(await repo.readFile(P.gitignore)).toBe('work/\n.index/\n.cache/\nviews/\nstate/snapshot.json\n/AGENTS.md\n/CLAUDE.md\n/ORDER.md\n');
+    expect(await repo.readFile(P.instructionsAgents)).toContain('书层指令');
+    expect(await repo.exists(P.agentsMd, commit)).toBe(false);
+    expect(await fs.stat(path.join(dir, '.claude')).then(() => true, () => false)).toBe(false);
+    expect((await repo.log({ limit: 5 })).items[0]?.trailers[TRAILER.task]).toBe('book.init');
+    expect(await repo.isClean()).toBe(true);
+    expect(await bookFiles(repo).premise()).toBe('种子\n原样');
+  });
+
+  it("initBookRepo layout 'legacy': the imported-book layout (root AGENTS.md placeholder, bible/premise.md, skills symlink)", async () => {
     const dir = path.join(tmp, 'init');
-    const { repo, commit } = await initBookRepo(dir, { config: { slug: 'demo', title: '演示', genre: 'xianxia', tier: 'lite' }, premise: '种子\n原样' });
+    const { repo, commit } = await initBookRepo(dir, { config: { slug: 'demo', title: '演示', genre: 'xianxia', tier: 'lite' } as never, premise: '种子\n原样', layout: 'legacy' });
     expect(commit).toMatch(/^[0-9a-f]{40}$/);
     expect(await repo.readFile(P.premise)).toBe('种子\n原样');
     const yaml = (await repo.readFile(P.bookYaml)) ?? '';
@@ -82,24 +109,24 @@ describe('repo', () => {
     expect(yaml).toContain('tier: lite');
     expect(yaml).not.toContain('publish'); // 默认值不固化
     expect(await repo.readFile(P.gitignore)).toBe('work/\n.index/\n.cache/\nviews/\nstate/snapshot.json\n');
+    expect(await repo.readFile(P.agentsMd, commit)).toContain('instructions/AGENTS.md');
+    expect(await repo.exists(P.overrides, commit)).toBe(true);
     expect(await fs.readlink(path.join(dir, '.claude/skills'))).toBe('../.agents/skills');
     const log = await repo.log({ limit: 5 });
     expect(log.items[0]?.trailers[TRAILER.task]).toBe('book.init');
     expect(await repo.isClean()).toBe(true);
-    await expect(initBookRepo(dir, { config: { slug: 'demo', title: 'x', genre: 'g' }, premise: '' })).rejects.toThrow(/not empty/);
+    expect(await bookFiles(repo).premise()).toBe('种子\n原样');
   });
 
-  it('向导写入的 scale 区间是行内序列（设置页表单按单行读写）', async () => {
-    const dir = path.join(tmp, 'scale');
-    const { repo } = await initBookRepo(dir, { config: { slug: 'scaled', title: '规模', genre: 'xianxia', scale: { target_cjk: 1000, hard_max_cjk: 2000, volumes: [3, 5], chapters_per_volume: [10, 12] } }, premise: 'p' });
-    const yaml = (await repo.readFile(P.bookYaml)) ?? '';
-    expect(yaml).toContain('volumes: [ 3, 5 ]');
-    expect(yaml).toContain('chapters_per_volume: [ 10, 12 ]');
+  it('initBookRepo refuses a non-empty dir', async () => {
+    const dir = path.join(tmp, 'init');
+    await expect(initBookRepo(dir, { config: { slug: 'demo', title: 'x', genre: 'g' }, premise: '', layout: 'legacy' })).rejects.toThrow(/not empty/);
+    await expect(initBookRepo(dir, { config: { slug: 'demo', title: 'x', genre: 'g' }, premise: '', layout: 'v3' })).rejects.toThrow(/not empty/);
   });
 
   it('commit / read at rev / blobShas / tags / trailers / log paging / reset', async () => {
     const dir = path.join(tmp, 'ops');
-    const { repo } = await initBookRepo(dir, { config: { slug: 'ops', title: 'ops', genre: 'xianxia' }, premise: 'p' });
+    const { repo } = await initBookRepo(dir, { config: { slug: 'ops', title: 'ops', genre: 'xianxia' }, premise: 'p', layout: 'legacy' });
     const c0 = await repo.head();
     await repo.writeFiles([{ path: 'manuscript/c00001.md', content: '第一版' }]);
     const c1 = await repo.commit({ message: 'ch1', trailers: { [TRAILER.task]: 'task-1' }, tags: ['ch/00001'] });
@@ -160,44 +187,35 @@ describe('repo', () => {
   });
 });
 
-describe('fixture + canonical files', () => {
-  it('createFixtureBook yields a valid typed book', async () => {
-    const dir = path.join(tmp, 'fx');
-    const { repo, head } = await createFixtureBook(dir, { accepted: 3, cards: 6 });
-    expect(head).toBe(await repo.head());
-    expect(await repo.tags('ch/*')).toEqual(['ch/00001', 'ch/00002', 'ch/00003']);
+describe('canonical files', () => {
+  it('bookFiles reads book.yaml, manuscripts (beat markers stripped) and the seed; a bad book.yaml throws CanonicalParseError', async () => {
+    const dir = path.join(tmp, 'canon');
+    const { repo } = await smallBook(dir);
     const f = bookFiles(repo);
     const { config } = await f.config();
     expect(config.genre).toBe('xianxia');
-    expect(config.tier).toBe('standard');
-    expect((await f.entities()).map((e) => e.entity.id).sort()).toEqual(['char.lin-feng', 'char.su-wan', 'loc.qingyun']);
-    expect((await f.cards(2, 4)).map((c) => c.id)).toEqual(['c00002', 'c00003', 'c00004']);
-    expect((await f.card(3))?.notes).toBe('这一章节奏放慢。');
-    expect((await f.ledger()).map((d) => d.chapter)).toEqual(['c00001', 'c00002', 'c00003']);
-    expect((await f.ledger(2)).length).toBe(2);
-    // 按 rev 读：第一章验收之后的提交里只有 1 章账本
-    const log = await repo.log({ limit: 10 });
-    const ch1 = log.items.find((c) => c.tags.includes('ch/00001'))?.sha as string;
-    expect((await f.ledger(undefined, ch1)).length).toBe(1);
-    expect((await f.world())?.vocab.conditions.map((c) => c.id)).toContain(FIXTURE.conds.armFracture);
-    expect((await f.secrets())[0]?.secret.leak_signatures.length).toBeGreaterThan(0);
-    expect(await f.overrides()).toEqual([]);
     expect(await f.manuscript(1)).toContain('林枫把那枚铜牌收进袖中');
-    expect(await f.compass()).not.toBeNull();
-    expect((await f.volumes()).map((v) => v.id)).toEqual(['v01']);
-    expect((await f.arcs()).map((a) => a.id)).toEqual(['a0001']);
-    expect(await f.premise()).toContain('林枫');
-    // 坏文件 → CanonicalParseError
-    await repo.writeFiles([{ path: P.card(9), content: 'schema: nv.card/1\nid: c00009\n' }]);
-    await expect(f.card(9)).rejects.toBeInstanceOf(CanonicalParseError);
-    await repo.writeFiles([{ path: P.card(9), content: null }]);
+    expect(await f.manuscript(3)).toBeNull();
+    expect(await f.premise()).toBe('林枫的种子');
+    // v3 书的种子在 seed.md，优先于旧书的 bible/premise.md
+    await repo.writeFiles([{ path: 'seed.md', content: '新种子' }]);
+    expect(await f.premise()).toBe('新种子');
+    await repo.writeFiles([{ path: P.bookYaml, content: 'schema: nv.book/1\nslug: BAD SLUG\n' }]);
+    await expect(f.config()).rejects.toBeInstanceOf(CanonicalParseError);
+  });
+
+  it('slugifyName turns a Chinese name into a pinyin slug and avoids taken ones', () => {
+    const a = slugifyName('林枫', new Set());
+    expect(a).toMatch(/^[a-z0-9][a-z0-9-]*$/);
+    expect(slugifyName('林枫', new Set([a]))).toBe(`${a}-2`);
+    expect(slugifyName('!!!', new Set())).toBe('x');
   });
 });
 
 describe('git isolation and commit paths', () => {
   it('ignores inherited GIT_DIR, tolerates never-tracked deletions, treats paths literally', async () => {
     const dir = path.join(tmp, 'iso');
-    await createFixtureBook(dir, { accepted: 1, cards: 2 });
+    await smallBook(dir);
     const repo = openRepo(dir);
     const saved = process.env.GIT_DIR;
     process.env.GIT_DIR = path.join(tmp, 'no-such-repo');
@@ -229,7 +247,7 @@ describe('git isolation and commit paths', () => {
 
   it('finds a trailer behind many prefix-colliding commits', async () => {
     const dir = path.join(tmp, 'grep');
-    await createFixtureBook(dir, { accepted: 1, cards: 1 });
+    await smallBook(dir);
     const repo = openRepo(dir);
     const target = await repo.commit({ message: 't', trailers: { [TRAILER.task]: 'task-1' }, allowEmpty: true });
     for (let i = 0; i < 55; i++) await repo.commit({ message: 'n', trailers: { [TRAILER.task]: `task-1${i}` }, allowEmpty: true });
@@ -238,28 +256,20 @@ describe('git isolation and commit paths', () => {
 });
 
 describe('run snapshot', () => {
-  it('creates a detached worktree at base, discards stray writes, harvests only regular files', async () => {
-    const dir = path.join(tmp, 'fx');
-    const repo = openRepo(dir);
+  it('creates a detached worktree at base (with the live .index copied), and stray writes never reach the live tree', async () => {
+    const dir = path.join(tmp, 'snap');
+    const { repo } = await smallBook(dir);
     const base = await repo.head();
     const runDir = path.join(tmp, 'runs', 'r1');
     const snap = await createRunSnapshot(dir, base, path.join(runDir, 'book'));
     expect(await fs.readFile(path.join(snap.dir, P.manuscript(1)), 'utf8')).toContain('铜牌');
-    // 越界写：改快照里的规范文件
+    expect(await fs.readFile(path.join(snap.dir, P.indexDir, 'x'), 'utf8')).toBe('idx');
+    // 越界写：改快照里的正文
     await fs.writeFile(path.join(snap.dir, P.manuscript(1)), 'stray');
-    const out = path.join(snap.dir, 'work/t-1/attempt-1/out');
-    await fs.mkdir(path.join(out, 'sub'), { recursive: true });
-    await fs.writeFile(path.join(out, 'receipt.json'), '{}');
-    await fs.writeFile(path.join(out, 'sub/draft.md'), '草稿');
-    await fs.symlink('/etc/passwd', path.join(out, 'evil'));
-    const h = await harvestOut(out, dir, 't-1', 1);
-    expect(h.files).toEqual(['receipt.json', 'sub/draft.md']);
-    expect(h.stagedDir).toBe(path.join(dir, 'work/t-1/attempt-1/out'));
-    expect(await fs.readFile(path.join(h.stagedDir, 'sub/draft.md'), 'utf8')).toBe('草稿');
     await removeRunSnapshot(snap);
     await expect(fs.stat(snap.dir)).rejects.toThrow();
     expect(await fs.readFile(path.join(dir, P.manuscript(1)), 'utf8')).toContain('铜牌');
-    expect(await repo.isClean()).toBe(true); // work/ 被忽略
+    expect(await repo.isClean()).toBe(true); // .index/ 被忽略
     await pruneWorktrees(dir);
     // 重建同一路径（重试）可以成功
     const again = await createRunSnapshot(dir, base, path.join(runDir, 'book'));
@@ -267,7 +277,7 @@ describe('run snapshot', () => {
   });
 
   it('recovers when the run dir vanished but the worktree is still registered', async () => {
-    const dir = path.join(tmp, 'fx');
+    const dir = path.join(tmp, 'snap');
     const base = await openRepo(dir).head();
     const dest = path.join(tmp, 'runs', 'r-gone', 'book');
     await createRunSnapshot(dir, base, dest);
@@ -275,16 +285,5 @@ describe('run snapshot', () => {
     const again = await createRunSnapshot(dir, base, dest);
     expect(await fs.readFile(path.join(again.dir, P.manuscript(1)), 'utf8')).toContain('铜牌');
     await removeRunSnapshot(again);
-  });
-
-  it('refuses to harvest when out/ itself is a symlink', async () => {
-    const dir = path.join(tmp, 'fx');
-    const outside = path.join(tmp, 'outside');
-    await fs.mkdir(outside, { recursive: true });
-    await fs.writeFile(path.join(outside, 'secret.txt'), 'x');
-    const link = path.join(tmp, 'link-out');
-    await fs.symlink(outside, link);
-    const h = await harvestOut(link, dir, 't-link', 1);
-    expect(h.files).toEqual([]);
   });
 });

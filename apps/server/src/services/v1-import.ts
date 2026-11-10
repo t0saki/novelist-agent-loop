@@ -18,17 +18,16 @@ import { and, eq, inArray } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml';
 import type { V1ImportJob, V1ImportPreview } from '@novelist/shared';
-import { countCjk, tags, volumeId, zGenrePack, zVolume } from '@novelist/shared';
+import { VOLUME_ID_RE, countCjk, tags, volumeId, zGenrePack } from '@novelist/shared';
 import type { z } from 'zod';
 import type { zV1ImportRequest } from '@novelist/shared';
 import type { AppDeps } from '../app.js';
-import { initBookRepo, openRepo, P, TRAILER } from '../book/index.js';
+import { fillVolumeTitles, initBookRepo, moveToTrash, openRepo, P, slugifyName, TRAILER } from '../book/index.js';
 import { books, chapters, importJobs, readers, readingProgress, v1ImportMap } from '../db/schema.js';
 import { createGenre, genreExists, v1PackFields } from '../genres/index.js';
 import { bookDir } from '../api/helpers.js';
 import { HttpProblem, badRequest, conflict } from '../api/problem.js';
-import { enqueueSpec, execEnv } from '../orchestrator/index.js';
-import { openBook } from '../pipeline/index.js';
+import { markVolumeTitlesDone } from '../boot/migrate-p3.js';
 import { makeSlug } from './books.js';
 
 export type V1ImportRequest = z.infer<typeof zV1ImportRequest>;
@@ -222,7 +221,6 @@ async function importThemes(deps: AppDeps, jobId: string, c: V1Client, usedIds: 
   const themeGenre = new Map(already);
   const created: string[] = [];
   const taken = new Set<string>();
-  const { slugifyName } = await import('../state/ids.js');
   for (const theme of rows) {
     if (themeGenre.has(theme.id) || (!all && !usedIds.has(theme.id))) continue;
     let id = slugifyName(theme.name, taken).replace(/[^a-z0-9-]/g, '-');
@@ -306,7 +304,9 @@ async function importNovel(deps: AppDeps, jobId: string, c: V1Client, novel: V1N
   if (stale[0]) {
     await appendLog(deps, jobId, `《${novel.title}》上次导入未完成，清理后重来`);
     await deps.db.delete(books).where(eq(books.id, stale[0].id));
-    await fs.rm(bookDir(deps, stale[0].slug), { recursive: true, force: true });
+    // 半成品目录进回收站（不做不可恢复的删除，P3 D14）
+    const staleDir = bookDir(deps, stale[0].slug);
+    if (await fs.stat(staleDir).then(() => true, () => false)) await moveToTrash(deps.paths, 'books', stale[0].slug, staleDir, { reason: 'v1_import_stale', id: stale[0].id, v1Id: novel.id, at: new Date().toISOString() });
   }
 
   const wanted = novel.slug.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
@@ -315,14 +315,14 @@ async function importNovel(deps: AppDeps, jobId: string, c: V1Client, novel: V1N
 
   const totalChapters = Math.max(novel.planned_chapters ?? 0, chapterRows.length ? (chapterRows[chapterRows.length - 1] as V1Chapter).index : 0, 1);
   const premise = [novel.premise, novel.synopsis && `## 简介\n\n${novel.synopsis}`, novel.tone && `基调：${novel.tone}`, novel.target_audience && `读者：${novel.target_audience}`].filter(Boolean).join('\n\n');
-  const { repo } = await initBookRepo(bookDir(deps, slug), { config: { slug, title: novel.title || slug, genre, ...(novel.synopsis ? { blurb: novel.synopsis.slice(0, 500) } : {}) } as never, premise });
+  const { repo } = await initBookRepo(bookDir(deps, slug), { config: { slug, title: novel.title || slug, genre, ...(novel.synopsis ? { blurb: novel.synopsis.slice(0, 500) } : {}) } as never, premise, layout: 'legacy' });
 
   const volumes = planVolumes(novel.volumes, totalChapters);
   const volumeOf = (no: number) => volumes.find((v) => no >= v.from && no <= v.to) ?? (volumes[volumes.length - 1] as VolumePlan);
   const files: { path: string; content: string }[] = [];
   for (const v of volumes) {
-    const parsed = zVolume.safeParse({ schema: 'nv.volume/1', id: v.id, title: v.title, detail: 'skeleton', chapters: [`c${String(v.from).padStart(5, '0')}`, `c${String(v.to).padStart(5, '0')}`] });
-    if (parsed.success) files.push({ path: P.volume(v.id), content: yamlStringify(parsed.data, { lineWidth: 0 }) });
+    const content = v1VolumeYaml(v);
+    if (content !== null) files.push({ path: P.volume(v.id), content });
   }
   for (const ch of done) files.push({ path: P.manuscript(ch.index), content: ch.content });
   files.push({ path: 'notes/v1/bible.json', content: `${JSON.stringify(jsonOf(novel.bible, {}), null, 2)}\n` });
@@ -386,26 +386,37 @@ async function importNovel(deps: AppDeps, jobId: string, c: V1Client, novel: V1N
     await repo.tag(tags.chapter(ch.index), commit);
     await repo.tag(tags.published(ch.index), commit);
   }
+  // 卷标题当场回填（读者端、导出读 chapters.volume_title），记进开机迁移的标记，M5 不再看这本书
+  try {
+    await fillVolumeTitles(deps.db, deps.paths, { id: bookId, slug });
+    await markVolumeTitlesDone(deps.db, bookId);
+  } catch (err) {
+    deps.log.warn({ err: (err as Error).message, slug }, 'v1 import: volume titles not filled (the next boot retries)');
+  }
   await setMapped(deps, 'novel', novel.id, bookId);
   await appendLog(deps, jobId, `《${novel.title}》→ ${slug}：${done.length} 章（丢弃未完成 ${others.length} 章）`);
-
-  if (req.bootstrapExtract && !archived && done.length > 0) {
-    await enqueueBootstrap(deps, bookId, done.map((d) => d.index));
-    await appendLog(deps, jobId, `《${novel.title}》已排入 import.bootstrap（每批 5 章）`);
-  }
+  // 导入的书是旧书：不排任何任务（request 的 bootstrapExtract 不再起作用，WP-3 从接口里删掉）
   return { slug, chapters: done.length, dropped: req.includeDrafts ? 0 : others.length };
 }
 
-async function enqueueBootstrap(deps: AppDeps, bookId: string, nos: number[]): Promise<void> {
-  const env = execEnv({ db: deps.db, config: deps.config, paths: deps.paths, log: deps.log, bus: deps.bus, secrets: deps.secrets, owner: 'v1-import' });
-  const book = await openBook(env.pdeps, bookId);
-  const ctx = { deps: env.pdeps, book };
-  for (let i = 0; i < nos.length; i += 5) {
-    const batch = nos.slice(i, i + 5);
-    const from = batch[0] as number;
-    const to = batch[batch.length - 1] as number;
-    await enqueueSpec(env, ctx, { kind: 'import.bootstrap', bookId, target: `c${String(from).padStart(5, '0')}-c${String(to).padStart(5, '0')}`, lane: 'side', params: { from, to, chapters: batch } });
-  }
+/**
+ * 卷骨架 plan/volumes/vNN.yaml：与旧代码 yamlStringify(zVolume.parse(…)) 的输出逐字节相同（键序、默认值照写；golden 测试比对）。
+ * id 不是 vNN 的跳过（旧代码 safeParse 唯一会失败的情况）。
+ */
+export function v1VolumeYaml(v: { id: string; title: string; from: number; to: number }): string | null {
+  if (!VOLUME_ID_RE.test(v.id)) return null;
+  const doc = {
+    schema: 'nv.volume/1',
+    id: v.id,
+    title: v.title,
+    detail: 'skeleton',
+    goal: '',
+    novelty: [],
+    milestones_due: [],
+    chapters: [`c${String(v.from).padStart(5, '0')}`, `c${String(v.to).padStart(5, '0')}`],
+    arcs: [],
+  };
+  return yamlStringify(doc, { lineWidth: 0 });
 }
 
 async function importReaders(deps: AppDeps, jobId: string, c: V1Client): Promise<number> {

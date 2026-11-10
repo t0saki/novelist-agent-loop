@@ -1,52 +1,57 @@
 /**
- * 角色路由与降级阶梯（DESIGN §7.4；D2 修订：全部在 Web UI 配置）。Owner: lane F。
- * 生效路由 = book.yaml routing.roles > book.yaml routing.preset > settings 'routing.active'（preset + 全局覆盖）。
- * resolve 检查：profile enabled、requires_ack 已确认、账号 enabled 且未 sleep、并发未满、熔断未开、厂商白名单、
- * constraint（vendor_ne_writer 等）。全部不满足 → 按 degrade_to → 放宽 constraint → 返回 waitUntil。
- * 模型 slug 不在 listModels 里只在可行性检查给 warning（IMPL §12：Argon slug 未核实，不硬失败）。
+ * 路由（DESIGN §7）：只有两个位置——写作（writer）和杂活（utility），每个位置主、备各一个 profile，存在 settings 'routing.slots'。
+ * 写作位置可被书级覆盖（book.yaml routing.writer_profile）顶替主用，备用照旧。fake 模式（config.fakeHarness）两个位置都走 fake、忽略书级覆盖；
+ * 这个“强制”不存库，进程不再是 fake 模式时位置照常可改。
+ * 检查：profile 存在且启用、fake 只在 allowFakeHarness 时可用、账号启用 / 风险条款已确认 / 认证有效 / 不在睡眠、并发未满、profile 不在冷却（routing.down:<id>）。
+ * 主用不可用 → 备用；都不可用 → 等到最早能恢复的时刻（没有时刻就由调用方决定等多久）。
  */
-import { and, count, eq, inArray } from 'drizzle-orm';
-import type { Account, FeasibilityReport, HarnessId, Profile, QualityTier, RoleId, RoleRoute, RouteDecision, RoutingPreset } from '@novelist/shared';
-import { AGY_ARGON_DEFAULT_SLUG, BUILTIN_PRESETS, BUILTIN_PROFILES, DEFAULT_PRESET_ID, HARNESS_VENDOR, RISK_NOTES, ROUTABLE_ROLES, normalizeTier, zAccount, zProfile, zRoutingPreset, zSystemSettings } from '@novelist/shared';
+import { count, eq, inArray, like } from 'drizzle-orm';
+import type { Account, HarnessId, Profile, RoutingSlots, Slot, SlotId, SlotStatus } from '@novelist/shared';
+import { AGY_ARGON_DEFAULT_SLUG, BUILTIN_PROFILES, DEFAULT_SLOTS, HARNESS_VENDOR, SLOT_IDS, zAccount, zProfile, zRoutingSlots, zSystemSettings } from '@novelist/shared';
 import type { Db } from '../db/client.js';
-import { accounts, accountsState, books, capabilities, circuitBreakers, profiles, routingPresets, runs, settings, usageLedger } from '../db/schema.js';
-import type { BookHandle } from '../pipeline/types.js';
+import { accounts, accountsState, books, profiles, runs, settings } from '../db/schema.js';
+import type { BookHandle } from '../runtime/types.js';
 
-export interface ResolveInput {
-  role: RoleId;
+export const SLOTS_KEY = 'routing.slots';
+export const DOWN_PREFIX = 'routing.down:';
+/** settings 里 P3 开机迁移的状态行（boot/migrate-p3.ts MIGRATION_KEY；这里不 import，免得循环依赖） */
+const P3_MIGRATION_KEY = 'migration.p3';
+
+export type RouteCause = 'auth' | 'quota' | 'concurrency' | 'disabled' | 'no_account' | 'no_route' | 'fake_disallowed' | 'ack' | 'down';
+
+export interface ResolveSlotInput {
+  slot: SlotId;
   book: BookHandle | null;
-  tier: QualityTier;
-  /** 本章写手的厂商（vendor_ne_writer） */
-  writerVendor?: string | null;
-  /** 规划者厂商（vendor_ne_planner） */
-  plannerVendor?: string | null;
-  /** not_in_judges：本章 judge 用过的 profile */
-  excludeProfiles?: string[];
-  /** output_contract 2 次后避开的 profile */
-  avoidProfiles?: string[];
-  /** refusal 跨厂商重试时避开的厂商 */
-  avoidVendors?: string[];
   now: Date;
   /** config.allowFakeHarness：fake profile 只有这时能被选中 */
   allowFakeHarness?: boolean;
-  /** 计算路由但不考虑并发上限（配额估算、可行性检查） */
+  /** 只看能不能路由、不考虑并发上限（自动开书的“写手闲着”判断） */
   ignoreConcurrency?: boolean;
+  /** config.fakeHarness：两个位置都走 fake，书级覆盖不看 */
+  forced?: boolean;
 }
 
-export type RouteCause = 'auth' | 'circuit_open' | 'model_unavailable' | 'quota' | 'concurrency' | 'disabled' | 'constraint' | 'no_account' | 'no_route' | 'fake_disallowed' | 'vendor' | 'avoided' | 'ack';
-
-export interface ResolvedRoute extends RouteDecision {
+export interface ResolvedRoute {
+  slot: SlotId;
+  profile: string | null;
+  account: string | null;
+  harness: string | null;
+  model: string | null;
+  usedFallback: boolean;
+  /** 没有可用 profile 时：等到何时（null = 没有确定的恢复时刻） */
+  waitUntil: string | null;
+  reason?: string;
+  /** 没有可用 profile 时，挡住的主要原因 */
+  cause?: RouteCause;
   profileObj: Profile | null;
   accountObj: Account | null;
-  /** 无可用 profile 时，阻塞的主要原因（failover / UI 用） */
-  cause?: RouteCause;
 }
 
 export function vendorOf(harness: string): string {
   return (HARNESS_VENDOR as Record<string, string>)[harness] ?? harness;
 }
 
-// ───────────────────────── 路由上下文（一次解析用一个快照） ─────────────────────────
+// ───────────────────────── 账号快照 ─────────────────────────
 
 export interface AccountSnapshot {
   account: Account;
@@ -55,14 +60,6 @@ export interface AccountSnapshot {
   authBad: boolean;
   credExpired: boolean;
   active: number;
-}
-
-interface RoutingCtx {
-  profiles: Map<string, Profile>;
-  accounts: AccountSnapshot[];
-  /** harness → 是否有未关闭的熔断 */
-  openCircuits: Set<string>;
-  writerProfile: string | null;
 }
 
 export function accountFromRow(row: typeof accounts.$inferSelect): Account | null {
@@ -97,48 +94,67 @@ export async function loadAccountSnapshots(db: Db, now: Date): Promise<AccountSn
   return out;
 }
 
-/** mock 模式（NOVELIST_FAKE_HARNESS=1）写入的强制路由：忽略书级 preset / roles / 粘性写手 */
-async function loadActive(db: Db): Promise<{ presetId?: string; overrides?: Partial<Record<RoleId, unknown>>; forced?: boolean }> {
-  const rows = await db.select().from(settings).where(eq(settings.key, 'routing.active')).limit(1);
-  return (rows[0]?.value ?? {}) as { presetId?: string; overrides?: Partial<Record<RoleId, unknown>>; forced?: boolean };
+// ───────────────────────── 位置的读写 ─────────────────────────
+
+/** 没有 routing.slots 行（全新安装、开机迁移还没跑）→ DEFAULT_SLOTS */
+export async function loadSlots(db: Db): Promise<RoutingSlots> {
+  const rows = await db.select().from(settings).where(eq(settings.key, SLOTS_KEY)).limit(1);
+  if (rows[0]) {
+    const parsed = zRoutingSlots.safeParse(rows[0].value);
+    if (parsed.success) return parsed.data;
+  }
+  return zRoutingSlots.parse(DEFAULT_SLOTS);
 }
 
-async function loadCtx(db: Db, book: BookHandle | null, now: Date): Promise<RoutingCtx> {
-  const [profileRows, snapshots, circuits, bookRows, active] = await Promise.all([
-    db.select().from(profiles),
-    loadAccountSnapshots(db, now),
-    db.select().from(circuitBreakers).where(inArray(circuitBreakers.state, ['open', 'half_open'])),
-    book ? db.select({ w: books.writerProfile }).from(books).where(eq(books.id, book.id)).limit(1) : Promise.resolve([]),
-    loadActive(db),
-  ]);
+/** 写两个位置；开机迁移留下的 migratedFrom / droppedProfiles 原样保留 */
+export async function saveSlots(db: Db, slots: Pick<RoutingSlots, 'writer' | 'utility'>): Promise<RoutingSlots> {
+  const rows = await db.select().from(settings).where(eq(settings.key, SLOTS_KEY)).limit(1);
+  const prev = rows[0] ? zRoutingSlots.safeParse(rows[0].value) : null;
+  const keep = prev?.success ? { ...(prev.data.migratedFrom !== undefined ? { migratedFrom: prev.data.migratedFrom } : {}), droppedProfiles: prev.data.droppedProfiles } : {};
+  const next = zRoutingSlots.parse({ ...keep, writer: slots.writer, utility: slots.utility });
+  const now = new Date().toISOString();
+  await db
+    .insert(settings)
+    .values({ key: SLOTS_KEY, value: next as unknown as Record<string, unknown>, updatedAt: now })
+    .onConflictDoUpdate({ target: settings.key, set: { value: next as unknown as Record<string, unknown>, updatedAt: now } });
+  return next;
+}
+
+/** model_unavailable 之后的 profile 冷却（D8）：到点前路由跳过它，有备用就走备用 */
+export async function markProfileDown(db: Db, profileId: string, until: string, reason: string): Promise<void> {
+  const now = new Date().toISOString();
+  const value = { until, reason };
+  await db.insert(settings).values({ key: `${DOWN_PREFIX}${profileId}`, value, updatedAt: now }).onConflictDoUpdate({ target: settings.key, set: { value, updatedAt: now } });
+}
+
+async function loadDown(db: Db, now: Date): Promise<Map<string, { until: string; reason: string }>> {
+  const rows = await db.select().from(settings).where(like(settings.key, `${DOWN_PREFIX}%`));
+  const out = new Map<string, { until: string; reason: string }>();
+  for (const r of rows) {
+    const v = r.value as { until?: unknown; reason?: unknown };
+    if (typeof v?.until !== 'string' || Date.parse(v.until) <= now.getTime()) continue;
+    out.set(r.key.slice(DOWN_PREFIX.length), { until: v.until, reason: typeof v.reason === 'string' ? v.reason : '' });
+  }
+  return out;
+}
+
+// ───────────────────────── 解析 ─────────────────────────
+
+interface RoutingCtx {
+  profiles: Map<string, Profile>;
+  accounts: AccountSnapshot[];
+  down: Map<string, { until: string; reason: string }>;
+}
+
+async function loadCtx(db: Db, now: Date): Promise<RoutingCtx> {
+  const [profileRows, snapshots, down] = await Promise.all([db.select().from(profiles), loadAccountSnapshots(db, now), loadDown(db, now)]);
   const profilesMap = new Map<string, Profile>();
   for (const r of profileRows) {
     const parsed = zProfile.safeParse({ ...r.body, id: r.id, harness: r.harness, enabled: r.enabled });
     if (parsed.success) profilesMap.set(r.id, parsed.data);
   }
-  return {
-    profiles: profilesMap,
-    accounts: snapshots,
-    openCircuits: new Set(circuits.map((c) => c.harness)),
-    writerProfile: active.forced ? null : (book?.config.routing.writer_profile ?? (bookRows[0]?.w as string | null | undefined) ?? null),
-  };
+  return { profiles: profilesMap, accounts: snapshots, down };
 }
-
-async function loadRoleRoutes(db: Db, book: BookHandle | null): Promise<RoutingPreset> {
-  return effectiveRouting(db, book);
-}
-
-function derefRoute(preset: RoutingPreset, role: RoleId): RoleRoute | null {
-  const r = preset.roles[role];
-  if (!r) return null;
-  if (r.same_as && r.same_as !== role) {
-    const target = preset.roles[r.same_as];
-    return target ?? r;
-  }
-  return r;
-}
-
-// ───────────────────────── 单个 profile 的可用性 ─────────────────────────
 
 interface CandFail {
   cause: RouteCause;
@@ -147,21 +163,14 @@ interface CandFail {
 }
 type CandResult = { ok: true; profile: Profile; account: AccountSnapshot | null } | ({ ok: false } & CandFail);
 
-function checkProfile(ctx: RoutingCtx, input: ResolveInput, profileId: string, opts: { constraint: RoleRoute['constraint'] }): CandResult {
+function checkProfile(ctx: RoutingCtx, input: ResolveSlotInput, profileId: string): CandResult {
   const fail = (cause: RouteCause, reason: string, wakeAt?: string): CandResult => ({ ok: false, cause, reason, ...(wakeAt ? { wakeAt } : {}) });
   const profile = ctx.profiles.get(profileId);
   if (!profile) return fail('disabled', `profile ${profileId} 不存在`);
   if (!profile.enabled) return fail('disabled', `profile ${profileId} 未启用`);
   if (profile.harness === 'fake' && !input.allowFakeHarness) return fail('fake_disallowed', 'fake 仅在 allowFakeHarness 时可用');
-  if (input.avoidProfiles?.includes(profileId)) return fail('avoided', `本任务避开 ${profileId}`);
-  const vendor = vendorOf(profile.harness);
-  if (input.avoidVendors?.includes(vendor)) return fail('avoided', `本任务避开厂商 ${vendor}`);
-  const allow = input.book?.config.vendors_allow;
-  if (allow && profile.harness !== 'fake' && !allow.includes(vendor)) return fail('vendor', `书级厂商白名单不含 ${vendor}`);
-  if (opts.constraint === 'vendor_ne_writer' && input.writerVendor && vendor === input.writerVendor) return fail('constraint', `与写手同厂商（${vendor}）`);
-  if (opts.constraint === 'vendor_ne_planner' && input.plannerVendor && vendor === input.plannerVendor) return fail('constraint', `与规划者同厂商（${vendor}）`);
-  if (opts.constraint === 'not_in_judges' && input.excludeProfiles?.includes(profileId)) return fail('constraint', '该 profile 已担任评委');
-  if (ctx.openCircuits.has(profile.harness)) return fail('circuit_open', `${profile.harness} 熔断中`);
+  const down = ctx.down.get(profileId);
+  if (down) return fail('down', `profile ${profileId} 暂停到 ${down.until}：${down.reason}`, down.until);
 
   const pool = ctx.accounts.filter((a) => a.account.harness === profile.harness && (profile.accounts.length === 0 || profile.accounts.includes(a.account.id)));
   if (pool.length === 0) {
@@ -193,257 +202,94 @@ function checkProfile(ctx: RoutingCtx, input: ResolveInput, profileId: string, o
   return { ok: true, profile, account: usable[0] ?? null };
 }
 
-function decision(input: ResolveInput, profile: Profile, snap: AccountSnapshot | null, degraded: RouteDecision['degraded'], route: RoleRoute): ResolvedRoute {
-  return {
-    role: input.role,
-    profile: profile.id,
-    account: snap?.account.id ?? null,
-    harness: profile.harness,
-    model: profile.model,
-    degraded,
-    waitUntil: null,
-    sameVendorAsWriter: route.constraint === 'vendor_ne_writer' && !!input.writerVendor && vendorOf(profile.harness) === input.writerVendor,
-    profileObj: profile,
-    accountObj: snap?.account ?? null,
-  };
+const SLOT_LABEL: Record<SlotId, string> = { writer: '写作', utility: '杂活' };
+
+/**
+ * 这个位置依次要试的 profile（去掉空值与重复）。
+ * legacySticky：M4b 还没搬进 book.yaml 的旧粘性写手（见 pendingStickyWriter），book.yaml 没有覆盖时当书级覆盖用。
+ */
+export function slotCandidates(slots: Pick<RoutingSlots, SlotId>, slot: SlotId, book: BookHandle | null, forced: boolean, legacySticky: string | null = null): string[] {
+  if (forced) return ['fake'];
+  const s: Slot = slots[slot];
+  const override = slot === 'writer' ? (book?.config.routing.writer_profile ?? legacySticky ?? null) : null;
+  const list = override ? [override, s.fallback] : [s.primary, s.fallback];
+  return [...new Set(list.filter((x): x is string => !!x))];
 }
 
-function noRoute(input: ResolveInput, fails: CandFail[], reason: string): ResolvedRoute {
-  const wake = fails.map((f) => f.wakeAt).filter((w): w is string => !!w).sort()[0] ?? null;
-  const firstCause = fails.find((f) => f.cause !== 'avoided' && f.cause !== 'constraint' && f.cause !== 'fake_disallowed')?.cause ?? fails[0]?.cause ?? 'no_route';
-  return {
-    role: input.role,
-    profile: null,
-    account: null,
-    harness: null,
-    model: null,
-    degraded: [],
-    waitUntil: wake,
-    reason: fails.length ? `${reason}：${fails.map((f) => f.reason).join('；')}` : reason,
-    sameVendorAsWriter: false,
-    profileObj: null,
-    accountObj: null,
-    cause: firstCause,
-  };
-}
-
-/** 纯解析逻辑（一次快照内确定）；测试直接调用 */
-function resolveWith(ctx: RoutingCtx, preset: RoutingPreset, input: ResolveInput): ResolvedRoute {
-  const route = derefRoute(preset, input.role);
-  if (!route) return noRoute(input, [], `preset ${preset.id} 没有角色 ${input.role} 的路由`);
-
-  // 粘性写手：一旦确定只用这个 profile；额度耗尽 → wait，不换写手（§7.4）
-  const sticky = input.role === 'writer' && route.sticky === 'book' ? ctx.writerProfile : null;
-  if (sticky) {
-    const r = checkProfile(ctx, input, sticky, { constraint: 'none' });
-    if (r.ok) return decision(input, r.profile, r.account, [], route);
-    return noRoute(input, [r], `写手 ${sticky} 不可用`);
-  }
-
+function resolveWith(ctx: RoutingCtx, candidates: string[], input: ResolveSlotInput): ResolvedRoute {
+  const base = { slot: input.slot, profile: null, account: null, harness: null, model: null, usedFallback: false, waitUntil: null, profileObj: null, accountObj: null };
+  if (candidates.length === 0) return { ...base, cause: 'no_route', reason: `${SLOT_LABEL[input.slot]}位置没有配置模型` };
   const fails: CandFail[] = [];
-  for (const id of route.chain) {
-    const r = checkProfile(ctx, input, id, { constraint: route.constraint });
-    if (r.ok) return decision(input, r.profile, r.account, [], route);
+  for (const [i, id] of candidates.entries()) {
+    const r = checkProfile(ctx, input, id);
+    if (r.ok) {
+      return { ...base, profile: r.profile.id, account: r.account?.account.id ?? null, harness: r.profile.harness, model: r.profile.model, usedFallback: i > 0, profileObj: r.profile, accountObj: r.account?.account ?? null };
+    }
     fails.push(r);
   }
-  // on_quota=wait 的角色（写手）：全部是额度/并发等待时不降级
-  const allWaiting = fails.length > 0 && fails.every((f) => f.cause === 'quota' || f.cause === 'concurrency');
-  if (route.on_quota === 'wait' && allWaiting) return noRoute(input, fails, '配额等待');
-
-  const primary = route.chain[0] ?? '';
-  for (const id of route.degrade_to) {
-    const r = checkProfile(ctx, input, id, { constraint: route.constraint });
-    if (r.ok) return decision(input, r.profile, r.account, [{ from: primary, to: id, reason: fails[0]?.reason ?? 'chain 不可用' }], route);
-    fails.push(r);
-  }
-  // 放宽厂商约束（§7.4 第 4 条：不同厂商 → 同厂商 → …）；记录并标黄
-  if (route.constraint !== 'none') {
-    for (const id of [...route.chain, ...route.degrade_to]) {
-      if (id === primary && input.avoidProfiles?.includes(id)) continue;
-      const r = checkProfile(ctx, input, id, { constraint: 'none' });
-      if (r.ok) {
-        const d = decision(input, r.profile, r.account, [{ from: primary, to: id, reason: `放宽约束 ${route.constraint}` }], route);
-        return { ...d, sameVendorAsWriter: !!input.writerVendor && vendorOf(r.profile.harness) === input.writerVendor };
-      }
-      fails.push(r);
-    }
-  }
-  return noRoute(input, fails, `角色 ${input.role} 无可用 profile`);
+  const wake = fails.map((f) => f.wakeAt).filter((w): w is string => !!w).sort()[0] ?? null;
+  return { ...base, waitUntil: wake, cause: fails[0]?.cause ?? 'no_route', reason: `${SLOT_LABEL[input.slot]}位置无可用模型：${fails.map((f) => f.reason).join('；')}` };
 }
 
-export async function resolveRoute(db: Db, input: ResolveInput): Promise<ResolvedRoute> {
-  const [preset, ctx] = await Promise.all([loadRoleRoutes(db, input.book), loadCtx(db, input.book, input.now)]);
-  return resolveWith(ctx, preset, input);
+/**
+ * M4b（boot/migrate-p3.ts runPostRecoveryMigrations）在开机时因为书在忙而延后、还没把 books.writer_profile 搬进 book.yaml 的书：
+ * 在搬完之前继续用旧的粘性写手（p3 D6：行为不变）。book.yaml 已有覆盖、M4b 已处理过（迁移状态里有这本书）、
+ * 接手过来的书（meta.v3.takeover）、值为空或等于写作位置主用 → null，照常走位置。
+ */
+export async function pendingStickyWriter(db: Db, book: BookHandle | null, primary: string | null): Promise<string | null> {
+  if (!book || book.config.routing.writer_profile) return null;
+  const row = (await db.select({ writerProfile: books.writerProfile, meta: books.meta }).from(books).where(eq(books.id, book.id)).limit(1))[0];
+  const want = row?.writerProfile ?? null;
+  if (!want || want === primary) return null;
+  const v3 = (row?.meta as { v3?: { takeover?: unknown } } | null | undefined)?.v3;
+  if (v3?.takeover !== undefined && v3.takeover !== null) return null;
+  const st = (await db.select({ value: settings.value }).from(settings).where(eq(settings.key, P3_MIGRATION_KEY)).limit(1))[0]?.value as { writerOverrides?: Record<string, unknown> } | undefined;
+  if (st?.writerOverrides && typeof st.writerOverrides === 'object' && st.writerOverrides[book.id]) return null;
+  return want;
 }
 
-// ───────────────────────── effective routing ─────────────────────────
-
-function presetFromRow(row: typeof routingPresets.$inferSelect | undefined, id: string): RoutingPreset | null {
-  if (row) {
-    const parsed = zRoutingPreset.safeParse({ ...row.body, id: row.id, name: row.name, builtin: row.builtin });
-    if (parsed.success) return parsed.data;
-  }
-  const builtin = BUILTIN_PRESETS.find((p) => p.id === id);
-  return builtin ? zRoutingPreset.parse(builtin) : null;
+export async function resolveSlot(db: Db, input: ResolveSlotInput): Promise<ResolvedRoute> {
+  const [slots, ctx] = await Promise.all([loadSlots(db), loadCtx(db, input.now)]);
+  const sticky = input.slot === 'writer' && !input.forced ? await pendingStickyWriter(db, input.book, slots.writer.primary) : null;
+  return resolveWith(ctx, slotCandidates(slots, input.slot, input.book, !!input.forced, sticky), input);
 }
 
-async function loadPreset(db: Db, id: string): Promise<RoutingPreset | null> {
-  const rows = await db.select().from(routingPresets).where(eq(routingPresets.id, id)).limit(1);
-  return presetFromRow(rows[0], id);
+export function toSlotStatus(r: ResolvedRoute): SlotStatus {
+  return { slot: r.slot, profile: r.profile, account: r.account, harness: r.harness, model: r.model, usedFallback: r.usedFallback, waitUntil: r.waitUntil, reason: r.profile ? null : (r.reason ?? null) };
 }
 
-export async function effectiveRouting(db: Db, book: BookHandle | null): Promise<RoutingPreset> {
-  const active = await loadActive(db);
-  const honorBook = book && !active.forced ? book : null;
-  const presetId = honorBook?.config.routing.preset ?? active.presetId ?? DEFAULT_PRESET_ID;
-  const preset = (await loadPreset(db, presetId)) ?? (await loadPreset(db, DEFAULT_PRESET_ID));
-  if (!preset) throw new Error(`routing preset 不存在：${presetId}`);
-  const merged: RoutingPreset = { ...preset, roles: { ...preset.roles } };
-  // 全局覆盖只作用于全局 active preset；书级 preset 显式指定时以书为准
-  if (!honorBook?.config.routing.preset) {
-    for (const [k, v] of Object.entries(active.overrides ?? {})) {
-      const parsed = zRoutingPreset.shape.roles.safeParse({ [k]: v });
-      if (parsed.success) merged.roles = { ...merged.roles, ...parsed.data };
-    }
-  }
-  if (honorBook) merged.roles = { ...merged.roles, ...honorBook.config.routing.roles };
-  return merged;
-}
-
-/** 哪些 harness 正在当主笔（熔断 30 分钟保护、failover） */
-export async function writerHarnesses(db: Db): Promise<Set<string>> {
-  const out = new Set<string>();
-  const [rows, profileRows, preset] = await Promise.all([db.select({ w: books.writerProfile }).from(books).where(inArray(books.status, ['active', 'planning'])), db.select().from(profiles), effectiveRouting(db, null)]);
-  const harnessOf = new Map(profileRows.map((r) => [r.id, r.harness]));
-  for (const r of rows) {
-    const h = r.w ? harnessOf.get(r.w) : undefined;
-    if (h) out.add(h);
-  }
-  for (const id of preset.roles.writer?.chain ?? []) {
-    const h = harnessOf.get(id);
-    if (h) out.add(h);
+/** 两个位置此刻的状态（模型页） */
+export async function slotStatus(db: Db, now: Date, opts: { allowFakeHarness?: boolean; forced?: boolean }): Promise<Record<SlotId, SlotStatus>> {
+  const [slots, ctx] = await Promise.all([loadSlots(db), loadCtx(db, now)]);
+  const out = {} as Record<SlotId, SlotStatus>;
+  for (const slot of SLOT_IDS) {
+    const input: ResolveSlotInput = { slot, book: null, now, ignoreConcurrency: true, ...(opts.allowFakeHarness ? { allowFakeHarness: true } : {}) };
+    out[slot] = toSlotStatus(resolveWith(ctx, slotCandidates(slots, slot, null, !!opts.forced), input));
   }
   return out;
 }
 
-// ───────────────────────── 可行性检查 ─────────────────────────
-
-const DEFAULT_ROLES: RoleId[] = ['planner', 'showrunner', 'writer', 'checker', 'confirm', 'extractor', 'format_checker', 'summarizer', 'auditor'];
-const STANDARD_ROLES: RoleId[] = ['reviewer', 'continuity', 'judge'];
-
-export interface FeasibilityOptions {
-  allowFakeHarness?: boolean;
-  now?: Date;
-}
-
-/** 开书/改路由时的可行性检查（§7.4）：模拟全部默认角色与已开启的 opt-in 角色 */
-export async function checkFeasibility(db: Db, book: BookHandle | null, opts?: FeasibilityOptions): Promise<FeasibilityReport> {
-  const now = opts?.now ?? new Date();
-  const preset = await effectiveRouting(db, book);
-  const ctx = await loadCtx(db, book, now);
-  const tier: QualityTier = (book?.config.tier as QualityTier | undefined) ?? 'standard';
-  const norm = normalizeTier(tier);
-  const roles = new Set<RoleId>(DEFAULT_ROLES);
-  if (norm !== 'lite') for (const r of STANDARD_ROLES) roles.add(r);
-  for (const r of Object.keys(preset.roles) as RoleId[]) if (!ROUTABLE_ROLES.includes(r)) roles.delete(r);
-
-  const decisions: RouteDecision[] = [];
-  const problems: FeasibilityReport['problems'] = [];
-  const chosen = new Set<string>();
-  let writerVendor: string | null = null;
-  const writerDecision = resolveWith(ctx, preset, { role: 'writer', book, tier, now, ignoreConcurrency: true, ...(opts?.allowFakeHarness ? { allowFakeHarness: true } : {}) });
-  if (writerDecision.harness) writerVendor = vendorOf(writerDecision.harness);
-
-  for (const role of roles) {
-    const d = role === 'writer' ? writerDecision : resolveWith(ctx, preset, { role, book, tier, now, writerVendor, ignoreConcurrency: true, ...(opts?.allowFakeHarness ? { allowFakeHarness: true } : {}) });
-    const { profileObj: _p, accountObj: _a, cause: _c, ...view } = d;
-    decisions.push(view);
-    if (d.profile) chosen.add(d.profile);
-    if (!d.profile) problems.push({ severity: 'error', role, message: d.reason ?? `角色 ${role} 无可用路由` });
-    else if (d.degraded.length > 0) problems.push({ severity: 'warning', role, message: `角色 ${role} 降级：${d.degraded.map((x) => `${x.from} → ${x.to}（${x.reason}）`).join('；')}` });
-    if (d.sameVendorAsWriter) problems.push({ severity: 'warning', role, message: `角色 ${role} 与写手同厂商，结果将标黄` });
-  }
-
-  // 模型 slug / 风险说明
-  const capRows = await db.select().from(capabilities);
-  const profileList = [...chosen].map((id) => ctx.profiles.get(id)).filter((p): p is Profile => !!p);
-  for (const p of profileList) {
-    const known = new Set<string>();
-    for (const r of capRows) if (r.harness === p.harness) for (const m of ((r.body as { models?: string[] }).models ?? [])) known.add(m);
-    for (const a of ctx.accounts) if (a.account.harness === p.harness) for (const m of a.account.customModels) known.add(m);
-    if (known.size > 0 && !known.has(p.model)) problems.push({ severity: 'warning', role: null, message: `profile ${p.id} 的模型 ${p.model} 不在 ${p.harness} 的已知模型列表中（可在 UI 修改 slug）` });
-    for (const ack of p.requires_ack) {
-      const note = RISK_NOTES[ack];
-      if (note) problems.push({ severity: 'info', role: null, message: note.text });
-    }
-    if (ctx.openCircuits.has(p.harness)) problems.push({ severity: 'error', role: null, message: `${p.harness} 当前熔断中` });
-  }
-  if (book?.config.routing.preset === 'fake' || preset.id === 'fake') problems.push({ severity: 'info', role: null, message: 'fake preset：仅测试用，不调用任何模型' });
-
-  return { book: book?.slug ?? null, tier, roles: decisions, problems, chaptersPerWindow: await estimateChapters(db, ctx, chosen, preset) };
-}
-
-/** 每窗口可写章数 ≈ (1 − reserve_pct) × 100 ÷ 每章窗口占用率（来自实测账本；无数据 null） */
-async function estimateChapters(db: Db, ctx: RoutingCtx, chosen: Set<string>, preset: RoutingPreset): Promise<FeasibilityReport['chaptersPerWindow']> {
-  const out: FeasibilityReport['chaptersPerWindow'] = [];
-  const writerIds = new Set(preset.roles.writer?.chain ?? []);
-  const seen = new Set<string>();
-  for (const id of chosen) {
-    if (!writerIds.has(id)) continue;
-    const profile = ctx.profiles.get(id);
-    if (!profile) continue;
-    const pool = ctx.accounts.filter((a) => a.account.harness === profile.harness && (profile.accounts.length === 0 || profile.accounts.includes(a.account.id)));
-    for (const a of pool) {
-      if (seen.has(a.account.id)) continue;
-      seen.add(a.account.id);
-      const rows = await db
-        .select({ d: usageLedger.utilDelta })
-        .from(usageLedger)
-        .where(and(eq(usageLedger.accountId, a.account.id), eq(usageLedger.profileId, id), eq(usageLedger.taskKind, 'chapter.write')));
-      const per: Record<string, { sum: number; n: number }> = {};
-      for (const r of rows) {
-        for (const [w, v] of Object.entries(r.d ?? {})) {
-          per[w] ??= { sum: 0, n: 0 };
-          const s = per[w];
-          s.sum += Number(v);
-          s.n += 1;
-        }
-      }
-      const windows = new Set([...a.account.windows.map((w) => w.window as string), ...Object.keys(per)]);
-      if (windows.size === 0) windows.add('7d');
-      for (const w of windows) {
-        const stat = per[w];
-        out.push(
-          stat && stat.sum > 0
-            ? { accountId: a.account.id, window: w, chapters: Math.floor((100 - a.account.reservePct) / (stat.sum / stat.n)), basis: `实测 ${stat.n} 章的平均占用率` }
-            : { accountId: a.account.id, window: w, chapters: null, basis: '无实测数据（待运行后估算）' },
-        );
-      }
-    }
-  }
-  return out;
+/** 这本书写作用的 profile（书级覆盖 / M4b 还没搬的旧粘性写手，否则写作位置的主用）；状态句 / 书页显示用 */
+export async function writerProfileOf(db: Db, book: BookHandle): Promise<string | null> {
+  if (book.config.routing.writer_profile) return book.config.routing.writer_profile;
+  const primary = (await loadSlots(db)).writer.primary;
+  return (await pendingStickyWriter(db, book, primary)) ?? primary;
 }
 
 // ───────────────────────── seed ─────────────────────────
 
-/** 首次启动写入内置 profiles / presets / settings 默认值（已存在则不覆盖） */
-export async function seedRouting(db: Db): Promise<void> {
+/** 首次启动写入内置 profiles 与 system 默认值（已存在则不覆盖）。不写 preset，也不写 routing.active（只留给上一版镜像） */
+export async function seedProfiles(db: Db): Promise<void> {
   const now = new Date().toISOString();
   for (const p of BUILTIN_PROFILES) {
     const parsed = zProfile.parse(p);
     await db.insert(profiles).values({ id: parsed.id, harness: parsed.harness, enabled: parsed.enabled, builtin: true, body: parsed as unknown as Record<string, unknown>, updatedAt: now }).onConflictDoNothing({ target: profiles.id });
-  }
-  for (const p of BUILTIN_PRESETS) {
-    const parsed = zRoutingPreset.parse(p);
-    // 内置 preset 在 UI 里只能另存为副本，所以可以随版本更新
-    await db.insert(routingPresets).values({ id: parsed.id, name: parsed.name, builtin: true, body: parsed as unknown as Record<string, unknown>, updatedAt: now }).onConflictDoUpdate({ target: routingPresets.id, set: { name: parsed.name, body: parsed as unknown as Record<string, unknown>, updatedAt: now }, setWhere: eq(routingPresets.builtin, true) });
   }
   // 早期版本写入的占位 slug（不在 `agy models` 里）；用户自选的值不动
   const [argon] = await db.select().from(profiles).where(eq(profiles.id, 'agy-argon')).limit(1);
   if ((argon?.body as { model?: string } | undefined)?.model === 'gemini-4-argon') {
     await db.update(profiles).set({ body: { ...(argon!.body as object), model: AGY_ARGON_DEFAULT_SLUG }, updatedAt: now }).where(eq(profiles.id, 'agy-argon'));
   }
-  await db.insert(settings).values({ key: 'routing.active', value: { presetId: DEFAULT_PRESET_ID, overrides: {} }, updatedAt: now }).onConflictDoNothing({ target: settings.key });
   await db.insert(settings).values({ key: 'system', value: zSystemSettings.parse({}), updatedAt: now }).onConflictDoNothing({ target: settings.key });
 }
 

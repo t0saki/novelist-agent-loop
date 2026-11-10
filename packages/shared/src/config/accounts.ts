@@ -46,7 +46,9 @@ export const zAccount = z.object({
   /** custom_api 下的自定义模型名（会并入该 harness 的模型列表） */
   customModels: z.array(z.string()).default([]),
   concurrency: z.number().int().positive().default(1),
+  /** @deprecated P3 删掉了配额预留（DESIGN §10）：不再读、页面上不能改；留着让存着的账号和上一版镜像照常解析 */
   reservePct: z.number().min(0).max(100).default(30),
+  /** @deprecated 同上（周用量上限随配额预留删除） */
   maxWeeklyUtilPct: z.number().min(0).max(100).optional(),
   monthlyUsdCap: z.number().nonnegative().optional(),
   windows: z.array(zQuotaWindowConfig).default([]),

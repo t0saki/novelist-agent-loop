@@ -1,26 +1,24 @@
 /**
- * Inbox（DESIGN §7.8）：审批门（timeout / on_timeout）、hold/block、questions、auth、配额、熔断提案。Owner: lane F。
+ * 待办（DESIGN §8.3）：账号认证 / 额度、没有可用路由、写不出正文等，同类按“种类 + 书”合并。
  *
  * 动作语义（body.on[action] 可覆盖默认）：
- *   body.on = { <actionId>: { task?: 'done'|'ready'|'cancelled'; followups?: TaskSpec[]; chapter?: {no,state};
- *                              book?: Partial<{status,pausedReason,writerProfile}>; circuit?: 'open'|'close';
- *                              meta?: Record<string,unknown>（合并进 books.meta） } }
+ *   body.on = { <actionId>: { task?: 'done'|'ready'|'cancelled'; chapter?: {no,state};
+ *                              book?: Partial<{status,pausedReason,writerProfile}>; meta?: Record<string,unknown>（合并进 books.meta） } }
  * 无 on 时按动作名的默认表：
- *   approve/accept/accept_with_debt/unblock/unhold/continue → 相关任务 done（走 onTaskDone）
- *   rewrite_with_note/retry/rewrite/revise → 相关任务重新 ready（note 进 L3.9，代数 +1）
+ *   approve/accept/unblock/continue → 相关任务 done（走 onTaskDone）
+ *   retry/rewrite/rerun → 相关任务重新 ready（代数 +1）
  *   reject/abandon/cancel → 相关任务 cancelled；skip → 相关任务 done（summary.skipped）
- *   veto（熔断 Inbox）→ 关闭熔断；dismiss → 只关闭本项
- * 所有动作都不跨越模型调用；需要 followups 入队的动作走 outbox（drainInbox 由 scheduler tick 调用）。
+ *   dismiss → 只关闭本项
+ * 所有动作都不跨越模型调用。旧库里还开着的审批、熔断之类由开机迁移关掉（boot/migrate-p3.ts M3）。
  */
 import { randomUUID } from 'node:crypto';
-import { and, eq, isNotNull, lte, ne, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import type { InboxItem } from '@novelist/shared';
 import type { Db } from '../db/client.js';
 import { books, chapters, inbox, tasks } from '../db/schema.js';
-import type { InboxInput, TaskRow, TaskSpec } from '../pipeline/types.js';
+import type { InboxInput, TaskRow } from '../runtime/types.js';
 import type { TaskState } from '@novelist/shared';
 import type { EventBus } from './bus.js';
-import { closeCircuit, openCircuit } from './circuit.js';
 import { orchOf, withOrch } from './orch-state.js';
 import { ACTIVE_STATES, setTaskState } from './queue.js';
 
@@ -60,8 +58,6 @@ export async function createInboxItem(db: Db, bus: EventBus, input: InboxInput):
       actions: input.actions,
       dedupeKey: input.dedupeKey ?? null,
       relatedTaskId: input.relatedTaskId ?? null,
-      timeoutAt: input.timeoutAt ?? null,
-      onTimeout: input.onTimeout ?? 'wait',
     })
     .onConflictDoNothing()
     .returning();
@@ -108,10 +104,8 @@ export async function resolveInboxAuto(db: Db, id: string, reason: string): Prom
 
 export interface ActionEffect {
   task?: 'done' | 'ready' | 'cancelled' | 'none';
-  followups?: TaskSpec[];
   chapter?: { no: number; state: string; workflow?: Record<string, unknown> };
   book?: { status?: string; pausedReason?: string | null; writerProfile?: string };
-  circuit?: 'open' | 'close';
   meta?: Record<string, unknown>;
 }
 
@@ -120,10 +114,6 @@ const READY_ACTIONS = new Set(['rewrite_with_note', 'retry', 'rewrite', 'revise'
 const CANCEL_ACTIONS = new Set(['reject', 'abandon', 'cancel']);
 
 function defaultEffect(item: InboxRow, action: string): ActionEffect {
-  if (item.kind === 'circuit') {
-    if (action === 'veto') return { circuit: 'close', task: 'none' };
-    if (action === 'approve' || action === 'open_now') return { circuit: 'open', task: 'none' };
-  }
   if (action === 'skip') return { task: 'done' };
   if (DONE_ACTIONS.has(action)) return { task: 'done' };
   if (READY_ACTIONS.has(action)) return { task: 'ready' };
@@ -168,23 +158,12 @@ async function applyTaskEffect(db: Db, taskId: string, effect: 'done' | 'ready' 
         finishedAt: null,
         params: withOrch(task.params, {
           generation: (orch.generation ?? 1) + 1,
-          avoidProfiles: [],
-          contractFailures: {},
-          ...(note ? { ownerNotes: [...(orch.ownerNotes ?? []), { source: `inbox:${item.id}`, text: note }] } : {}),
           recover: undefined,
         }),
         updatedAt: now,
       })
       .where(cas);
   }
-}
-
-/** 把 owner 笔记附到 followup（collectOwnerNotes 读 params.ownerNotes） */
-function withNote(params: Record<string, unknown> | undefined, note: string | undefined): Record<string, unknown> {
-  const p = params ?? {};
-  if (!note?.trim()) return p;
-  const prior = Array.isArray(p.ownerNotes) ? (p.ownerNotes as string[]) : [];
-  return { ...p, ownerNotes: [...prior, note] };
 }
 
 /** 执行动作（approve / reject / rewrite_with_note / accept_with_debt / unblock / migrate …），返回更新后的项，并入队后续任务 */
@@ -206,8 +185,7 @@ export async function actOnInbox(db: Db, bus: EventBus, id: string, action: stri
     if (related[0] && ACTIVE_STATES.includes(related[0].state as TaskState)) throw new Error('相关任务正在执行中，请等它结束后再操作');
   }
 
-  const followups = (effect.followups ?? []).map((f) => ({ ...f, params: withNote(f.params, note) }));
-  const resolution: Record<string, unknown> = { action, ...(note ? { note } : {}), ...(payload ? { payload } : {}), ts: new Date().toISOString(), ...(followups.length ? { followups, followupsPending: true } : {}) };
+  const resolution: Record<string, unknown> = { action, ...(note ? { note } : {}), ...(payload ? { payload } : {}), ts: new Date().toISOString() };
   // 先 CAS 关单：双击或超时扫描并发时只有一方拿到这一行，效果只执行一次
   const updated = await db
     .update(inbox)
@@ -221,11 +199,7 @@ export async function actOnInbox(db: Db, bus: EventBus, id: string, action: stri
 
   if (item.relatedTaskId && effect.task && effect.task !== 'none') await applyTaskEffect(db, item.relatedTaskId, effect.task, item, action, note);
   if (effect.chapter && item.bookId) {
-    let workflow = effect.chapter.workflow;
-    if (workflow && (workflow as { next?: { params?: Record<string, unknown> } }).next) {
-      const next = (workflow as { next: { params?: Record<string, unknown> } }).next;
-      workflow = { ...workflow, next: { ...next, params: withNote(next.params, note) } };
-    }
+    const workflow = effect.chapter.workflow;
     await db
       .update(chapters)
       .set({ state: effect.chapter.state, ...(workflow ? { workflow } : {}), updatedAt: new Date().toISOString() })
@@ -233,48 +207,10 @@ export async function actOnInbox(db: Db, bus: EventBus, id: string, action: stri
   }
   if (effect.book && item.bookId) await db.update(books).set({ ...effect.book, updatedAt: new Date().toISOString() }).where(eq(books.id, item.bookId));
   if (effect.meta && item.bookId) await db.update(books).set({ meta: sql`${books.meta} || ${JSON.stringify(effect.meta)}::jsonb`, updatedAt: new Date().toISOString() }).where(eq(books.id, item.bookId));
-  if (effect.circuit) {
-    const c = item.body as { harness?: string; version?: string; isolation?: string; reason?: string };
-    if (c.harness && c.version !== undefined && c.isolation) {
-      if (effect.circuit === 'close') await closeCircuit(db, c.harness, c.version, c.isolation);
-      else await openCircuit(db, c.harness, c.version, c.isolation, c.reason ?? 'owner approved');
-    }
-  }
-
-  // 失败切换：批准 → 书级写手改为提案的 profile
-  const failover = item.body?.failover as { to?: string } | undefined;
-  if (failover?.to && item.bookId && (action === 'approve' || action === 'accept')) await db.update(books).set({ writerProfile: failover.to, updatedAt: new Date().toISOString() }).where(eq(books.id, item.bookId));
 
   return toDto(updated[0], slug);
 }
 
 export async function dismissInbox(db: Db, id: string): Promise<void> {
   await db.update(inbox).set({ state: 'dismissed', resolvedAt: new Date().toISOString() }).where(and(eq(inbox.id, id), eq(inbox.state, 'open')));
-}
-
-export async function expireInboxTimeouts(db: Db, bus: EventBus, now: Date): Promise<number> {
-  const rows = await db
-    .select()
-    .from(inbox)
-    .where(and(eq(inbox.state, 'open'), isNotNull(inbox.timeoutAt), lte(inbox.timeoutAt, now.toISOString()), ne(inbox.onTimeout, 'wait')));
-  let n = 0;
-  for (const row of rows) {
-    const action = row.onTimeout === 'auto_approve' ? 'approve' : 'skip';
-    const actions = (row.actions as { id: string }[]).map((a) => a.id);
-    await db.update(inbox).set({ actions: actions.includes(action) ? row.actions : [...(row.actions as unknown[]), { id: action, label: action }] }).where(eq(inbox.id, row.id));
-    await actOnInbox(db, bus, row.id, action, undefined, { auto: true, reason: 'timeout' });
-    await db.update(inbox).set({ state: 'expired' }).where(and(eq(inbox.id, row.id), eq(inbox.state, 'resolved')));
-    n += 1;
-  }
-  return n;
-}
-
-/** 待入队的 inbox followups（outbox） */
-export async function pendingInboxFollowups(db: Db): Promise<{ id: string; followups: TaskSpec[] }[]> {
-  const rows = await db.select().from(inbox).where(sql`${inbox.resolution}->>'followupsPending' = 'true'`);
-  return rows.map((r) => ({ id: r.id, followups: ((r.resolution as { followups?: TaskSpec[] } | null)?.followups ?? []) }));
-}
-
-export async function clearInboxFollowups(db: Db, id: string): Promise<void> {
-  await db.update(inbox).set({ resolution: sql`(${inbox.resolution} - 'followupsPending')` }).where(eq(inbox.id, id));
 }
